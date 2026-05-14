@@ -1,0 +1,63 @@
+[tools]
+go = "1.25"
+
+[tasks."cctl:test"]
+description = "Run cctl unit tests (no remote ssh / tmux required)"
+run = '''
+    set -euo pipefail
+    go test ./...
+    '''
+
+[tasks."cctl:test:integration"]
+description = "Run cctl integration tests — drives real local + workspace round-trips (worktree + tmux). Workspace tests skip automatically if unreachable."
+run = '''
+    set -euo pipefail
+    go test -tags=integration -timeout=180s ./...
+    '''
+
+[tasks."cctl:install"]
+description = "Install cctl into ~/.local/bin (and symlink from mise's go bin)"
+run = '''
+    set -euo pipefail
+
+    # Primary install: ~/.local/bin so cctl survives Go-version upgrades and
+    # is on PATH even when mise's go shim isn't active.
+    global_bin="$HOME/.local/bin"
+    mkdir -p "$global_bin"
+
+    # Embed the version from `git describe` if available, so `cctl --version`
+    # surfaces the tagged release / commit instead of "dev".
+    version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+    GOBIN="$global_bin" go install -ldflags "-X github.com/geoah/go-cctl/pkg/cctl.Version=${version}" .
+
+    # `go install` names the binary after the module's last path component
+    # (go-cctl); rename it to the user-facing name once.
+    src="$global_bin/go-cctl"
+    target="$global_bin/cctl"
+    if [ ! -x "$src" ]; then
+        echo "go install did not produce $src"
+        exit 1
+    fi
+    mv -f "$src" "$target"
+    echo "Installed:  $target"
+
+    # Best-effort: also drop a symlink into mise's go bin so it stays on PATH
+    # after future Go upgrades wipe ~/.local/share/mise/.../bin.
+    mise_bin="$(go env GOBIN 2>/dev/null || true)"
+    if [ -z "$mise_bin" ]; then
+        mise_bin="$(go env GOPATH 2>/dev/null)/bin"
+    fi
+    if [ -n "$mise_bin" ] && [ -d "$mise_bin" ] && [ "$mise_bin" != "$global_bin" ]; then
+        ln -sfn "$target" "$mise_bin/cctl"
+        echo "Symlinked:  $mise_bin/cctl -> $target"
+    fi
+    '''
+
+[tasks."cctl:build"]
+description = "Build cctl into ./bin/cctl (for quick iteration / smoke tests)"
+run = '''
+    set -euo pipefail
+    mkdir -p ./bin
+    go build -o ./bin/cctl .
+    echo "Built ./bin/cctl"
+    '''
