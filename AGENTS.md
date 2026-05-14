@@ -2,8 +2,10 @@
 
 This is the home of `cctl`. It manages mosh + tmux + claude sessions,
 with a Bubble Tea TUI and a cobra CLI. All logic lives in
-[`pkg/cctl`](pkg/cctl/); the top-level `main.go` is a thin shim that
-calls `cctl.Run()`.
+[`pkg/cctl`](pkg/cctl/); [`cmd/cctl/main.go`](cmd/cctl/main.go) is a
+thin shim that calls `cctl.Run()`. The binary lives under `cmd/` (not
+the repo root) so `go install …/cmd/cctl@latest` produces a binary
+named `cctl` rather than `go-cctl`.
 
 ## ⚠️ TESTING IS NON-NEGOTIABLE ⚠️
 

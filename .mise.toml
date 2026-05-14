@@ -28,17 +28,16 @@ run = '''
     # Embed the version from `git describe` if available, so `cctl --version`
     # surfaces the tagged release / commit instead of "dev".
     version="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
-    GOBIN="$global_bin" go install -ldflags "-X github.com/geoah/go-cctl/pkg/cctl.Version=${version}" .
+    GOBIN="$global_bin" go install -ldflags "-X github.com/geoah/go-cctl/pkg/cctl.Version=${version}" ./cmd/cctl
 
-    # `go install` names the binary after the module's last path component
-    # (go-cctl); rename it to the user-facing name once.
-    src="$global_bin/go-cctl"
+    # `go install` names the binary after the last path component of the
+    # build target, which is `cctl` thanks to ./cmd/cctl — no rename
+    # step needed.
     target="$global_bin/cctl"
-    if [ ! -x "$src" ]; then
-        echo "go install did not produce $src"
+    if [ ! -x "$target" ]; then
+        echo "go install did not produce $target"
         exit 1
     fi
-    mv -f "$src" "$target"
     echo "Installed:  $target"
 
     # Best-effort: also drop a symlink into mise's go bin so it stays on PATH
@@ -58,6 +57,6 @@ description = "Build cctl into ./bin/cctl (for quick iteration / smoke tests)"
 run = '''
     set -euo pipefail
     mkdir -p ./bin
-    go build -o ./bin/cctl .
+    go build -o ./bin/cctl ./cmd/cctl
     echo "Built ./bin/cctl"
     '''

@@ -12,17 +12,29 @@ focuses the existing tab instead of duplicating it.
 
 ## Install
 
-```bash
-# via mise (manages Go too)
-mise use go@latest
-go install github.com/geoah/go-cctl@latest
+The recommended path is via [mise](https://mise.jdx.dev), which manages
+both the Go toolchain and the resulting `cctl` shim in one command:
 
-# or with a system Go
-go install github.com/geoah/go-cctl@latest
+```bash
+# Pin globally so cctl is always on $PATH:
+mise use -g go:github.com/geoah/go-cctl/cmd/cctl@latest
+
+# Or scope it to the current project's mise.toml:
+mise use go:github.com/geoah/go-cctl/cmd/cctl@latest
 ```
 
-The binary is installed as `cctl`. Run `cctl init` to generate a starter
-`~/.cctl.yaml`, then `cctl` to open the TUI.
+mise will install a Go toolchain on demand, build the binary via
+`go install`, and put it behind a shim called `cctl` on your `$PATH`.
+Replace `@latest` with a tag (e.g. `@v0.1.0`) or commit SHA to pin.
+
+If you'd rather use a system Go directly:
+
+```bash
+go install github.com/geoah/go-cctl/cmd/cctl@latest
+```
+
+Either way the binary is named `cctl`. Run `cctl init` once to generate
+a starter `~/.cctl.yaml`, then `cctl` to open the TUI.
 
 ## What it does
 
@@ -38,7 +50,8 @@ The binary is installed as `cctl`. Run `cctl init` to generate a starter
 
 ## Layout
 
-- `main.go` — entry point, calls `pkg/cctl.Run()`.
+- `cmd/cctl/main.go` — entry point (so `go install …/cmd/cctl@latest`
+  produces a binary called `cctl`), thin shim around `pkg/cctl.Run()`.
 - `pkg/cctl/` — all logic (TUI, CLI, spawner, config, discovery, scripts).
 - `AGENTS.md` — guidance for AI agents and contributors editing the
   package (especially the testing rules).
