@@ -33,8 +33,87 @@ If you'd rather use a system Go directly:
 go install github.com/geoah/go-cctl/cmd/cctl@latest
 ```
 
-Either way the binary is named `cctl`. Run `cctl init` once to generate
-a starter `~/.cctl.yaml`, then `cctl` to open the TUI.
+Either way the binary is named `cctl`.
+
+## Setup
+
+cctl is config-driven — it needs to know which hosts to look at and
+where to find git repos on them. Generate a starter config and edit it:
+
+```bash
+cctl init                       # writes ~/.cctl.yaml if absent
+$EDITOR ~/.cctl.yaml
+```
+
+The minimum useful config has at least one server with one
+`repo_sources` entry. A realistic example covering both a local box
+and a remote workspace:
+
+```yaml
+defaults:
+  branch_prefix: yourname        # branches go yourname/<name>
+  worktree_base: ~/worktrees     # cctl puts every worktree here
+  mosh: true                     # use mosh for remotes when available
+  claude_flags: ["--dangerously-skip-permissions"]
+  worktree_post_create:          # run inside each fresh worktree
+    - mise trust
+
+servers:
+  local:
+    local: true
+    repo_sources:
+      - path: ~/src/github.com   # walks recursively up to max_depth
+        max_depth: 3
+        default_branch: main
+
+  workspace:
+    host: 10.0.0.1
+    user: you
+    ssh_key: ~/.ssh/id_ed25519
+    ssh_opts:
+      - "-o"
+      - "IdentitiesOnly=yes"
+    repo_sources:
+      - path: "~/"
+        max_depth: 4
+        default_branch: main
+```
+
+The knobs:
+
+- **`servers.<name>`** — one block per host. `local: true` for the
+  current machine; otherwise set `host:` + `user:` (+ optional
+  `ssh_key:` / `ssh_opts:` for non-default ssh).
+- **`repo_sources:`** — directories cctl walks (up to `max_depth`) to
+  auto-discover git repos. Anything with a `.git` becomes a row in
+  the tree without you having to enumerate it.
+- **`repos:`** (optional, not shown) — explicit overrides for repos
+  that live outside any `repo_sources` root or need a non-default
+  branch.
+- **`defaults.worktree_base`** — root for new worktrees
+  (`<base>/<repo>/<worktree>`). The default is `~/worktrees`; cctl
+  refuses to delete anything outside this path, so put it somewhere
+  you're happy treating as scratch.
+- **`defaults.worktree_post_create`** — list of shell commands run
+  inside each freshly-created worktree (e.g. `mise trust`,
+  `direnv allow`, `pre-commit install`). Best-effort; failures log
+  but don't abort the session.
+- **`defaults.branch_prefix`** — branches for new worktrees are named
+  `<prefix>/<worktree-name>`.
+- **`defaults.mosh: true`** uses [mosh](https://mosh.org) instead of
+  ssh for remote sessions (better roaming + latency). Falls back
+  to ssh per-server with `mosh: false`.
+
+Re-run `cctl init` later for a refreshed example; it never overwrites
+an existing `~/.cctl.yaml`. Run `cctl doctor` if a host or repo looks
+wrong — it prints a per-server health report (transport, tools, repo
+status, orphan sessions).
+
+Then launch the TUI:
+
+```bash
+cctl
+```
 
 ## What it does
 
