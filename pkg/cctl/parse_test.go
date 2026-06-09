@@ -2,6 +2,7 @@ package cctl
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -787,41 +788,70 @@ func TestHasNoisyComponent_FiltersHiddenAndDependencyDirs(t *testing.T) {
 	}
 }
 
-// ---- status state machine -------------------------------------------------
+// ---- background-task registry -----------------------------------------------
 
-// TestStatusBar_TransitionsAndAutoClear drives the helper methods we use
-// from the Update loop and verifies the bookkeeping is right: progress
-// stays sticky, success/failure carry a clearAt, the auto-clear in the
-// tickMsg handler resets to idle.
-func TestStatusBar_TransitionsAndAutoClear(t *testing.T) {
+// TestBgTasks_LifecycleAndAutoClear drives the task helpers used from the
+// Update loop: start → running, finish → done with a clearAt (failures
+// stick around longer than successes), tick prunes expired entries.
+func TestBgTasks_LifecycleAndAutoClear(t *testing.T) {
 	m := &tuiModel{state: map[string]*serverState{}}
-	if cmd := m.setStatusProgress("opening foo"); cmd == nil {
-		t.Errorf("setStatusProgress should return a non-nil tick cmd")
+	id, cmd := m.startTask("sess:w/r/wt/x", "deleting…")
+	if cmd == nil {
+		t.Errorf("startTask should return a non-nil tick cmd")
 	}
-	if m.status.kind != statusProgress || m.status.label != "opening foo" {
-		t.Errorf("after progress: %+v", m.status)
+	if m.runningTaskFor("sess:w/r/wt/x") == nil {
+		t.Fatalf("task should be running for its own key")
 	}
-	// Success: clearAt set in the future.
-	m.setStatusSuccess("done")
-	if m.status.kind != statusSuccess || time.Now().After(m.status.clearAt) {
-		t.Errorf("after success: %+v", m.status)
+	m.finishTask(id, "killed", nil)
+	if m.runningTaskFor("sess:w/r/wt/x") != nil {
+		t.Errorf("finished task must not count as running")
 	}
-	// Failure: includes detail + later clearAt than success.
-	prevClear := m.status.clearAt
-	m.setStatusFailure("broke", "stderr noise")
-	if m.status.kind != statusFailure || m.status.detail != "stderr noise" {
-		t.Errorf("after failure: %+v", m.status)
+	okClear := m.tasks[0].clearAt
+	if m.tasks[0].label != "killed" || m.tasks[0].failed || time.Now().After(okClear) {
+		t.Errorf("after success finish: %+v", m.tasks[0])
 	}
-	if !m.status.clearAt.After(prevClear) {
+	// Failure: detail recorded, longer clearAt than success.
+	id2, _ := m.startTask("wt:w/r/wt", "removing…")
+	m.finishTask(id2, "remove failed", fmt.Errorf("stderr noise"))
+	failed := m.tasks[1]
+	if !failed.failed || failed.detail != "stderr noise" {
+		t.Errorf("after failure finish: %+v", failed)
+	}
+	if !failed.clearAt.After(okClear) {
 		t.Errorf("failure clearAt (%v) should outlast success clearAt (%v) so the user can read the error",
-			m.status.clearAt, prevClear)
+			failed.clearAt, okClear)
 	}
-	// Drive the tickMsg path: forcing clearAt into the past must reset
-	// the status to idle on the next tick.
-	m.status.clearAt = time.Now().Add(-time.Second)
+	// Drive the tickMsg path: forcing clearAt into the past must prune.
+	for _, bt := range m.tasks {
+		bt.clearAt = time.Now().Add(-time.Second)
+	}
 	m.Update(tickMsg{})
-	if m.status.kind != statusIdle {
-		t.Errorf("expired status should auto-clear to idle on tick; got %+v", m.status)
+	if len(m.tasks) != 0 {
+		t.Errorf("expired tasks should be pruned on tick; got %d left", len(m.tasks))
+	}
+}
+
+// TestTaskKeysConflict pins the subtree-overlap rule that decides which
+// concurrent actions are allowed: same row, ancestor, and descendant
+// conflict; siblings and unrelated rows don't; anonymous keys never do.
+func TestTaskKeysConflict(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+		why  string
+	}{
+		{"sess:w/r/wt/x", "sess:w/r/wt/x", true, "same session"},
+		{"wt:w/r/wt", "sess:w/r/wt/x", true, "worktree vs session under it"},
+		{"sess:w/r/wt/x", "wt:w/r/wt", true, "session vs its worktree"},
+		{"sess:w/r/wt/x", "sess:w/r/wt/y", false, "sibling sessions"},
+		{"wt:w/r/a", "wt:w/r/b", false, "sibling worktrees"},
+		{"wt:w/r/wt", "wt:w/r/wt2", false, "prefix-similar names are not ancestors"},
+		{"", "wt:w/r/wt", false, "anonymous never conflicts"},
+	}
+	for _, c := range cases {
+		if got := taskKeysConflict(c.a, c.b); got != c.want {
+			t.Errorf("taskKeysConflict(%q, %q) = %v want %v (%s)", c.a, c.b, got, c.want, c.why)
+		}
 	}
 }
 
@@ -833,22 +863,21 @@ func TestNeedTick(t *testing.T) {
 	if m.needTick() {
 		t.Errorf("idle model should not need ticking")
 	}
-	m.status.kind = statusProgress
+	id, _ := m.startTask("sess:w/r/wt/x", "working…")
 	if !m.needTick() {
-		t.Errorf("progress state must keep ticking for spinner animation")
+		t.Errorf("running task must keep ticking for spinner animation")
 	}
-	m.status.kind = statusSuccess
-	m.status.clearAt = time.Now().Add(time.Second)
+	m.finishTask(id, "done", nil)
 	if !m.needTick() {
-		t.Errorf("success with pending clearAt should keep ticking until expired")
+		t.Errorf("finished task with pending clearAt should keep ticking until expired")
 	}
-	m.status.clearAt = time.Now().Add(-time.Second)
+	m.tasks[0].clearAt = time.Now().Add(-time.Second)
 	if m.needTick() {
-		t.Errorf("success past clearAt should stop ticking")
+		t.Errorf("task past clearAt should stop ticking")
 	}
 	// Server-side animation: connecting and post-connect loading both
 	// keep the tick alive so server-row spinners advance.
-	m.status = statusBar{}
+	m.tasks = nil
 	m.state["x"] = &serverState{conn: connConnecting}
 	if !m.needTick() {
 		t.Errorf("connecting server should require ticking")
@@ -859,7 +888,7 @@ func TestNeedTick(t *testing.T) {
 	}
 	m.state["x"] = &serverState{conn: connConnected, sessionsLoaded: true, reposLoaded: true, worktreesLoaded: true}
 	if m.needTick() {
-		t.Errorf("fully-loaded server with no active status should stop ticking")
+		t.Errorf("fully-loaded server with no active tasks should stop ticking")
 	}
 }
 
@@ -908,10 +937,18 @@ func TestCmuxWorkspaceListParser(t *testing.T) {
 
 // ---- dd refusal on repo/server rows ---------------------------------------
 
+// lastTask returns the most recently added task (test helper).
+func lastTask(m *tuiModel) *bgTask {
+	if len(m.tasks) == 0 {
+		return nil
+	}
+	return m.tasks[len(m.tasks)-1]
+}
+
 // TestExecuteDelete_RepoRowRefusedWithExplicitMessage pins the post-incident
 // rule "cctl can only delete worktrees and sessions, never the repo
 // itself." Pressing dd on a (r) row must not silently noop and must
-// route through setStatusFailure so the refusal is visible in red.
+// surface a visible red refusal in the footer task list.
 func TestExecuteDelete_RepoRowRefusedWithExplicitMessage(t *testing.T) {
 	m := &tuiModel{
 		cfg:         &Config{Servers: map[string]Server{"w": {}}},
@@ -921,11 +958,12 @@ func TestExecuteDelete_RepoRowRefusedWithExplicitMessage(t *testing.T) {
 		cursor:      0,
 	}
 	_, _ = m.executeDelete()
-	if m.status.kind != statusFailure {
-		t.Fatalf("dd on repo: status kind = %v, want statusFailure", m.status.kind)
+	last := lastTask(m)
+	if last == nil || !last.failed {
+		t.Fatalf("dd on repo: want a failed task entry, got %+v", last)
 	}
-	if !strings.Contains(m.status.label, "can't delete a repo") {
-		t.Errorf("dd on repo: status label = %q, want it to mention can't delete", m.status.label)
+	if !strings.Contains(last.label, "can't delete a repo") {
+		t.Errorf("dd on repo: label = %q, want it to mention can't delete", last.label)
 	}
 }
 
@@ -940,33 +978,92 @@ func TestExecuteDelete_ServerRowRefusedWithExplicitMessage(t *testing.T) {
 		cursor:      0,
 	}
 	_, _ = m.executeDelete()
-	if m.status.kind != statusFailure {
-		t.Fatalf("dd on server: status kind = %v, want statusFailure", m.status.kind)
+	last := lastTask(m)
+	if last == nil || !last.failed {
+		t.Fatalf("dd on server: want a failed task entry, got %+v", last)
 	}
-	if !strings.Contains(m.status.label, "can't delete a server") {
-		t.Errorf("dd on server: status label = %q, want it to mention can't delete", m.status.label)
+	if !strings.Contains(last.label, "can't delete a server") {
+		t.Errorf("dd on server: label = %q, want it to mention can't delete", last.label)
 	}
 }
 
-// TestPreparingPrefix_OnlyMatchingRowSpins covers the per-row spinner:
-// only the row whose key equals m.preparingKey gets the spinner glyph,
-// every other row renders without one. Catches a regression where a
-// careless rowKey() change would either spin every row (the bug we'd
-// notice immediately) or no row (the bug we wouldn't).
-func TestPreparingPrefix_OnlyMatchingRowSpins(t *testing.T) {
-	m := &tuiModel{preparingKey: "repo:w/r1", spinnerFrame: 3}
-	matching := treeRow{kind: rowRepo, server: "w", repo: "r1"}
+// TestExecuteDelete_BlocksConflictingTargetsOnly is the regression test for
+// the "dd is flaky when you do several things at once" complaint: a second
+// dd on the SAME row (or its parent worktree) while a delete is running
+// must be refused, but actions on unrelated rows must go through.
+func TestExecuteDelete_BlocksConflictingTargetsOnly(t *testing.T) {
+	sessA := &SessionInfo{Repo: "r1", Worktree: "wt", Session: "a", Name: "cctl/r1/wt/a"}
+	sessB := &SessionInfo{Repo: "r1", Worktree: "other", Session: "b", Name: "cctl/r1/other/b"}
+	m := &tuiModel{
+		cfg:         &Config{Servers: map[string]Server{"w": {Local: true, Repos: map[string]Repo{"r1": {Path: "/tmp/r1"}}}}},
+		serverNames: []string{"w"},
+		state:       map[string]*serverState{"w": {}},
+		rows: []treeRow{
+			{kind: rowSession, server: "w", repo: "r1", worktree: "wt", session: sessA},
+			{kind: rowWorktree, server: "w", repo: "r1", worktree: "wt"},
+			{kind: rowSession, server: "w", repo: "r1", worktree: "other", session: sessB},
+		},
+		cursor: 0,
+	}
+	// First dd on session A: starts a running task.
+	_, cmd := m.executeDelete()
+	if cmd == nil {
+		t.Fatalf("first delete should produce a cmd")
+	}
+	if m.runningTaskFor("sess:w/r1/wt/a") == nil {
+		t.Fatalf("first delete should register a running task")
+	}
+	before := len(m.tasks)
+	// Second dd on the same row: refused with a failed notice, no new
+	// running task.
+	_, _ = m.executeDelete()
+	last := lastTask(m)
+	if last == nil || !last.failed || !strings.Contains(last.label, "busy") {
+		t.Errorf("dd on busy row should refuse with a 'busy' notice; got %+v", last)
+	}
+	if got := len(m.tasks); got != before+1 {
+		t.Errorf("refusal should add exactly one notice; tasks %d → %d", before, got)
+	}
+	// dd on the parent worktree: also refused (ancestor conflict).
+	m.cursor = 1
+	_, _ = m.executeDelete()
+	if last := lastTask(m); last == nil || !last.failed || !strings.Contains(last.label, "busy") {
+		t.Errorf("dd on parent worktree of a busy session should refuse; got %+v", last)
+	}
+	// dd on an unrelated session: allowed (new running task).
+	m.cursor = 2
+	_, cmd = m.executeDelete()
+	if cmd == nil {
+		t.Fatalf("delete on unrelated row should produce a cmd")
+	}
+	if m.runningTaskFor("sess:w/r1/other/b") == nil {
+		t.Errorf("unrelated delete should run concurrently, not be blocked")
+	}
+}
+
+// TestPreparingPrefix_TaskTargetsSpin covers the per-row spinner: the row
+// targeted by a running task spins, and so does its parent worktree
+// (subtree overlap) — but unrelated rows don't, and finished tasks stop
+// the spinner.
+func TestPreparingPrefix_TaskTargetsSpin(t *testing.T) {
+	m := &tuiModel{spinnerFrame: 3}
+	id, _ := m.startTask("sess:w/r1/wt/a", "deleting…")
+	target := treeRow{kind: rowSession, server: "w", repo: "r1",
+		session: &SessionInfo{Repo: "r1", Worktree: "wt", Session: "a"}}
+	parent := treeRow{kind: rowWorktree, server: "w", repo: "r1", worktree: "wt"}
 	other := treeRow{kind: rowRepo, server: "w", repo: "r2"}
-	if got := m.preparingPrefix(matching); got == "" {
-		t.Errorf("matching row should get a spinner prefix, got empty")
+	if got := m.preparingPrefix(target); got == "" {
+		t.Errorf("targeted row should get a spinner prefix, got empty")
+	}
+	if got := m.preparingPrefix(parent); got == "" {
+		t.Errorf("parent worktree of a busy session should spin too, got empty")
 	}
 	if got := m.preparingPrefix(other); got != "" {
-		t.Errorf("non-matching row should NOT get a spinner prefix, got %q", got)
+		t.Errorf("unrelated row should NOT get a spinner prefix, got %q", got)
 	}
-	// With preparingKey empty, no row spins.
-	m.preparingKey = ""
-	if got := m.preparingPrefix(matching); got != "" {
-		t.Errorf("idle model: no row should spin, got %q", got)
+	m.finishTask(id, "done", nil)
+	if got := m.preparingPrefix(target); got != "" {
+		t.Errorf("finished task: no row should spin, got %q", got)
 	}
 }
 

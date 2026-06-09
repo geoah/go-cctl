@@ -67,7 +67,6 @@ type tuiMode int
 const (
 	modeBrowse tuiMode = iota
 	modeNewForm
-	modeConfirm
 	modeFilter
 )
 
@@ -104,26 +103,22 @@ const (
 	connDisconnected
 )
 
-// statusKind is the phase of the status bar's state machine: idle (hidden),
-// progress (spinner + label), success (✓ + label, auto-clears), failure
-// (✗ + label + error, auto-clears slower so the user can read it).
-type statusKind int
-
-const (
-	statusIdle statusKind = iota
-	statusProgress
-	statusSuccess
-	statusFailure
-)
-
-// statusBar tracks the inline action indicator shown above the legend.
-// One status at a time — newer events overwrite older ones (the typical
-// flow is progress → success/failure → idle).
-type statusBar struct {
-	kind    statusKind
-	label   string    // primary message ("spawning workspace/<repo>/<wt>")
-	detail  string    // sub-line, usually the error text on failure
-	clearAt time.Time // when to auto-revert to idle (success/failure only)
+// bgTask is one tracked background operation (a delete, a prepare+spawn).
+// The TUI used to keep a single status slot + a single preparing-row key,
+// which made concurrent actions flaky: a second dd would overwrite the
+// first one's spinner and its outcome message. Now every async action is a
+// task: the footer lists everything running (and recently finished), the
+// targeted rows render a spinner, and conflicting actions on the same
+// target are refused while one is in flight.
+type bgTask struct {
+	id      int
+	key     string // rowKey of the target; "" for anonymous notices
+	label   string
+	detail  string // sub-line, usually the error text on failure
+	started time.Time
+	done    bool
+	failed  bool
+	clearAt time.Time // done only: when the entry drops from the footer
 }
 
 // spinnerFrames is a 10-step Braille spinner (industry standard, available
@@ -141,16 +136,13 @@ const tickInterval = 100 * time.Millisecond
 // needTick reports whether anything in the model is animating right now.
 // Used to decide whether to schedule another tick after the current one.
 func (m *tuiModel) needTick() bool {
-	if m.status.kind == statusProgress {
-		return true
-	}
-	if m.status.kind == statusSuccess || m.status.kind == statusFailure {
-		if !m.status.clearAt.IsZero() && time.Now().Before(m.status.clearAt) {
+	for _, t := range m.tasks {
+		if !t.done {
 			return true
 		}
-	}
-	if m.preparingKey != "" {
-		return true
+		if !t.clearAt.IsZero() && time.Now().Before(t.clearAt) {
+			return true
+		}
 	}
 	for _, st := range m.state {
 		if st == nil {
@@ -180,24 +172,116 @@ func (m *tuiModel) scheduleTick() tea.Cmd {
 	return tea.Tick(tickInterval, func(time.Time) tea.Msg { return tickMsg{} })
 }
 
-// setStatusProgress moves the status bar into progress mode with the
-// given label and returns a tick cmd to start animating.
-func (m *tuiModel) setStatusProgress(label string) tea.Cmd {
-	m.status = statusBar{kind: statusProgress, label: label}
+// startTask registers a running background task targeting the row with
+// the given key and returns its id plus a tick cmd to start animating.
+func (m *tuiModel) startTask(key, label string) (int, tea.Cmd) {
+	m.nextTaskID++
+	m.tasks = append(m.tasks, &bgTask{
+		id:      m.nextTaskID,
+		key:     key,
+		label:   label,
+		started: time.Now(),
+	})
+	log().Debug("tui-task-start", "id", m.nextTaskID, "key", key, "label", label)
+	return m.nextTaskID, m.scheduleTick()
+}
+
+// finishTask marks the task done. A non-empty label replaces the running
+// one (so "deleting X…" becomes "killed X"); err != nil renders the entry
+// as a failure and keeps it on screen longer so the user can read it.
+// Unknown ids are tolerated (the task may have been created by an older
+// code path) — the outcome is shown as a fresh already-done entry.
+func (m *tuiModel) finishTask(id int, label string, err error) tea.Cmd {
+	var t *bgTask
+	for _, c := range m.tasks {
+		if c.id == id {
+			t = c
+			break
+		}
+	}
+	if t == nil {
+		m.nextTaskID++
+		t = &bgTask{id: m.nextTaskID, started: time.Now()}
+		m.tasks = append(m.tasks, t)
+	}
+	if label != "" {
+		t.label = label
+	}
+	t.done = true
+	t.failed = err != nil
+	if err != nil {
+		t.detail = err.Error()
+		t.clearAt = time.Now().Add(10 * time.Second)
+	} else {
+		t.clearAt = time.Now().Add(4 * time.Second)
+	}
+	log().Debug("tui-task-done", "id", t.id, "label", t.label, "err", errString(err))
 	return m.scheduleTick()
 }
 
-// setStatusSuccess flashes a green check + label and schedules auto-clear.
-func (m *tuiModel) setStatusSuccess(label string) tea.Cmd {
-	m.status = statusBar{kind: statusSuccess, label: label, clearAt: time.Now().Add(3 * time.Second)}
+// noteSuccess / noteFailure record an instant outcome (no running phase) —
+// the replacement for the old one-slot status bar's flash messages.
+func (m *tuiModel) noteSuccess(label string) tea.Cmd {
+	m.nextTaskID++
+	m.tasks = append(m.tasks, &bgTask{
+		id: m.nextTaskID, label: label, started: time.Now(),
+		done: true, clearAt: time.Now().Add(4 * time.Second),
+	})
 	return m.scheduleTick()
 }
 
-// setStatusFailure shows a red cross + label + detail and schedules
-// auto-clear after a longer interval so the user can read the error.
-func (m *tuiModel) setStatusFailure(label, detail string) tea.Cmd {
-	m.status = statusBar{kind: statusFailure, label: label, detail: detail, clearAt: time.Now().Add(6 * time.Second)}
+func (m *tuiModel) noteFailure(label, detail string) tea.Cmd {
+	m.nextTaskID++
+	m.tasks = append(m.tasks, &bgTask{
+		id: m.nextTaskID, label: label, detail: detail, started: time.Now(),
+		done: true, failed: true, clearAt: time.Now().Add(10 * time.Second),
+	})
 	return m.scheduleTick()
+}
+
+// taskKeyPath strips the kind prefix from a row key ("wt:s/r/w" → "s/r/w")
+// so conflict checks compare tree paths regardless of row kind.
+func taskKeyPath(k string) string {
+	if i := strings.Index(k, ":"); i >= 0 {
+		return k[i+1:]
+	}
+	return k
+}
+
+// taskKeysConflict reports whether two row keys target overlapping subtrees:
+// the same row, an ancestor, or a descendant. A worktree delete therefore
+// conflicts with (and blocks) actions on every session under that worktree,
+// and vice versa. Anonymous keys ("") never conflict.
+func taskKeysConflict(a, b string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	pa, pb := taskKeyPath(a), taskKeyPath(b)
+	return pa == pb || strings.HasPrefix(pa, pb+"/") || strings.HasPrefix(pb, pa+"/")
+}
+
+// runningTaskFor returns the first running task whose target overlaps the
+// given row key, or nil. Used both to block conflicting actions and to
+// render the per-row spinner.
+func (m *tuiModel) runningTaskFor(key string) *bgTask {
+	for _, t := range m.tasks {
+		if !t.done && taskKeysConflict(t.key, key) {
+			return t
+		}
+	}
+	return nil
+}
+
+// pruneTasks drops finished tasks whose display window has passed.
+func (m *tuiModel) pruneTasks() {
+	kept := m.tasks[:0]
+	for _, t := range m.tasks {
+		if t.done && !t.clearAt.IsZero() && time.Now().After(t.clearAt) {
+			continue
+		}
+		kept = append(kept, t)
+	}
+	m.tasks = kept
 }
 
 type tuiModel struct {
@@ -217,21 +301,16 @@ type tuiModel struct {
 	statusMsg string
 	statusErr string
 
-	// status is the animated action-status state machine. Drives the line
-	// above the legend: spinner while in progress, ✓/✗ with auto-clear
-	// when done. See statusBar comments for transitions.
-	status statusBar
-	// spinnerFrame ticks while anything in the model is animating
-	// (status.kind == statusProgress, status auto-clear pending, or any
-	// server is connecting / still loading). Shared so every spinner in
-	// the UI advances in lockstep.
+	// tasks is the background-task registry: every async action (delete,
+	// prepare+spawn) plus instant outcome notices. Drives the footer's
+	// task list, per-row spinners, and conflict blocking. Pruned on tick.
+	tasks      []*bgTask
+	nextTaskID int
+	// spinnerFrame ticks while anything in the model is animating (any
+	// running task, or any server connecting / still loading). Shared so
+	// every spinner in the UI advances in lockstep.
 	spinnerFrame int
 	tickPending  bool
-	// preparingKey is the rowKey of the row whose Enter action triggered
-	// the in-flight prepare. While set, that row renders with a spinner
-	// glyph on its left so the user can see exactly what's loading.
-	// Cleared on prepareDoneMsg/actionDoneMsg.
-	preparingKey string
 
 	// new-session form
 	formServer   string
@@ -241,9 +320,6 @@ type tuiModel struct {
 	nameInput    textinput.Model
 	promptInput  textinput.Model
 	formFocus    int // index into formFields (which depends on formWorktree presence)
-
-	// confirm overlay
-	confirmRow treeRow
 
 	// k9s-style filter — when non-empty, only rows matching this substring
 	// (or whose descendants match) are rendered.
@@ -410,12 +486,16 @@ type prepareDoneMsg struct {
 	// instead of creating one. Only safe when a live tmux client is known
 	// to sit in that tab (attach-to-attached-session); see Spawner.
 	focusExisting bool
-	err           error
+	// taskID ties this result back to the bgTask started when the action
+	// was triggered, so the right footer entry resolves.
+	taskID int
+	err    error
 }
 
 type actionDoneMsg struct {
 	msg     string
 	refresh string
+	taskID  int
 	err     error
 }
 
@@ -616,14 +696,12 @@ func errString(err error) string {
 	return err.Error()
 }
 
-// preparingPrefix returns an amber-bold spinner glyph + space when the
-// given row matches m.preparingKey (i.e. its Enter triggered an in-flight
-// prepare). Returns "" otherwise so the column doesn't shift.
+// preparingPrefix returns an amber-bold spinner glyph + space when a
+// running background task targets this row (or an ancestor/descendant of
+// it — a worktree being removed spins its session rows too). Returns ""
+// otherwise so the column doesn't shift.
 func (m *tuiModel) preparingPrefix(r treeRow) string {
-	if m.preparingKey == "" {
-		return ""
-	}
-	if rowKey(r) != m.preparingKey {
+	if m.runningTaskFor(rowKey(r)) == nil {
 		return ""
 	}
 	return warnStyle.Bold(true).Render(spinnerFrames[m.spinnerFrame%len(spinnerFrames)]) + " "
@@ -762,34 +840,24 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		m.tickPending = false
 		// Advance the shared spinner frame so every spinner in the UI
-		// (status bar, server rows) draws the same braille glyph.
+		// (footer task list, server rows) draws the same braille glyph.
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
-		// Auto-clear success/failure once their clearAt has passed.
-		if m.status.kind == statusSuccess || m.status.kind == statusFailure {
-			if !m.status.clearAt.IsZero() && time.Now().After(m.status.clearAt) {
-				m.status = statusBar{}
-			}
-		}
+		m.pruneTasks()
 		return m, m.scheduleTick()
 
 	case prepareDoneMsg:
-		// Prepare has finished. Clear the per-row spinner now; the
-		// status bar carries success/failure for the spawn step.
-		m.preparingKey = ""
 		if msg.err != nil {
-			return m, m.setStatusFailure(msg.label+": prepare failed", msg.err.Error())
+			return m, m.finishTask(msg.taskID, msg.label+": prepare failed", msg.err)
 		}
-		progress := m.setStatusProgress("opening " + msg.label + " (cmux tab)…")
 		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.title, msg.focusExisting)
 		if err != nil {
 			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
-			return m, m.setStatusFailure(provider+" spawn failed", err.Error())
+			return m, m.finishTask(msg.taskID, provider+" spawn failed", err)
 		}
 		log().Info("tui-spawn-ok", "label", msg.label, "provider", provider)
-		success := m.setStatusSuccess(fmt.Sprintf("opened %s (%s tab)", msg.label, provider))
+		finish := m.finishTask(msg.taskID, fmt.Sprintf("opened %s (%s tab)", msg.label, provider), nil)
 		refresh := msg.refresh
-		_ = progress
-		return m, tea.Batch(success,
+		return m, tea.Batch(finish,
 			tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
 				return refreshServerMsg{server: refresh}
 			}),
@@ -808,22 +876,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmds...)
 
 	case actionDoneMsg:
-		m.mode = modeBrowse
-		var statusCmd tea.Cmd
-		if msg.err != nil {
-			label := msg.msg
-			if label == "" {
-				label = "action failed"
-			}
-			statusCmd = m.setStatusFailure(label, msg.err.Error())
-		} else if msg.msg != "" {
-			statusCmd = m.setStatusSuccess(msg.msg)
+		// Note: this no longer forces the mode back to browse — the user
+		// may have opened the form or the filter while the action ran in
+		// the background, and yanking them out of it was part of the old
+		// flakiness.
+		label := msg.msg
+		if msg.err != nil && label == "" {
+			label = "action failed"
 		}
+		statusCmd := m.finishTask(msg.taskID, label, msg.err)
 		if msg.refresh != "" {
 			cmds := m.loadServerCmd(msg.refresh)
-			if statusCmd != nil {
-				cmds = append(cmds, statusCmd)
-			}
+			cmds = append(cmds, statusCmd)
 			return m, tea.Batch(cmds...)
 		}
 		return m, statusCmd
@@ -834,8 +898,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleBrowseKey(msg)
 		case modeNewForm:
 			return m.handleFormKey(msg)
-		case modeConfirm:
-			return m.handleConfirmKey(msg)
 		case modeFilter:
 			return m.handleFilterKey(msg)
 		}
@@ -1003,45 +1065,20 @@ func (m *tuiModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			f.Blur()
 		}
 		m.statusErr = ""
-		// Mark the source row (the row the user pressed Enter on to open
-		// the form) so its render adds a spinner on the left. The form
-		// captured the row's identity into formServer/formRepo/formWorktree
-		// on open — if formWorktree was empty the source was a repo row,
-		// otherwise a worktree row.
-		if m.formWorktree == "" {
-			m.preparingKey = "repo:" + server + "/" + repo
-		} else {
-			m.preparingKey = "wt:" + server + "/" + repo + "/" + m.formWorktree
+		// Track the prepare as a task keyed on the new session's row —
+		// the worktree row above it spins too (ancestor overlap), and a
+		// dd on that worktree is blocked until the prepare lands.
+		key := "sess:" + server + "/" + repo + "/" + wt + "/" + name
+		if t := m.runningTaskFor(key); t != nil {
+			return m, m.noteFailure("target is busy: "+t.label,
+				"wait for the running action to finish before creating this session")
 		}
-		progress := m.setStatusProgress(fmt.Sprintf("preparing %s/%s/%s/%s…", server, repo, wt, name))
-		return m, tea.Batch(progress, m.newSessionPrepareCmd(server, repo, wt, name, prompt))
+		id, tick := m.startTask(key, fmt.Sprintf("preparing %s/%s/%s/%s…", server, repo, wt, name))
+		return m, tea.Batch(tick, m.newSessionPrepareCmd(server, repo, wt, name, prompt, id))
 	}
 	var cmd tea.Cmd
 	*fields[m.formFocus], cmd = fields[m.formFocus].Update(msg)
 	return m, cmd
-}
-
-func (m *tuiModel) handleConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "esc", "n", "ctrl+c":
-		m.mode = modeBrowse
-		return m, nil
-	case "y", "enter":
-		row := m.confirmRow
-		m.mode = modeBrowse
-		switch row.kind {
-		case rowSession:
-			removeWT := row.note == "with-worktree"
-			return m, m.killCmd(row.server, row.repo, row.session.Session, row.session.Name, row.session.Worktree, removeWT)
-		case rowWorktree:
-			var wtPath string
-			if row.wt != nil {
-				wtPath = row.wt.Path
-			}
-			return m, m.killWorktreeCmd(row.server, row.repo, row.worktree, wtPath)
-		}
-	}
-	return m, nil
 }
 
 // handleFilterKey edits m.filter live (each keystroke triggers rebuildRows so
@@ -1094,10 +1131,13 @@ func (m *tuiModel) activateRow() (tea.Model, tea.Cmd) {
 	case rowRepo, rowWorktree:
 		return m.startNewForm()
 	case rowSession:
-		m.preparingKey = rowKey(row)
-		progress := m.setStatusProgress(fmt.Sprintf("preparing %s/%s/%s/%s…",
+		if t := m.runningTaskFor(rowKey(row)); t != nil {
+			return m, m.noteFailure("row is busy: "+t.label,
+				"wait for the running action to finish before opening this session")
+		}
+		id, tick := m.startTask(rowKey(row), fmt.Sprintf("opening %s/%s/%s/%s…",
 			row.server, row.repo, row.session.Worktree, row.session.Session))
-		return m, tea.Batch(progress, m.attachCmd(row.server, row.repo, *row.session))
+		return m, tea.Batch(tick, m.attachCmd(row.server, row.repo, *row.session, id))
 	}
 	return m, nil
 }
@@ -1297,32 +1337,42 @@ func (m *tuiModel) startNewForm() (tea.Model, tea.Cmd) {
 // session row we keep the worktree (the branch is the user's work); on a
 // worktree row we kill any sessions on it and `git worktree remove`. The
 // synthetic "main" worktree is refused.
+//
+// The delete runs as a tracked background task: the row keeps a spinner,
+// the footer lists the operation, and a second action targeting the same
+// subtree is refused until it finishes.
 func (m *tuiModel) executeDelete() (tea.Model, tea.Cmd) {
 	if m.cursor >= len(m.rows) {
 		return m, nil
 	}
 	row := m.rows[m.cursor]
+	if t := m.runningTaskFor(rowKey(row)); t != nil {
+		return m, m.noteFailure("row is busy: "+t.label,
+			"wait for the running action to finish before starting another on the same target")
+	}
 	switch row.kind {
 	case rowSession:
 		log().Info("tui-dd-session",
 			"server", row.server, "repo", row.repo,
 			"wt", row.session.Worktree, "session", row.session.Session)
-		return m, m.killCmd(row.server, row.repo, row.session.Session, row.session.Name, row.session.Worktree, false)
+		id, tick := m.startTask(rowKey(row),
+			fmt.Sprintf("deleting session %s/%s/%s", row.repo, row.session.Worktree, row.session.Session))
+		return m, tea.Batch(tick, m.killCmd(row.server, row.repo, row.session.Name, row.session.Worktree, false, id))
 	case rowRepo:
 		// Repos are deliberately not deletable from cctl. The post-incident
 		// rule is: cctl can only delete things INSIDE the worktree_base.
 		// Repos live outside it (they're the user's source of truth). Show
 		// an explicit, visible refusal instead of silently doing nothing.
 		log().Info("tui-dd-repo-refused", "server", row.server, "repo", row.repo)
-		return m, m.setStatusFailure("can't delete a repo from cctl",
+		return m, m.noteFailure("can't delete a repo from cctl",
 			"cctl only deletes worktrees and sessions; the repo dir is yours to manage (rm or git clone manually)")
 	case rowServer:
 		log().Info("tui-dd-server-refused", "server", row.server)
-		return m, m.setStatusFailure("can't delete a server",
+		return m, m.noteFailure("can't delete a server",
 			"servers are config entries; edit ~/.cctl.yaml to remove one")
 	case rowWorktree:
 		if row.worktree == "main" {
-			return m, m.setStatusFailure("can't delete the main worktree",
+			return m, m.noteFailure("can't delete the main worktree",
 				"that's the repo's primary checkout; cctl will never remove it")
 		}
 		// Pass the *actual* on-disk path from `git worktree list` (not the
@@ -1332,51 +1382,32 @@ func (m *tuiModel) executeDelete() (tea.Model, tea.Cmd) {
 		if row.wt != nil {
 			wtPath = row.wt.Path
 		}
+		// Snapshot the sessions running on this worktree NOW, on the UI
+		// goroutine — the kill closure runs concurrently and must not read
+		// m.state (the loaders mutate it).
+		var victims []string
+		if st := m.state[row.server]; st != nil {
+			for _, s := range st.sessions {
+				if s.Repo == row.repo && s.Worktree == row.worktree {
+					victims = append(victims, s.Name)
+				}
+			}
+		}
 		log().Info("tui-dd-worktree",
 			"server", row.server, "repo", row.repo, "wt", row.worktree, "path", wtPath)
-		return m, m.killWorktreeCmd(row.server, row.repo, row.worktree, wtPath)
+		id, tick := m.startTask(rowKey(row),
+			fmt.Sprintf("removing worktree %s/%s (%d session(s))", row.repo, row.worktree, len(victims)))
+		return m, tea.Batch(tick, m.killWorktreeCmd(row.server, row.repo, row.worktree, wtPath, victims, id))
 	default:
-		return m, m.setStatusFailure("nothing to delete on this row", "select a session or worktree")
+		return m, m.noteFailure("nothing to delete on this row", "select a session or worktree")
 	}
 }
 
-// startKillConfirm is the older modal-based delete flow (kept around for
-// completeness but no longer triggered by any keybinding — dd routes
-// straight through executeDelete instead). Left in case we want a
-// confirmation prompt later.
-func (m *tuiModel) startKillConfirm(withWorktree bool) (tea.Model, tea.Cmd) {
-	if m.cursor >= len(m.rows) {
-		return m, nil
-	}
-	row := m.rows[m.cursor]
-	switch row.kind {
-	case rowSession:
-		m.confirmRow = row
-		if withWorktree {
-			m.confirmRow.note = "with-worktree"
-		} else {
-			m.confirmRow.note = "keep-worktree"
-		}
-		m.mode = modeConfirm
-	case rowWorktree:
-		if row.worktree == "main" {
-			m.statusErr = "cannot remove the main worktree (it's the repo's primary checkout)"
-			return m, nil
-		}
-		m.confirmRow = row
-		m.confirmRow.note = "wt-remove"
-		m.mode = modeConfirm
-	default:
-		m.statusErr = "select a session or worktree to delete"
-	}
-	return m, nil
-}
-
-func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo) tea.Cmd {
+func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		r, err := m.cfg.resolve(serverName, repoName)
 		if err != nil {
-			return prepareDoneMsg{err: err}
+			return prepareDoneMsg{err: err, taskID: taskID}
 		}
 		// attachOrRespawn (not bare `tmux attach`): cmux re-runs the wrapper
 		// script when restoring the workspace, possibly long after the
@@ -1398,11 +1429,12 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo) tea.
 			// session's old tab (if any) is a dead shell; the wrapper
 			// must run, so force a fresh workspace.
 			focusExisting: sess.Attached,
+			taskID:        taskID,
 		}
 	}
 }
 
-func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionName, prompt string) tea.Cmd {
+func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionName, prompt string, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
 		log().Info("tui-new-session-prepare-start",
@@ -1411,14 +1443,14 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 		if err != nil {
 			log().Error("tui-new-session-resolve-fail",
 				"server", serverName, "repo", repoName, "err", err.Error())
-			return prepareDoneMsg{err: err}
+			return prepareDoneMsg{err: err, taskID: taskID}
 		}
 		cmdStr, err := prepareClaude(r, worktree, sessionName, "", prompt, false, false)
 		log().Info("tui-new-session-prepare-done",
 			"server", serverName, "session", sessionName,
 			"dur", time.Since(start).String(), "err", errString(err))
 		if err != nil {
-			return prepareDoneMsg{err: err}
+			return prepareDoneMsg{err: err, taskID: taskID}
 		}
 		return prepareDoneMsg{
 			server:  r.Server,
@@ -1428,6 +1460,7 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 			title:   fmt.Sprintf("%s/%s/%s", repoName, worktree, sessionName),
 			label:   fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
 			refresh: serverName,
+			taskID:  taskID,
 		}
 	}
 }
@@ -1459,14 +1492,14 @@ func workspaceCwd(r *Resolved, worktreeName string) string {
 	return expandPath(worktreePath(r.WorktreeBase, r.RepoName, worktreeName))
 }
 
-func (m *tuiModel) killCmd(serverName, repoName, sessionName, tmuxFullName, worktreeName string, removeWorktree bool) tea.Cmd {
+func (m *tuiModel) killCmd(serverName, repoName, tmuxFullName, worktreeName string, removeWorktree bool, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		r, err := m.cfg.resolve(serverName, repoName)
 		if err != nil {
-			return actionDoneMsg{err: err}
+			return actionDoneMsg{err: err, taskID: taskID}
 		}
 		if _, err := runRemote(r.Server, fmt.Sprintf("tmux kill-session -t %s", shellQuote(tmuxFullName))); err != nil {
-			return actionDoneMsg{err: fmt.Errorf("kill %s: %w", tmuxFullName, err)}
+			return actionDoneMsg{err: fmt.Errorf("kill %s: %w", tmuxFullName, err), taskID: taskID}
 		}
 		// "main" worktree is the original checkout — never delete it.
 		if removeWorktree && worktreeName != "main" {
@@ -1476,16 +1509,19 @@ func (m *tuiModel) killCmd(serverName, repoName, sessionName, tmuxFullName, work
 					msg:     fmt.Sprintf("killed %s (worktree removal failed)", tmuxFullName),
 					err:     fmt.Errorf("remove worktree %s: %w", wt, err),
 					refresh: serverName,
+					taskID:  taskID,
 				}
 			}
 			return actionDoneMsg{
 				msg:     fmt.Sprintf("killed %s + removed worktree", tmuxFullName),
 				refresh: serverName,
+				taskID:  taskID,
 			}
 		}
 		return actionDoneMsg{
 			msg:     fmt.Sprintf("killed %s (worktree kept)", tmuxFullName),
 			refresh: serverName,
+			taskID:  taskID,
 		}
 	}
 }
@@ -1499,14 +1535,18 @@ func (m *tuiModel) killCmd(serverName, repoName, sessionName, tmuxFullName, work
 // known (TUI flow). If empty we fall back to the cctl-convention path
 // `<worktree_base>/<repo>/<worktree_name>` — the legacy behavior, which
 // silently no-ops for worktrees that live outside that convention.
-func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath string) tea.Cmd {
+//
+// `victims` is the list of tmux session names to kill first, snapshotted
+// by the caller on the UI goroutine — this closure runs concurrently with
+// the model and must not read m.state.
+func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath string, victims []string, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		if worktreeName == "main" {
-			return actionDoneMsg{err: fmt.Errorf("cannot remove the main worktree")}
+			return actionDoneMsg{err: fmt.Errorf("cannot remove the main worktree"), taskID: taskID}
 		}
 		r, err := m.cfg.resolve(serverName, repoName)
 		if err != nil {
-			return actionDoneMsg{err: err}
+			return actionDoneMsg{err: err, taskID: taskID}
 		}
 		// Belt-and-braces: even if the row was misclassified by a
 		// samePath regression, refuse to act when the on-disk path
@@ -1520,19 +1560,7 @@ func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath st
 			return actionDoneMsg{err: fmt.Errorf(
 				"refused: wtPath %s is the main checkout (repo.Path=%s) — the row was likely mis-classified",
 				wtPath, r.Repo.Path,
-			)}
-		}
-		// Snapshot the sessions running on this worktree before we start
-		// killing — we read from the model's last-known state (no SSH
-		// round-trip needed) so multiple kills don't fight each other.
-		st := m.state[serverName]
-		var victims []string
-		if st != nil {
-			for _, s := range st.sessions {
-				if s.Repo == repoName && s.Worktree == worktreeName {
-					victims = append(victims, s.Name)
-				}
-			}
+			), taskID: taskID}
 		}
 		wt := wtPath
 		if wt == "" {
@@ -1551,12 +1579,14 @@ func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath st
 				msg:     fmt.Sprintf("killed %d session(s); worktree removal failed", len(victims)),
 				err:     fmt.Errorf("remove worktree %s: %w", wt, err),
 				refresh: serverName,
+				taskID:  taskID,
 			}
 		}
 		log().Info("tui-kill-worktree-ok", "wt", wt, "sessions_killed", len(victims))
 		return actionDoneMsg{
 			msg:     fmt.Sprintf("removed %s (path=%s, killed %d session(s); branch kept)", worktreeName, wt, len(victims)),
 			refresh: serverName,
+			taskID:  taskID,
 		}
 	}
 }
@@ -1804,8 +1834,6 @@ func (m *tuiModel) View() string {
 	switch m.mode {
 	case modeNewForm:
 		return m.formView()
-	case modeConfirm:
-		return m.confirmView()
 	default:
 		return m.browseView()
 	}
@@ -2153,24 +2181,24 @@ func highlightMatch(name, needle string) string {
 
 func (m *tuiModel) footer() string {
 	var b strings.Builder
-	// Status bar lives on its own line above the legend, separated by a
-	// blank line so the moving spinner / colored message reads as a
-	// distinct UI element instead of running into the keybinding list.
-	statusLine := ""
+	// The task list lives above the legend, separated by a blank line:
+	// one line per running background action (spinner + elapsed) and per
+	// recently finished one (✓/✗, auto-expiring). Unlike the old single
+	// status slot, concurrent deletes/spawns each keep their own line.
+	var lines []string
 	switch {
 	case m.pendingD:
-		statusLine = errorStyle.Bold(true).Render("press d again to delete — any other key cancels")
+		lines = append(lines, errorStyle.Bold(true).Render("press d again to delete — any other key cancels"))
 	case m.statusErr != "":
-		statusLine = errorStyle.Width(m.errorWidth()).Render("error: " + m.statusErr)
+		lines = append(lines, errorStyle.Width(m.errorWidth()).Render("error: "+m.statusErr))
 	default:
-		if line := m.renderStatusBar(); line != "" {
-			statusLine = line
-		} else if m.statusMsg != "" {
-			statusLine = dimStyle.Render(m.statusMsg)
+		lines = m.renderTaskLines()
+		if len(lines) == 0 && m.statusMsg != "" {
+			lines = append(lines, dimStyle.Render(m.statusMsg))
 		}
 	}
-	if statusLine != "" {
-		b.WriteString(statusLine + "\n\n")
+	if len(lines) > 0 {
+		b.WriteString(strings.Join(lines, "\n") + "\n\n")
 	}
 	// Legend: one shortcut per line. Was a 130-column single line that
 	// truncated awkwardly on narrow terminals.
@@ -2180,25 +2208,52 @@ func (m *tuiModel) footer() string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderStatusBar draws the action status indicator (spinner / ✓ / ✗ with
-// label). Returns "" when status is idle so the caller can fall through to
-// other lines.
-func (m *tuiModel) renderStatusBar() string {
-	switch m.status.kind {
-	case statusProgress:
-		spin := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
-		// Use the warn (amber) hue + bold so it pops vs the dim legend.
-		return warnStyle.Bold(true).Render(spin+" "+m.status.label) + dimStyle.Render(" — working…")
-	case statusSuccess:
-		return okStyle.Bold(true).Render("✓ " + m.status.label)
-	case statusFailure:
-		head := errorStyle.Bold(true).Render("✗ " + m.status.label)
-		if m.status.detail == "" {
-			return head
+// maxTaskLines caps the footer's task list so a burst of actions doesn't
+// push the tree off screen. Running tasks get priority over finished ones.
+const maxTaskLines = 6
+
+// renderTaskLines draws one line per visible background task: running
+// first (spinner + label + elapsed), then recently finished (✓ / ✗ +
+// label, with the error detail on failures).
+func (m *tuiModel) renderTaskLines() []string {
+	var running, finished []*bgTask
+	for _, t := range m.tasks {
+		if t.done {
+			finished = append(finished, t)
+		} else {
+			running = append(running, t)
 		}
-		return head + dimStyle.Render(" — "+abbrev(m.status.detail, 200))
 	}
-	return ""
+	var lines []string
+	spin := spinnerFrames[m.spinnerFrame%len(spinnerFrames)]
+	for _, t := range running {
+		if len(lines) >= maxTaskLines {
+			break
+		}
+		line := warnStyle.Bold(true).Render(spin + " " + t.label)
+		if elapsed := time.Since(t.started).Round(time.Second); elapsed >= time.Second {
+			line += dimStyle.Render(fmt.Sprintf(" (%s)", elapsed))
+		}
+		lines = append(lines, line)
+	}
+	for _, t := range finished {
+		if len(lines) >= maxTaskLines {
+			break
+		}
+		if t.failed {
+			line := errorStyle.Bold(true).Render("✗ " + t.label)
+			if t.detail != "" {
+				line += dimStyle.Render(" — " + abbrev(t.detail, 200))
+			}
+			lines = append(lines, line)
+		} else {
+			lines = append(lines, okStyle.Bold(true).Render("✓ "+t.label))
+		}
+	}
+	if hidden := len(running) + len(finished) - len(lines); hidden > 0 {
+		lines = append(lines, dimStyle.Render(fmt.Sprintf("… and %d more", hidden)))
+	}
+	return lines
 }
 
 // legendLines is the keybinding reference shown at the bottom of the TUI.
@@ -2266,46 +2321,6 @@ func (m *tuiModel) formView() string {
 		b.WriteString(dimStyle.Render("worktree = `main` reuses the primary checkout; any other name creates a new worktree on branch <prefix>/<name>.") + "\n")
 	}
 	b.WriteString(dimStyle.Render("⏎ submit · tab switch · esc cancel"))
-	return b.String()
-}
-
-func (m *tuiModel) confirmView() string {
-	row := m.confirmRow
-	var b strings.Builder
-	switch row.kind {
-	case rowSession:
-		tmuxFullName := row.session.Name
-		withWT := row.note == "with-worktree"
-		b.WriteString(titleStyle.Render("kill session?"))
-		b.WriteString("\n\n")
-		b.WriteString("  " + tmuxFullName + dimStyle.Render(fmt.Sprintf("  on %s", row.server)) + "\n\n")
-		b.WriteString("  • kill tmux session\n")
-		switch {
-		case withWT && row.session.Worktree == "main":
-			b.WriteString("  • " + dimStyle.Render("worktree=main is the primary checkout — never removed") + "\n")
-		case withWT:
-			b.WriteString("  • remove worktree (branch kept)\n")
-		default:
-			b.WriteString("  • " + dimStyle.Render("keep worktree") + "\n")
-		}
-	case rowWorktree:
-		var victims int
-		st := m.state[row.server]
-		if st != nil {
-			for _, s := range st.sessions {
-				if s.Repo == row.repo && s.Worktree == row.worktree {
-					victims++
-				}
-			}
-		}
-		b.WriteString(titleStyle.Render("remove worktree?"))
-		b.WriteString("\n\n")
-		b.WriteString("  " + row.repo + "/" + row.worktree + dimStyle.Render(fmt.Sprintf("  on %s", row.server)) + "\n\n")
-		b.WriteString(fmt.Sprintf("  • kill %d running session(s) under this worktree\n", victims))
-		b.WriteString("  • git worktree remove (branch kept)\n")
-	}
-	b.WriteString("\n")
-	b.WriteString(dimStyle.Render("y / ⏎ confirm · n / esc cancel"))
 	return b.String()
 }
 
