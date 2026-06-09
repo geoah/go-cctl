@@ -287,12 +287,12 @@ func sessionRoundTrip(t *testing.T, srv Server, label string) {
 	}
 
 	// Idempotent path: prepareClaude detects an existing session via
-	// hasSession() and produces a `tmux attach` command rather than a
-	// fresh new-session. We don't actually attach here (no tty), but we
-	// can verify the precondition that drives that branch: hasSession is
-	// true *and* a duplicate new-session would fail (proving the branch
-	// is necessary). The actual attach path is exercised end-to-end via
-	// `cctl claude` itself in interactive use.
+	// hasSession() and produces a `tmux new-session -A` command (attach
+	// if alive, resurrect if not) rather than a fresh launch. We don't
+	// actually attach here (no tty), but we can verify the precondition
+	// that drives that branch: hasSession is true *and* a duplicate
+	// new-session (without -A) would fail. The actual attach path is
+	// exercised end-to-end via `cctl claude` itself in interactive use.
 	if _, err := runRemote(srv, fmt.Sprintf("tmux new-session -d -s %s true 2>&1", shellQuote(tname))); err == nil {
 		t.Errorf("[%s] expected duplicate new-session to fail (proves attach branch is needed)", label)
 	}

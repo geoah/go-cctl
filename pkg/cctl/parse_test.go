@@ -414,6 +414,38 @@ func TestClaudeLaunchScript_AppendsPromptWhenProvided(t *testing.T) {
 	}
 }
 
+func TestClaudeLaunchScript_GuardsAgainstMissingCwd(t *testing.T) {
+	got := claudeLaunchScript("/wt", nil, "")
+	// If the worktree was deleted, the cd must abort the script (after a
+	// readable pause) instead of letting claude launch in whatever
+	// directory the shell happened to start in.
+	if !strings.Contains(got, `cd "/wt" || {`) {
+		t.Errorf("launch script must guard the cd; got:\n%s", got)
+	}
+}
+
+// attachOrRespawn must emit `tmux new-session -A`, not a bare attach: the
+// command is baked into a wrapper script that cmux persists in its
+// workspace layout and re-runs on restore, possibly long after the tmux
+// session died. A bare attach then fails with "can't find session";
+// `new-session -A` resurrects it (claude --continue) in the worktree.
+func TestAttachOrRespawn_SurvivesDeadSession(t *testing.T) {
+	r := &Resolved{ClaudeFlags: []string{"--dangerously-skip-permissions"}}
+	got := attachOrRespawn(r, "cctl/rxtx_dev/main/mneme", "/repos/rxtx.dev")
+	if !strings.Contains(got, "tmux new-session -A -s cctl/rxtx_dev/main/mneme") {
+		t.Errorf("want new-session -A with the session name; got:\n%s", got)
+	}
+	if strings.Contains(got, "tmux attach") {
+		t.Errorf("bare tmux attach must not appear; got:\n%s", got)
+	}
+	if !strings.Contains(got, `cd "/repos/rxtx.dev"`) {
+		t.Errorf("respawn launch must cd into the session's worktree; got:\n%s", got)
+	}
+	if !strings.Contains(got, "--dangerously-skip-permissions") {
+		t.Errorf("respawn launch must keep the repo's claude flags; got:\n%s", got)
+	}
+}
+
 func TestClaudeLaunchScript_PrependsCmuxBinWhenInsideCmux(t *testing.T) {
 	got := claudeLaunchScript("/wt", nil, "")
 	// The script must guard with CMUX_WORKSPACE_ID so it's a no-op when

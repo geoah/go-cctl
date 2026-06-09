@@ -187,7 +187,11 @@ func claudeLaunchScript(cwd string, claudeFlags []string, prompt string) string 
 		fresh = append(fresh, prompt)
 		resume = append(resume, prompt)
 	}
-	return fmt.Sprintf(`cd %s
+	return fmt.Sprintf(`cd %s || {
+  echo "cctl: worktree directory is gone — press Enter to close"
+  read _ || true
+  exit 1
+}
 # Route claude through cmux's wrapper when running inside cmux so the
 # notification + session-tracking hooks attach. Harmless on remote
 # (the path simply doesn't exist).

@@ -92,6 +92,16 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 		return "", err
 	}
 
+	// Work out the session's working directory up front — both branches
+	// need it. "main" is the alias for the repo's own checkout; no extra
+	// worktree is created and claude runs in the original repo path.
+	var cwd string
+	if noWorktree || worktreeName == "main" {
+		cwd = r.Repo.Path
+	} else {
+		cwd = worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
+	}
+
 	if exists {
 		if prompt != "" {
 			// Type the prompt into the running claude REPL, then attach.
@@ -104,10 +114,10 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 				return "", fmt.Errorf("send-keys to %s: %w", tname, err)
 			}
 		}
-		return fmt.Sprintf("tmux attach -t %s", shellQuote(tname)), nil
+		return attachOrRespawn(r, tname, cwd), nil
 	}
 
-	// New session — work out paths and create the worktree if needed.
+	// New session — create the worktree if needed.
 	branch := branchOverride
 	if branch == "" {
 		if r.BranchPrefix != "" {
@@ -117,16 +127,7 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 		}
 	}
 
-	var cwd string
-	switch {
-	case noWorktree:
-		cwd = r.Repo.Path
-	case worktreeName == "main":
-		// "main" is the alias for the repo's own checkout — no extra worktree
-		// is created; we just launch claude in the original repo path.
-		cwd = r.Repo.Path
-	default:
-		cwd = worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
+	if !noWorktree && worktreeName != "main" {
 		script := ensureWorktreeScript(r.Repo.Path, cwd, branch, r.DefaultBranch, r.WorktreePostCreate)
 		if out, err := runRemote(r.Server, script); err != nil {
 			if out != "" {
@@ -148,4 +149,19 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 	// `new-session -A` creates if absent, attaches if present — which is what we
 	// want, and avoids a race between has-session and new-session.
 	return fmt.Sprintf("tmux new-session -A -s %s %s", shellQuote(tname), shellQuote(launch)), nil
+}
+
+// attachOrRespawn returns the shell command for landing in a session that
+// exists right now. A bare `tmux attach` would be the obvious choice, but
+// the command gets baked into a wrapper script that can outlive the
+// session: cmux persists the script path in its workspace layout and
+// re-runs it when restoring the workspace, by which point the session may
+// have died (claude exited, server rebooted, ...) and attach would fail
+// with tmux's terse "can't find session". `new-session -A` attaches while
+// the session is alive and otherwise resurrects it in the same worktree —
+// claudeLaunchScript's `claude --continue` branch picks the conversation
+// back up.
+func attachOrRespawn(r *Resolved, tname, cwd string) string {
+	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "")
+	return fmt.Sprintf("tmux new-session -A -s %s %s", shellQuote(tname), shellQuote(launch))
 }

@@ -1374,10 +1374,17 @@ func (m *tuiModel) attachCmd(serverName, repoName, sessionName, tmuxFullName, wo
 		if err != nil {
 			return prepareDoneMsg{err: err}
 		}
+		// attachOrRespawn (not bare `tmux attach`): cmux re-runs the wrapper
+		// script when restoring the workspace, possibly long after the
+		// session died — see the helper's doc comment.
+		cwd := r.Repo.Path
+		if worktreeName != "" && worktreeName != "main" {
+			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
+		}
 		return prepareDoneMsg{
 			server:  r.Server,
 			useMosh: r.UseMosh,
-			cmdStr:  fmt.Sprintf("tmux attach -t %s", shellQuote(tmuxFullName)),
+			cmdStr:  attachOrRespawn(r, tmuxFullName, cwd),
 			cwd:     workspaceCwd(r, worktreeName),
 			title:   fmt.Sprintf("%s/%s/%s", repoName, worktreeName, sessionName),
 			label:   fmt.Sprintf("%s/%s/%s", serverName, repoName, sessionName),
