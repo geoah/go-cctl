@@ -1098,6 +1098,55 @@ func TestPreparingPrefix_TaskTargetsSpin(t *testing.T) {
 	}
 }
 
+// ---- tmux name sanitization --------------------------------------------------
+
+// TestTmuxName_SanitizesLikeTmux pins the rxtx.dev fix: tmux silently
+// replaces '.' and ':' in session names, so cctl must build names that
+// already match what tmux will store — otherwise has-session/attach
+// target a name that doesn't exist.
+func TestTmuxName_SanitizesLikeTmux(t *testing.T) {
+	if got := tmuxName("rxtx.dev", "main", "mneme"); got != "cctl/rxtx_dev/main/mneme" {
+		t.Errorf("tmuxName = %q, want dots replaced like tmux does", got)
+	}
+	if got := tmuxName("plain", "wt", "s"); got != "cctl/plain/wt/s" {
+		t.Errorf("tmuxName = %q, names without reserved chars must pass through", got)
+	}
+}
+
+// TestNormalizeSessionNames maps parsed-back sanitized components to the
+// real repo/worktree names so sessions group under the right rows instead
+// of a ghost "rxtx_dev" repo. Exact matches must win over remaps.
+func TestNormalizeSessionNames(t *testing.T) {
+	st := &serverState{
+		repos: map[string]Repo{
+			"rxtx.dev": {Path: "/r/rxtx.dev"},
+			"exact_one": {Path: "/r/exact_one"},
+		},
+		worktrees: map[string][]Worktree{
+			"rxtx.dev": {{Name: "v1.2"}, {Name: "main"}},
+		},
+		sessions: []SessionInfo{
+			{Repo: "rxtx_dev", Worktree: "v1_2", Session: "a"},
+			{Repo: "rxtx_dev", Worktree: "main", Session: "b"},
+			{Repo: "exact_one", Worktree: "wt", Session: "c"},
+			{Repo: "unknown_repo", Worktree: "wt", Session: "d"},
+		},
+	}
+	st.normalizeSessionNames()
+	if st.sessions[0].Repo != "rxtx.dev" || st.sessions[0].Worktree != "v1.2" {
+		t.Errorf("session a: got %s/%s, want rxtx.dev/v1.2", st.sessions[0].Repo, st.sessions[0].Worktree)
+	}
+	if st.sessions[1].Repo != "rxtx.dev" || st.sessions[1].Worktree != "main" {
+		t.Errorf("session b: got %s/%s, want rxtx.dev/main", st.sessions[1].Repo, st.sessions[1].Worktree)
+	}
+	if st.sessions[2].Repo != "exact_one" {
+		t.Errorf("session c: exact repo name must be kept, got %s", st.sessions[2].Repo)
+	}
+	if st.sessions[3].Repo != "unknown_repo" {
+		t.Errorf("session d: unmatched repo must stay as parsed, got %s", st.sessions[3].Repo)
+	}
+}
+
 // ---- plain-terminal sessions (`t` key) --------------------------------------
 
 // TestTerminalSessions covers the t-key plumbing: name recognition (so
@@ -1140,6 +1189,166 @@ func TestTerminalSessions(t *testing.T) {
 	}
 	if got := m.freeTerminalName("w", "r", "fresh"); got != "term" {
 		t.Errorf("freeTerminalName(fresh wt) = %q want term", got)
+	}
+}
+
+// ---- cursor identity across rebuilds ----------------------------------------
+
+// TestRestoreCursor_FollowsRowIdentity is the regression test for "dd
+// moves my cursor to the wrong place": the cursor must track the row it
+// was on (by identity, not index) when the tree changes shape, and fall
+// back to the nearest surviving ancestor when that row was deleted.
+func TestRestoreCursor_FollowsRowIdentity(t *testing.T) {
+	sessA := &SessionInfo{Repo: "r1", Worktree: "wt", Session: "a"}
+	sessB := &SessionInfo{Repo: "r1", Worktree: "wt", Session: "b"}
+	srv := treeRow{kind: rowServer, server: "w"}
+	repo := treeRow{kind: rowRepo, server: "w", repo: "r1"}
+	wt := treeRow{kind: rowWorktree, server: "w", repo: "r1", worktree: "wt"}
+	rowA := treeRow{kind: rowSession, server: "w", repo: "r1", worktree: "wt", session: sessA}
+	rowB := treeRow{kind: rowSession, server: "w", repo: "r1", worktree: "wt", session: sessB}
+
+	// Cursor on session b; a delete of session a (above it) lands and the
+	// refresh removes that row. The highlight must stay on b, not on
+	// whatever slid into index 4.
+	m := &tuiModel{rows: []treeRow{srv, repo, wt, rowA, rowB}, cursor: 4}
+	prev := m.rows[m.cursor]
+	m.rows = []treeRow{srv, repo, wt, rowB}
+	m.restoreCursor(&prev)
+	if got := m.rows[m.cursor]; got.kind != rowSession || got.session.Session != "b" {
+		t.Errorf("cursor should follow session b, landed on %+v", got)
+	}
+
+	// Cursor on the row that was itself deleted: fall back to its
+	// worktree row.
+	m = &tuiModel{rows: []treeRow{srv, repo, wt, rowA, rowB}, cursor: 3}
+	prev = m.rows[m.cursor]
+	m.rows = []treeRow{srv, repo, wt, rowB}
+	m.restoreCursor(&prev)
+	if got := m.rows[m.cursor]; got.kind != rowWorktree || got.worktree != "wt" {
+		t.Errorf("deleted row's cursor should land on its worktree, landed on %+v", got)
+	}
+
+	// Whole worktree gone: fall back to the repo row.
+	m = &tuiModel{rows: []treeRow{srv, repo, wt, rowA, rowB}, cursor: 2}
+	prev = m.rows[m.cursor]
+	m.rows = []treeRow{srv, repo}
+	m.restoreCursor(&prev)
+	if got := m.rows[m.cursor]; got.kind != rowRepo || got.repo != "r1" {
+		t.Errorf("deleted worktree's cursor should land on its repo, landed on %+v", got)
+	}
+}
+
+// ---- restore (R) and upgrade (UU) -------------------------------------------
+
+// TestRestoreAll_PicksOnlyDetachedSessionsOnConnectedServers pins R's
+// selection rule: attached sessions already have a live client in some
+// tab (restoring would mirror them), and servers that aren't connected
+// have stale lists.
+func TestRestoreAll_PicksOnlyDetachedSessionsOnConnectedServers(t *testing.T) {
+	m := &tuiModel{
+		cfg:         &Config{Servers: map[string]Server{"up": {Local: true}, "down": {}}},
+		serverNames: []string{"down", "up"},
+		state: map[string]*serverState{
+			"up": {conn: connConnected, sessionsLoaded: true, sessions: []SessionInfo{
+				{Repo: "r", Worktree: "wt", Session: "a", Name: "cctl/r/wt/a", Attached: false},
+				{Repo: "r", Worktree: "wt", Session: "b", Name: "cctl/r/wt/b", Attached: true},
+			}},
+			"down": {conn: connDisconnected, sessionsLoaded: true, sessions: []SessionInfo{
+				{Repo: "r", Worktree: "wt", Session: "c", Name: "cctl/r/wt/c", Attached: false},
+			}},
+		},
+	}
+	_, cmd := m.restoreAll()
+	if cmd == nil {
+		t.Fatalf("restoreAll with a detached session should produce a cmd")
+	}
+	last := lastTask(m)
+	if last == nil || last.done {
+		t.Fatalf("restoreAll should register a running task, got %+v", last)
+	}
+	if !strings.Contains(last.label, "1 session tab") {
+		t.Errorf("only session 'a' qualifies (b attached, c's server down); label = %q", last.label)
+	}
+
+	// All-attached: nothing to do, instant success notice.
+	m2 := &tuiModel{
+		cfg:         m.cfg,
+		serverNames: []string{"up"},
+		state: map[string]*serverState{
+			"up": {conn: connConnected, sessionsLoaded: true, sessions: []SessionInfo{
+				{Repo: "r", Worktree: "wt", Session: "b", Attached: true},
+			}},
+		},
+	}
+	_, _ = m2.restoreAll()
+	if last := lastTask(m2); last == nil || !last.done || last.failed {
+		t.Errorf("restoreAll with nothing to do should note success, got %+v", last)
+	}
+}
+
+// TestUpgradeTarget_ExcludesTerminalSessions: UU restarts claude
+// sessions only — plain term* shells don't run claude and must be left
+// alone.
+func TestUpgradeTarget_ExcludesTerminalSessions(t *testing.T) {
+	m := &tuiModel{
+		serverNames: []string{"w"},
+		state: map[string]*serverState{"w": {sessions: []SessionInfo{
+			{Repo: "r", Worktree: "wt", Session: "poc", Name: "cctl/r/wt/poc"},
+			{Repo: "r", Worktree: "wt", Session: "term", Name: "cctl/r/wt/term"},
+			{Repo: "r", Worktree: "wt", Session: "term2", Name: "cctl/r/wt/term2"},
+		}}},
+		rows:   []treeRow{{kind: rowServer, server: "w"}},
+		cursor: 0,
+	}
+	server, names := m.upgradeTarget()
+	if server != "w" {
+		t.Errorf("upgradeTarget server = %q want w", server)
+	}
+	if len(names) != 1 || names[0] != "cctl/r/wt/poc" {
+		t.Errorf("upgradeTarget names = %v, want only the claude session", names)
+	}
+}
+
+// TestClaudeUpdateScript_RunsInLoginShellWithInstallDirs pins the fix for
+// "UU fails on remote: claude: command not found" — bare ssh gets the
+// minimal PATH, so the update must run through a login shell with the
+// well-known install dirs prepended.
+func TestClaudeUpdateScript_RunsInLoginShellWithInstallDirs(t *testing.T) {
+	got := claudeUpdateScript("claude update")
+	for _, want := range []string{
+		"bash -lc 'claude update'",
+		"$HOME/.local/bin",
+		"$HOME/.local/share/mise/shims",
+		`export PATH=`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("claudeUpdateScript missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestUpgradeClaude_BlocksWholeServerWhileRunning: the upgrade task is
+// keyed on the server row, so any action under that server conflicts
+// until it finishes.
+func TestUpgradeClaude_BlocksWholeServerWhileRunning(t *testing.T) {
+	m := &tuiModel{
+		cfg:         &Config{Servers: map[string]Server{"w": {Local: true}}},
+		serverNames: []string{"w"},
+		state:       map[string]*serverState{"w": {}},
+		rows:        []treeRow{{kind: rowServer, server: "w"}},
+		cursor:      0,
+	}
+	_, cmd := m.upgradeClaude()
+	if cmd == nil {
+		t.Fatalf("upgradeClaude should produce a cmd")
+	}
+	if m.runningTaskFor("sess:w/r/wt/x") == nil {
+		t.Errorf("a session row under the upgrading server should read as busy")
+	}
+	// Second UU while running: refused.
+	_, _ = m.upgradeClaude()
+	if last := lastTask(m); last == nil || !last.failed || !strings.Contains(last.label, "busy") {
+		t.Errorf("upgrade while busy should refuse, got %+v", last)
 	}
 }
 

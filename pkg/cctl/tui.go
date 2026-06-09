@@ -91,6 +91,51 @@ type serverState struct {
 	connErr      error // last probe failure
 }
 
+// normalizeSessionNames maps the tmux-sanitized repo/worktree components
+// of loaded sessions back to their real names ("rxtx_dev" → "rxtx.dev")
+// using the repo and worktree lists, once those are loaded. tmux replaces
+// '.'/':' in session names, so the parsed-back components don't textually
+// match repos/worktrees whose names contain dots; without this remap such
+// sessions grouped under a ghost repo row that resolve() refused to act
+// on. Exact matches always win — a repo literally named "rxtx_dev" keeps
+// its sessions even if "rxtx.dev" also exists.
+//
+// Called whenever sessions, repos, or worktrees finish (re)loading, since
+// the three fetches land in any order.
+func (st *serverState) normalizeSessionNames() {
+	if len(st.sessions) == 0 {
+		return
+	}
+	repoBySafe := map[string]string{}
+	for name := range st.repos {
+		repoBySafe[tmuxSafeName(name)] = name
+	}
+	for i := range st.sessions {
+		s := &st.sessions[i]
+		if _, exact := st.repos[s.Repo]; !exact {
+			if real, ok := repoBySafe[s.Repo]; ok {
+				s.Repo = real
+			}
+		}
+		wts := st.worktrees[s.Repo]
+		exact := false
+		for _, wt := range wts {
+			if wt.Name == s.Worktree {
+				exact = true
+				break
+			}
+		}
+		if !exact {
+			for _, wt := range wts {
+				if tmuxSafeName(wt.Name) == s.Worktree {
+					s.Worktree = wt.Name
+					break
+				}
+			}
+		}
+	}
+}
+
 // connState is the reachability of a server's transport (ssh/mosh). It's
 // independent of repo/session health — those can fail (missing repo,
 // permission, etc.) on a server that's perfectly reachable; we don't want
@@ -327,8 +372,10 @@ type tuiModel struct {
 
 	// pendingD is true after the user pressed `d` once; the next key has
 	// to also be `d` to confirm the delete (vim's dd flow). Any other key
-	// cancels.
+	// cancels. pendingU is the same arming flow for `U` (upgrade claude +
+	// restart that server's claude sessions).
 	pendingD bool
+	pendingU bool
 
 	exitErr error
 }
@@ -773,6 +820,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.sessions = msg.sessions
 		st.sessionErr = msg.err
 		st.sessionsLoaded = true
+		st.normalizeSessionNames()
 		m.rebuildRows()
 		return m, nil
 
@@ -784,6 +832,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.repos = msg.repos
 		st.repoErr = msg.err
 		st.reposLoaded = true
+		st.normalizeSessionNames()
 		m.rebuildRows()
 		return m, nil
 
@@ -796,6 +845,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.repoStatus = msg.statuses
 		st.wtErr = msg.err
 		st.worktreesLoaded = true
+		st.normalizeSessionNames()
 		m.rebuildRows()
 		return m, nil
 
@@ -927,23 +977,23 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor = len(m.rows) - 1
 		}
 	case "h", "left":
-		m.clearPendingD()
+		m.clearPending()
 		m.collapseCurrent()
 	case "l", "right":
-		m.clearPendingD()
+		m.clearPending()
 		m.expandCurrent()
 	case "enter", " ", "shift+enter", "ctrl+enter", "alt+enter":
-		m.clearPendingD()
+		m.clearPending()
 		// Enter (and any modifier variant) opens the row in a new cmux
 		// tab. The inline / in-place mode was removed — cctl is built
 		// around cmux's workspace UI and a separate path was just an
 		// extra config knob people had to learn.
 		return m.activateRow()
 	case "n":
-		m.clearPendingD()
+		m.clearPending()
 		return m.startNewForm()
 	case "t":
-		m.clearPendingD()
+		m.clearPending()
 		return m.openTerminal()
 	case "d":
 		// vim-style dd: first d arms (red footer prompt is the
@@ -953,11 +1003,12 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// hold unpushed work). On a (w) worktree row we kill any
 		// sessions on it and remove the worktree, same as before.
 		if m.pendingD {
-			m.pendingD = false
+			m.clearPending()
 			m.statusErr = ""
 			m.statusMsg = ""
 			return m.executeDelete()
 		}
+		m.clearPending()
 		// If the row can't be deleted (server / repo / "main" worktree),
 		// don't even arm the prompt — show the refusal immediately so the
 		// user isn't led to believe a second `d` will do something.
@@ -968,41 +1019,56 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = "" // hide any earlier error so the red prompt below stands alone
 		m.statusMsg = ""
 		return m, nil
+	case "R":
+		m.clearPending()
+		return m.restoreAll()
+	case "U":
+		// UU, same arming flow as dd: upgrading claude restarts every
+		// claude session on the target server (killing whatever they
+		// were doing), so it deserves the explicit second keypress.
+		if m.pendingU {
+			m.clearPending()
+			m.statusErr = ""
+			m.statusMsg = ""
+			return m.upgradeClaude()
+		}
+		m.clearPending()
+		m.pendingU = true
+		m.statusErr = ""
+		m.statusMsg = ""
+		return m, nil
 	case "r":
-		m.clearPendingD()
+		m.clearPending()
 		m.statusErr = ""
 		log().Info("tui-refresh-all")
 		return m, m.refreshAllCmd()
 	case "/":
-		m.clearPendingD()
+		m.clearPending()
 		m.mode = modeFilter
 		m.statusErr = ""
 		log().Debug("tui-filter-start")
 		return m, nil
 	case "esc":
-		// in browse mode, esc clears any active filter or pending dd
-		if m.pendingD {
-			m.pendingD = false
-		}
+		// in browse mode, esc clears any active filter or pending dd/UU
+		m.clearPending()
 		if m.filter != "" {
 			log().Debug("tui-filter-clear")
 			m.filter = ""
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · ←→ collapse/expand · ⏎ attach · n new · t terminal · dd delete · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · ←→ collapse/expand · ⏎ attach · n new · t terminal · dd delete · R restore · UU upgrade claude · / filter · r refresh · q quit"
 	default:
-		// any other key cancels a pending dd so the next d starts fresh
-		m.clearPendingD()
+		// any other key cancels a pending dd/UU so the next press starts fresh
+		m.clearPending()
 	}
 	return m, nil
 }
 
-// clearPendingD resets the dd arming state. Safe to call unconditionally.
-func (m *tuiModel) clearPendingD() {
-	if m.pendingD {
-		m.pendingD = false
-	}
+// clearPending resets the dd/UU arming states. Safe to call unconditionally.
+func (m *tuiModel) clearPending() {
+	m.pendingD = false
+	m.pendingU = false
 }
 
 func (m *tuiModel) formFields() []*textinput.Model {
@@ -1482,6 +1548,162 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 	}
 }
 
+// restoreItem is one session whose cmux tab should be (re)opened by the
+// R-restore flow, snapshotted on the UI goroutine.
+type restoreItem struct {
+	server string
+	repo   string
+	sess   SessionInfo
+}
+
+// restoreAll handles `R`: after a cmux restart every workspace/tab is
+// gone while the tmux sessions live on — this rebuilds the cmux state by
+// opening a tab (workspace per worktree) for every detached session on
+// every connected server. Attached sessions are skipped: their client is
+// already in a tab somewhere, mirroring it helps nobody. Runs as one
+// sequential background task so concurrent spawns can't race each other
+// into duplicate workspaces.
+func (m *tuiModel) restoreAll() (tea.Model, tea.Cmd) {
+	var items []restoreItem
+	for _, server := range m.serverNames {
+		st := m.state[server]
+		if st == nil || st.conn != connConnected || !st.sessionsLoaded {
+			continue
+		}
+		for _, s := range st.sessions {
+			if s.Attached {
+				continue
+			}
+			items = append(items, restoreItem{server: server, repo: s.Repo, sess: s})
+		}
+	}
+	if len(items) == 0 {
+		return m, m.noteSuccess("nothing to restore — every session is attached (or none are running)")
+	}
+	log().Info("tui-restore-all", "sessions", len(items))
+	id, tick := m.startTask("", fmt.Sprintf("restoring %d session tab(s)…", len(items)))
+	return m, tea.Batch(tick, m.restoreCmd(items, id))
+}
+
+func (m *tuiModel) restoreCmd(items []restoreItem, taskID int) tea.Cmd {
+	return func() tea.Msg {
+		ok := 0
+		var firstErr error
+		for _, it := range items {
+			r, err := m.cfg.resolve(it.server, it.repo)
+			if err == nil {
+				cwd := r.Repo.Path
+				if it.sess.Worktree != "" && it.sess.Worktree != "main" {
+					cwd = worktreePath(r.WorktreeBase, r.RepoName, it.sess.Worktree)
+				}
+				_, err = spawnInNewWindow(m.cfg, r.Server, r.UseMosh,
+					attachOrRespawn(r, it.sess.Name, cwd),
+					workspaceCwd(r, it.sess.Worktree),
+					fmt.Sprintf("%s/%s", it.repo, it.sess.Worktree),
+					it.sess.Session,
+					false)
+			}
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%s/%s/%s: %w", it.repo, it.sess.Worktree, it.sess.Session, err)
+				}
+				log().Warn("tui-restore-fail", "server", it.server,
+					"session", it.sess.Name, "err", err.Error())
+				continue
+			}
+			ok++
+		}
+		if firstErr != nil {
+			return actionDoneMsg{
+				msg:    fmt.Sprintf("restored %d/%d session tab(s)", ok, len(items)),
+				err:    firstErr,
+				taskID: taskID,
+			}
+		}
+		return actionDoneMsg{
+			msg:     fmt.Sprintf("restored %d session tab(s)", ok),
+			refresh: "",
+			taskID:  taskID,
+		}
+	}
+}
+
+// upgradeTarget resolves what a `UU` press would act on: the selected
+// row's server and how many claude sessions (term* shells excluded) would
+// be restarted there. Used by both the armed footer prompt and the action.
+func (m *tuiModel) upgradeTarget() (string, []string) {
+	if m.cursor >= len(m.rows) {
+		return "", nil
+	}
+	server := m.rows[m.cursor].server
+	var names []string
+	if st := m.state[server]; st != nil {
+		for _, s := range st.sessions {
+			if !isTerminalSession(s.Session) {
+				names = append(names, s.Name)
+			}
+		}
+	}
+	return server, names
+}
+
+// upgradeClaude handles the second `U`: run the configured update command
+// on the selected row's server, then restart each claude session there
+// via `tmux respawn-window -k` — the window re-runs its stored launch
+// script, so claude relaunches on the new binary and `--continue` picks
+// the conversation back up. Attached clients (cmux tabs) stay attached
+// through the respawn. Plain-terminal sessions are left alone.
+func (m *tuiModel) upgradeClaude() (tea.Model, tea.Cmd) {
+	server, names := m.upgradeTarget()
+	if server == "" {
+		return m, m.noteFailure("select a row first", "U targets the server of the selected row")
+	}
+	if t := m.runningTaskFor("server:" + server); t != nil {
+		return m, m.noteFailure("server is busy: "+t.label,
+			"wait for the running action to finish before upgrading claude")
+	}
+	srv := m.cfg.Servers[server]
+	updateCmd := m.cfg.claudeUpdateCmd()
+	log().Info("tui-upgrade-claude", "server", server, "sessions", len(names), "cmd", updateCmd)
+	// Keyed on the server row so everything underneath it is blocked (and
+	// spins) while claude upgrades and the sessions bounce.
+	id, tick := m.startTask("server:"+server,
+		fmt.Sprintf("upgrading claude on %s (then restarting %d session(s))…", server, len(names)))
+	return m, tea.Batch(tick, m.upgradeClaudeCmd(server, srv, updateCmd, names, id))
+}
+
+func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd string, sessions []string, taskID int) tea.Cmd {
+	return func() tea.Msg {
+		out, err := runRemote(srv, claudeUpdateScript(updateCmd))
+		if err != nil {
+			return actionDoneMsg{
+				msg:    fmt.Sprintf("claude upgrade failed on %s", serverName),
+				err:    fmt.Errorf("%s: %w — %s", updateCmd, err, abbrev(strings.TrimSpace(out), 200)),
+				taskID: taskID,
+			}
+		}
+		restarted, failed := 0, 0
+		for _, name := range sessions {
+			if _, err := runRemote(srv, fmt.Sprintf("tmux respawn-window -k -t %s", shellQuote(name))); err != nil {
+				log().Warn("tui-respawn-fail", "server", serverName, "session", name, "err", err.Error())
+				failed++
+				continue
+			}
+			restarted++
+		}
+		msg := fmt.Sprintf("claude upgraded on %s; restarted %d session(s)", serverName, restarted)
+		if failed > 0 {
+			return actionDoneMsg{
+				msg:     msg,
+				err:     fmt.Errorf("%d session(s) failed to restart — see ~/.cctl.log", failed),
+				refresh: serverName,
+				taskID:  taskID,
+			}
+		}
+		return actionDoneMsg{msg: msg, refresh: serverName, taskID: taskID}
+	}
+}
+
 func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		r, err := m.cfg.resolve(serverName, repoName)
@@ -1803,9 +2025,67 @@ func (m *tuiModel) rebuildRows() {
 	if m.filter != "" {
 		rows = applyFilter(rows, m.filter)
 	}
+	var prev *treeRow
+	if m.cursor >= 0 && m.cursor < len(m.rows) {
+		r := m.rows[m.cursor]
+		prev = &r
+	}
 	m.rows = rows
-	if m.cursor >= len(rows) {
-		m.cursor = len(rows) - 1
+	m.restoreCursor(prev)
+}
+
+// restoreCursor keeps the highlight on the same logical row across a
+// rebuild. The cursor used to be a bare index, so any refresh that
+// changed the tree's shape (a dd landing, sessions appearing, filter
+// keystrokes) silently moved the highlight onto a stranger. Exact row
+// first; if it's gone (deleted, collapsed away), the nearest surviving
+// ancestor — after dd'ing a session that's its worktree row; after
+// dd'ing a worktree, its repo. Falls back to index-clamping when
+// nothing identifiable survives.
+func (m *tuiModel) restoreCursor(prev *treeRow) {
+	if prev != nil {
+		// Placeholder rows (empty/loading) have no rowKey; match them on
+		// full identity so a background refresh doesn't bump the cursor
+		// up to their parent.
+		if rowKey(*prev) == "" {
+			for i := range m.rows {
+				r := m.rows[i]
+				if r.kind == prev.kind && r.server == prev.server &&
+					r.repo == prev.repo && r.worktree == prev.worktree {
+					m.cursor = i
+					return
+				}
+			}
+		}
+		// Candidate keys, most specific first: the row itself, then its
+		// ancestor chain derived from the captured identity fields.
+		cands := []string{rowKey(*prev)}
+		switch {
+		case prev.kind == rowSession && prev.session != nil:
+			cands = append(cands, "wt:"+prev.server+"/"+prev.repo+"/"+prev.session.Worktree)
+		case prev.worktree != "":
+			cands = append(cands, "wt:"+prev.server+"/"+prev.repo+"/"+prev.worktree)
+		}
+		if prev.repo != "" {
+			cands = append(cands, "repo:"+prev.server+"/"+prev.repo)
+		}
+		if prev.server != "" {
+			cands = append(cands, "server:"+prev.server)
+		}
+		for _, k := range cands {
+			if k == "" {
+				continue
+			}
+			for i := range m.rows {
+				if rowKey(m.rows[i]) == k {
+					m.cursor = i
+					return
+				}
+			}
+		}
+	}
+	if m.cursor >= len(m.rows) {
+		m.cursor = len(m.rows) - 1
 	}
 	if m.cursor < 0 {
 		m.cursor = 0
@@ -2270,6 +2550,11 @@ func (m *tuiModel) footer() string {
 	switch {
 	case m.pendingD:
 		lines = append(lines, errorStyle.Bold(true).Render("press d again to delete — any other key cancels"))
+	case m.pendingU:
+		server, names := m.upgradeTarget()
+		lines = append(lines, errorStyle.Bold(true).Render(fmt.Sprintf(
+			"press U again to upgrade claude on %s and restart %d claude session(s) — any other key cancels",
+			server, len(names))))
 	case m.statusErr != "":
 		lines = append(lines, errorStyle.Width(m.errorWidth()).Render("error: "+m.statusErr))
 	default:
@@ -2347,6 +2632,8 @@ var legendLines = []string{
 	"n         new session on selected row",
 	"t         plain terminal on selected worktree (no claude)",
 	"dd        delete (worktree or session — never the repo)",
+	"R         restore tabs for all detached sessions (after cmux restart)",
+	"UU        upgrade claude on selected server + restart its sessions",
 	"/         filter (k9s-style)",
 	"r         refresh",
 	"q         quit",

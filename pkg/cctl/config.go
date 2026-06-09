@@ -39,6 +39,20 @@ type Defaults struct {
 	// but does NOT abort the session — these are conveniences, not
 	// gating checks.
 	WorktreePostCreate []string `yaml:"worktree_post_create"`
+	// ClaudeUpdate is the shell command the TUI's `U` key runs on a
+	// server to upgrade claude before restarting that server's claude
+	// sessions. Override when claude is managed by npm/mise/brew on a
+	// given setup (e.g. "npm install -g @anthropic-ai/claude-code").
+	ClaudeUpdate string `yaml:"claude_update"`
+}
+
+// claudeUpdateCmd returns the configured upgrade command, defaulting to
+// claude's built-in self-updater.
+func (c *Config) claudeUpdateCmd() string {
+	if cmd := strings.TrimSpace(c.Defaults.ClaudeUpdate); cmd != "" {
+		return cmd
+	}
+	return "claude update"
 }
 
 type Server struct {

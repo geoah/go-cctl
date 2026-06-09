@@ -7,8 +7,10 @@ its own branch, so you can run multiple long-running agents on the same
 repo without stomping on each other.
 
 Built around [cmux](https://github.com/manaflow-ai/cmux) for the
-multi-workspace UI: every session opens as a new cmux tab; re-attaching
-focuses the existing tab instead of duplicating it.
+multi-workspace UI: each worktree gets one cmux workspace and every
+session on it opens as a tab inside that workspace (`t` adds a plain
+terminal tab, no claude); re-attaching focuses the existing workspace
+instead of duplicating it.
 
 ## Install
 
@@ -57,6 +59,7 @@ defaults:
   claude_flags: ["--dangerously-skip-permissions"]
   worktree_post_create:          # run inside each fresh worktree
     - mise trust
+  # claude_update: claude update # what UU runs before restarting sessions
 
 servers:
   local:
