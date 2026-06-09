@@ -406,7 +406,11 @@ type prepareDoneMsg struct {
 	title   string // human label for the new tab/workspace (cmux rename-workspace)
 	label   string
 	refresh string
-	err     error
+	// focusExisting allows the spawner to focus a same-titled workspace
+	// instead of creating one. Only safe when a live tmux client is known
+	// to sit in that tab (attach-to-attached-session); see Spawner.
+	focusExisting bool
+	err           error
 }
 
 type actionDoneMsg struct {
@@ -430,7 +434,7 @@ type refreshServerMsg struct {
 // We always write a tiny wrapper script first so each Spawner only ever
 // has to hand its terminal one filesystem path; this dodges all the
 // arg-quoting/splitting pitfalls.
-func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, title string) (string, error) {
+func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, title string, focusExisting bool) (string, error) {
 	inner, err := interactiveCmd(s, useMosh, cmdStr)
 	if err != nil {
 		return "", fmt.Errorf("build interactive cmd: %w", err)
@@ -444,8 +448,8 @@ func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, title st
 		pref = cfg.Defaults.Spawn
 	}
 	sp, reason := detectSpawner(pref)
-	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script, "cwd", cwd, "title", title)
-	if err := sp.Spawn(script, cwd, title); err != nil {
+	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script, "cwd", cwd, "title", title, "focusExisting", focusExisting)
+	if err := sp.Spawn(script, cwd, title, focusExisting); err != nil {
 		os.Remove(script)
 		return sp.Name(), err
 	}
@@ -776,7 +780,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.setStatusFailure(msg.label+": prepare failed", msg.err.Error())
 		}
 		progress := m.setStatusProgress("opening " + msg.label + " (cmux tab)…")
-		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.title)
+		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.title, msg.focusExisting)
 		if err != nil {
 			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
 			return m, m.setStatusFailure(provider+" spawn failed", err.Error())
@@ -1093,7 +1097,7 @@ func (m *tuiModel) activateRow() (tea.Model, tea.Cmd) {
 		m.preparingKey = rowKey(row)
 		progress := m.setStatusProgress(fmt.Sprintf("preparing %s/%s/%s/%s…",
 			row.server, row.repo, row.session.Worktree, row.session.Session))
-		return m, tea.Batch(progress, m.attachCmd(row.server, row.repo, row.session.Session, row.session.Name, row.session.Worktree))
+		return m, tea.Batch(progress, m.attachCmd(row.server, row.repo, *row.session))
 	}
 	return m, nil
 }
@@ -1368,7 +1372,7 @@ func (m *tuiModel) startKillConfirm(withWorktree bool) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *tuiModel) attachCmd(serverName, repoName, sessionName, tmuxFullName, worktreeName string) tea.Cmd {
+func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo) tea.Cmd {
 	return func() tea.Msg {
 		r, err := m.cfg.resolve(serverName, repoName)
 		if err != nil {
@@ -1378,17 +1382,22 @@ func (m *tuiModel) attachCmd(serverName, repoName, sessionName, tmuxFullName, wo
 		// script when restoring the workspace, possibly long after the
 		// session died — see the helper's doc comment.
 		cwd := r.Repo.Path
-		if worktreeName != "" && worktreeName != "main" {
-			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
+		if sess.Worktree != "" && sess.Worktree != "main" {
+			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
 		}
 		return prepareDoneMsg{
 			server:  r.Server,
 			useMosh: r.UseMosh,
-			cmdStr:  attachOrRespawn(r, tmuxFullName, cwd),
-			cwd:     workspaceCwd(r, worktreeName),
-			title:   fmt.Sprintf("%s/%s/%s", repoName, worktreeName, sessionName),
-			label:   fmt.Sprintf("%s/%s/%s", serverName, repoName, sessionName),
+			cmdStr:  attachOrRespawn(r, sess.Name, cwd),
+			cwd:     workspaceCwd(r, sess.Worktree),
+			title:   fmt.Sprintf("%s/%s/%s", repoName, sess.Worktree, sess.Session),
+			label:   fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
 			refresh: serverName,
+			// Reuse the existing cmux tab only when a tmux client is
+			// already attached — that's the tab holding it. A detached
+			// session's old tab (if any) is a dead shell; the wrapper
+			// must run, so force a fresh workspace.
+			focusExisting: sess.Attached,
 		}
 	}
 }

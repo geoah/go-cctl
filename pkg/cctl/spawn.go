@@ -25,10 +25,18 @@ import (
 //
 // `title` is the human label the new tab/workspace should display. cmux
 // uses it via rename-workspace.
+//
+// `focusExisting` says a workspace with this title, if one exists, can be
+// focused instead of creating a new one. Only the attach-to-a-live-session
+// path sets it: there the existing tab holds the attached tmux client, so
+// focusing is the right move. Everywhere else (new session, resurrect) the
+// wrapper script MUST actually run, and an existing same-named workspace is
+// just a leftover whose wrapper already exited — focusing it would silently
+// do nothing.
 type Spawner interface {
 	Name() string
 	Available() bool
-	Spawn(scriptPath, cwd, title string) error
+	Spawn(scriptPath, cwd, title string, focusExisting bool) error
 }
 
 // ---- cmux ------------------------------------------------------------------
@@ -50,14 +58,18 @@ func (cmuxSpawner) Available() bool {
 }
 
 // Spawn either focuses an existing cmux workspace whose name matches the
-// requested title, or creates a new one-pane workspace running our wrapper.
+// requested title (only when the caller allows it via focusExisting), or
+// creates a new one-pane workspace running our wrapper.
 //
 // Focus-existing: when the user hits Enter on an attached session that we
 // previously spawned in a tab, the cmux workspace for it usually still
 // exists. Re-opening it as a new tab leaves the original tab orphaned
 // with a duplicate. So we ask cmux to list workspaces, find one whose
 // name equals our title (we set `--name <title>` on creation), and call
-// `select-workspace` to focus it. Only on no-match do we create.
+// `select-workspace` to focus it. Only on no-match do we create. The
+// caller gates this: for detached/new/resurrected sessions a same-named
+// workspace is a dead leftover and focusing it would skip running the
+// wrapper entirely (the tmux session would never start).
 //
 // Creating uses `new-workspace --layout` so cmux's default template
 // (which adds a Files panel beside the terminal) is bypassed and the
@@ -65,7 +77,7 @@ func (cmuxSpawner) Available() bool {
 //
 // Auth: cmux's socket only accepts processes started inside cmux. When run
 // from outside, the call errors and the TUI falls back to inline ExecProcess.
-func (cmuxSpawner) Spawn(script, cwd, title string) error {
+func (cmuxSpawner) Spawn(script, cwd, title string, focusExisting bool) error {
 	cli := cmuxCLIPath()
 	if cli == "" {
 		return fmt.Errorf("cmux CLI not found (install /Applications/cmux.app)")
@@ -76,7 +88,7 @@ func (cmuxSpawner) Spawn(script, cwd, title string) error {
 	// Try focus-existing first. Errors here aren't fatal — we just fall
 	// through to creation; the existing-workspace fast path is a UX
 	// optimization, not a correctness requirement.
-	if title != "" {
+	if focusExisting && title != "" {
 		if id, ok := findCmuxWorkspaceByName(cli, title); ok {
 			out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput()
 			if err == nil {
