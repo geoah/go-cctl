@@ -80,19 +80,22 @@ func ensureWorktreeScript(repoPath, wtPath, branch, baseBranch string, postCreat
 //  3. Refuse if $WT is an ancestor of $REPO (so we never delete a
 //     parent dir that contains the repo).
 //  4. Refuse if $WT is $HOME, "/", or empty.
-//  5. Refuse if $WT is OUTSIDE the configured worktree_base. That
-//     means rm-rf can only ever target a path inside the directory
-//     the user explicitly designated for worktrees.
+//  5. If $WT is OUTSIDE the configured worktree_base, it must be a
+//     git-REGISTERED worktree of this repo (per `git worktree list
+//     --porcelain`) — worktrees created by other tools (cmux, manual
+//     `git worktree add`) live anywhere, and refusing them outright made
+//     dd useless on those rows. Unregistered outside paths are refused.
 //  6. Use `git worktree remove [--force]` for the actual removal.
-//  7. Only fall back to `rm -rf` when the path remains AND it's still
-//     inside the worktree_base after all the checks above.
+//  7. Only fall back to `rm -rf` when the path remains AND it's inside
+//     the worktree_base. Outside the base there is NO rm fallback — if
+//     git can't remove it, the script fails with the reason instead.
 //
 // If any check fails, exit 3 with a message naming the cause. The TUI/CLI
 // surface this as a refusal so the user knows what happened.
 //
 // worktreeBase is the user's configured `defaults.worktree_base` (e.g.
 // "~/worktrees"). It anchors the rm fallback so even if every other check
-// were broken, the worst case is removing a path inside that base.
+// were broken, the worst case for rm -rf is a path inside that base.
 func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 	if worktreeBase == "" {
 		worktreeBase = "~/worktrees"
@@ -124,10 +127,11 @@ func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 		`    echo "cctl: refusing — $WT looks like home or root" >&2; exit 3`,
 		`    ;;`,
 		`esac`,
-		`# Guard 4: WT must live INSIDE the configured worktree_base.`,
-		`# This is the load-bearing safety net: even if every other guard`,
-		`# is bypassed, rm -rf can only ever hit a path the user designated`,
-		`# for worktrees.`,
+		`# Guard 4: rm -rf is only ever allowed INSIDE the configured`,
+		`# worktree_base — that's the load-bearing safety net from the old`,
+		`# delete-the-repo incident. A path OUTSIDE the base is still`,
+		`# removable, but only when git itself lists it as a worktree of`,
+		`# this repo, and only via git worktree remove (no rm fallback).`,
 		`check_under_base() {`,
 		`  local wt="$1" base="$2"`,
 		`  [ -n "$wt" ] && [ -n "$base" ] || return 1`,
@@ -138,9 +142,19 @@ func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 		`}`,
 		`# Prefer real-path containment; fall back to lexical if the dir`,
 		`# is already gone (can't pwd -P on a missing path).`,
-		`if [ -n "$WT_BASE_REAL" ]; then`,
-		`  if ! check_under_base "${WT_REAL:-$WT}" "$WT_BASE_REAL" && ! check_under_base "$WT" "$WT_BASE"; then`,
-		`    echo "cctl: refusing — $WT is outside worktree_base ($WT_BASE). cctl only removes paths inside the configured worktree_base. Remove this manually if you're certain." >&2`,
+		`UNDER_BASE=0`,
+		`if check_under_base "${WT_REAL:-$WT}" "$WT_BASE_REAL" || check_under_base "$WT" "$WT_BASE"; then`,
+		`  UNDER_BASE=1`,
+		`fi`,
+		`if [ "$UNDER_BASE" != 1 ]; then`,
+		`  REGISTERED=0`,
+		`  if [ -d "$REPO/.git" ]; then`,
+		`    if git -C "$REPO" worktree list --porcelain 2>/dev/null | grep -Fx -e "worktree ${WT_REAL:-$WT}" -e "worktree $WT" >/dev/null; then`,
+		`      REGISTERED=1`,
+		`    fi`,
+		`  fi`,
+		`  if [ "$REGISTERED" != 1 ]; then`,
+		`    echo "cctl: refusing — $WT is outside worktree_base ($WT_BASE) and not a registered worktree of $REPO. Remove this manually if you're certain." >&2`,
 		`    exit 3`,
 		`  fi`,
 		`fi`,
@@ -149,13 +163,13 @@ func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 		`  cd "$REPO"`,
 		`  git worktree remove "$WT" 2>/dev/null || git worktree remove --force "$WT" 2>/dev/null || true`,
 		`fi`,
-		`# Fallback: rm -rf only the WT (already verified to be inside`,
-		`# worktree_base by the guard above).`,
-		`if [ -e "$WT" ]; then`,
+		`# Fallback: rm -rf only inside worktree_base; outside it git was`,
+		`# the only tool allowed to touch the path.`,
+		`if [ -e "$WT" ] && [ "$UNDER_BASE" = 1 ]; then`,
 		`  rm -rf -- "$WT"`,
 		`fi`,
 		`if [ -e "$WT" ]; then`,
-		`  echo "worktree at $WT still exists after removal attempts" >&2`,
+		`  echo "worktree at $WT still exists after removal attempts (git worktree remove failed; rm fallback is disabled outside worktree_base)" >&2`,
 		`  exit 1`,
 		`fi`,
 	}, "\n")
