@@ -11,15 +11,30 @@ import (
 // cctl only ever touches sessions it owns.
 const sessionPrefix = "cctl/"
 
+// tmuxSafeName mirrors tmux's own session-name sanitization: '.' and ':'
+// are reserved (window/pane target separators) and tmux silently replaces
+// them with '_' when creating a session. cctl applies the same replacement
+// up front so the name it builds is byte-for-byte the name tmux stores.
+// Without this, a repo like "rxtx.dev" produced sessions cctl could
+// create but never find again: new-session stored "cctl/rxtx_dev/…" while
+// has-session/attach asked for "cctl/rxtx.dev/…", and the parsed-back
+// "rxtx_dev" showed up in the tree as a ghost repo that resolve() refused.
+func tmuxSafeName(s string) string {
+	return strings.NewReplacer(".", "_", ":", "_").Replace(s)
+}
+
 // tmuxName returns the canonical tmux session name. With the worktree level
 // added, every name has four "/"-separated parts:
 //
 //	cctl/<repo>/<worktree>/<session>
 //
 // Repo names are leaf-only (no '/'), worktree names are basenames, so the
-// split is unambiguous.
+// split is unambiguous. Every part is tmux-sanitized (see tmuxSafeName);
+// the on-disk worktree path keeps the real name — only the tmux session
+// name is sanitized, and the TUI maps parsed names back via the loaded
+// repo/worktree lists.
 func tmuxName(repo, worktree, session string) string {
-	return sessionPrefix + repo + "/" + worktree + "/" + session
+	return sessionPrefix + tmuxSafeName(repo) + "/" + tmuxSafeName(worktree) + "/" + tmuxSafeName(session)
 }
 
 // parseTmuxName splits a tmux session name into (repo, worktree, session, ok).
