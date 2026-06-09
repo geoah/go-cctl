@@ -3,6 +3,7 @@ package cctl
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -161,7 +162,29 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 // the session is alive and otherwise resurrects it in the same worktree —
 // claudeLaunchScript's `claude --continue` branch picks the conversation
 // back up.
+//
+// Terminal sessions (created by the TUI's `t` key, named term/term2/…)
+// resurrect as plain shells instead of relaunching claude.
 func attachOrRespawn(r *Resolved, tname, cwd string) string {
+	if _, _, sess, ok := parseTmuxName(tname); ok && isTerminalSession(sess) {
+		return terminalCmd(tname, cwd)
+	}
 	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "")
 	return fmt.Sprintf("tmux new-session -A -s %s %s", shellQuote(tname), shellQuote(launch))
+}
+
+// terminalSessionRe matches the names the TUI's `t` key generates for
+// plain-shell sessions: "term", "term2", "term3", …
+var terminalSessionRe = regexp.MustCompile(`^term\d*$`)
+
+func isTerminalSession(name string) bool {
+	return terminalSessionRe.MatchString(name)
+}
+
+// terminalCmd is the idempotent command for a plain-shell session: attach
+// if it's alive, otherwise create it with the worktree as the working
+// directory. Same transport as claude sessions (tmux on local/ssh/mosh),
+// just without claude — the `t` key's "give me a terminal here" action.
+func terminalCmd(tname, cwd string) string {
+	return fmt.Sprintf("tmux new-session -A -s %s -c %s", shellQuote(tname), shellPath(cwd))
 }

@@ -942,6 +942,9 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "n":
 		m.clearPendingD()
 		return m.startNewForm()
+	case "t":
+		m.clearPendingD()
+		return m.openTerminal()
 	case "d":
 		// vim-style dd: first d arms (red footer prompt is the
 		// confirmation). second d deletes outright — no extra modal.
@@ -987,7 +990,7 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · ←→ collapse/expand · ⏎ attach · n new · dd delete · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · ←→ collapse/expand · ⏎ attach · n new · t terminal · dd delete · / filter · r refresh · q quit"
 	default:
 		// any other key cancels a pending dd so the next d starts fresh
 		m.clearPendingD()
@@ -1401,6 +1404,81 @@ func (m *tuiModel) executeDelete() (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tick, m.killWorktreeCmd(row.server, row.repo, row.worktree, wtPath, victims, id))
 	default:
 		return m, m.noteFailure("nothing to delete on this row", "select a session or worktree")
+	}
+}
+
+// openTerminal handles `t`: a plain-shell tmux session on the selected
+// worktree, opened as a tab in the worktree's cmux workspace — the same
+// transport as a claude session (tmux + mosh/ssh/local), just without
+// claude. A repo row targets its "main" checkout; a session row targets
+// that session's worktree. Names auto-increment (term, term2, …) per
+// worktree so repeated presses give fresh shells; the sessions appear in
+// the tree like any other and can be attached/deleted there.
+func (m *tuiModel) openTerminal() (tea.Model, tea.Cmd) {
+	if m.cursor >= len(m.rows) {
+		return m, nil
+	}
+	row := m.rows[m.cursor]
+	var server, repo, wt string
+	switch row.kind {
+	case rowWorktree:
+		server, repo, wt = row.server, row.repo, row.worktree
+	case rowRepo:
+		server, repo, wt = row.server, row.repo, "main"
+	case rowSession:
+		server, repo, wt = row.server, row.repo, row.session.Worktree
+	default:
+		return m, m.noteFailure("terminal needs a repo, worktree, or session row",
+			"select where the shell should live and press t again")
+	}
+	name := m.freeTerminalName(server, repo, wt)
+	key := "sess:" + server + "/" + repo + "/" + wt + "/" + name
+	id, tick := m.startTask(key, fmt.Sprintf("opening terminal %s/%s/%s…", repo, wt, name))
+	return m, tea.Batch(tick, m.terminalPrepareCmd(server, repo, wt, name, id))
+}
+
+// freeTerminalName picks the first unused term/term2/term3… name on the
+// given worktree, based on the model's last-loaded session list.
+func (m *tuiModel) freeTerminalName(server, repo, wt string) string {
+	used := map[string]bool{}
+	if st := m.state[server]; st != nil {
+		for _, s := range st.sessions {
+			if s.Repo == repo && s.Worktree == wt {
+				used[s.Session] = true
+			}
+		}
+	}
+	if !used["term"] {
+		return "term"
+	}
+	for i := 2; ; i++ {
+		if name := fmt.Sprintf("term%d", i); !used[name] {
+			return name
+		}
+	}
+}
+
+func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name string, taskID int) tea.Cmd {
+	return func() tea.Msg {
+		r, err := m.cfg.resolve(serverName, repoName)
+		if err != nil {
+			return prepareDoneMsg{err: err, taskID: taskID}
+		}
+		cwd := r.Repo.Path
+		if worktree != "" && worktree != "main" {
+			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktree)
+		}
+		return prepareDoneMsg{
+			server:   r.Server,
+			useMosh:  r.UseMosh,
+			cmdStr:   terminalCmd(tmuxName(r.RepoName, worktree, name), cwd),
+			cwd:      workspaceCwd(r, worktree),
+			wsTitle:  fmt.Sprintf("%s/%s", repoName, worktree),
+			tabTitle: name,
+			label:    fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, name),
+			refresh:  serverName,
+			taskID:   taskID,
+		}
 	}
 }
 
@@ -2267,6 +2345,7 @@ var legendLines = []string{
 	"←→        collapse / expand",
 	"⏎         open in new cmux tab (r/w → form, s → attach)",
 	"n         new session on selected row",
+	"t         plain terminal on selected worktree (no claude)",
 	"dd        delete (worktree or session — never the repo)",
 	"/         filter (k9s-style)",
 	"r         refresh",

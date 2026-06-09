@@ -1098,6 +1098,51 @@ func TestPreparingPrefix_TaskTargetsSpin(t *testing.T) {
 	}
 }
 
+// ---- plain-terminal sessions (`t` key) --------------------------------------
+
+// TestTerminalSessions covers the t-key plumbing: name recognition (so
+// dead terminal sessions resurrect as shells, not claude), the idempotent
+// new-session -A -c command, and per-worktree name auto-increment.
+func TestTerminalSessions(t *testing.T) {
+	for name, want := range map[string]bool{
+		"term": true, "term2": true, "term17": true,
+		"terminal": false, "xterm": false, "poc": false, "": false,
+	} {
+		if got := isTerminalSession(name); got != want {
+			t.Errorf("isTerminalSession(%q) = %v want %v", name, got, want)
+		}
+	}
+
+	cmd := terminalCmd("cctl/r/wt/term", "/wt/path")
+	if !strings.Contains(cmd, "tmux new-session -A -s cctl/r/wt/term") || !strings.Contains(cmd, `-c "/wt/path"`) {
+		t.Errorf("terminalCmd = %q, want new-session -A with -c cwd", cmd)
+	}
+	if strings.Contains(cmd, "claude") {
+		t.Errorf("terminalCmd must not involve claude: %q", cmd)
+	}
+
+	// attachOrRespawn routes terminal-named sessions to the shell command.
+	r := &Resolved{}
+	if got := attachOrRespawn(r, "cctl/r/wt/term2", "/wt"); strings.Contains(got, "claude") {
+		t.Errorf("attachOrRespawn on a term session must not resurrect claude: %q", got)
+	}
+	if got := attachOrRespawn(r, "cctl/r/wt/poc", "/wt"); !strings.Contains(got, "claude") {
+		t.Errorf("attachOrRespawn on a normal session must keep the claude launch: %q", got)
+	}
+
+	m := &tuiModel{state: map[string]*serverState{"w": {sessions: []SessionInfo{
+		{Repo: "r", Worktree: "wt", Session: "term"},
+		{Repo: "r", Worktree: "wt", Session: "term2"},
+		{Repo: "r", Worktree: "other", Session: "term"},
+	}}}}
+	if got := m.freeTerminalName("w", "r", "wt"); got != "term3" {
+		t.Errorf("freeTerminalName(wt) = %q want term3", got)
+	}
+	if got := m.freeTerminalName("w", "r", "fresh"); got != "term" {
+		t.Errorf("freeTerminalName(fresh wt) = %q want term", got)
+	}
+}
+
 // ---- helpers ---------------------------------------------------------------
 
 func keys(m map[string]Repo) []string {
