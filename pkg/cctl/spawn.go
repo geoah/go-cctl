@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strings"
 )
@@ -23,20 +24,21 @@ import (
 // the worktree name. The inline spawner ignores it; the wrapper script
 // does its own cd anyway.
 //
-// `title` is the human label the new tab/workspace should display. cmux
-// uses it via rename-workspace.
+// The mapping to cmux's model is one workspace per WORKTREE and one tab
+// (surface) per SESSION: `wsTitle` ("repo/worktree") names the workspace,
+// `tabTitle` (the session name) names the tab inside it. Spawning into a
+// worktree that already has a workspace adds a tab there instead of
+// creating another workspace.
 //
-// `focusExisting` says a workspace with this title, if one exists, can be
-// focused instead of creating a new one. Only the attach-to-a-live-session
-// path sets it: there the existing tab holds the attached tmux client, so
-// focusing is the right move. Everywhere else (new session, resurrect) the
-// wrapper script MUST actually run, and an existing same-named workspace is
-// just a leftover whose wrapper already exited — focusing it would silently
-// do nothing.
+// `focusExisting` says reaching the existing workspace is enough — don't
+// run the script at all. Only the attach-to-a-live-session path sets it:
+// there a tab in that workspace already holds the attached tmux client,
+// and running a second client would just mirror it. Everywhere else (new
+// session, detached resurrect) the wrapper script MUST actually run.
 type Spawner interface {
 	Name() string
 	Available() bool
-	Spawn(scriptPath, cwd, title string, focusExisting bool) error
+	Spawn(scriptPath, cwd, wsTitle, tabTitle string, focusExisting bool) error
 }
 
 // ---- cmux ------------------------------------------------------------------
@@ -57,27 +59,26 @@ func (cmuxSpawner) Available() bool {
 	return err == nil
 }
 
-// Spawn either focuses an existing cmux workspace whose name matches the
-// requested title (only when the caller allows it via focusExisting), or
-// creates a new one-pane workspace running our wrapper.
+// Spawn maps cctl's tree onto cmux: one workspace per worktree (named
+// `wsTitle`, "repo/worktree"), one tab per session (named `tabTitle`).
 //
-// Focus-existing: when the user hits Enter on an attached session that we
-// previously spawned in a tab, the cmux workspace for it usually still
-// exists. Re-opening it as a new tab leaves the original tab orphaned
-// with a duplicate. So we ask cmux to list workspaces, find one whose
-// name equals our title (we set `--name <title>` on creation), and call
-// `select-workspace` to focus it. Only on no-match do we create. The
-// caller gates this: for detached/new/resurrected sessions a same-named
-// workspace is a dead leftover and focusing it would skip running the
-// wrapper entirely (the tmux session would never start).
+//   - workspace exists + focusExisting → just select it (a tab in there
+//     already holds the attached tmux client; running the script again
+//     would only mirror the session).
+//   - workspace exists → add a tab: new-surface, run the wrapper in it
+//     (respawn-pane), rename the tab to the session name.
+//   - no workspace → create one via `new-workspace --layout` with a single
+//     terminal surface running the wrapper (bypasses cmux's default
+//     template with its Files panel), then best-effort rename its tab.
 //
-// Creating uses `new-workspace --layout` so cmux's default template
-// (which adds a Files panel beside the terminal) is bypassed and the
-// workspace contains exactly one terminal surface.
+// Every cmux call past the first is best-effort with logging: if adding a
+// tab to an existing workspace fails (cmux version drift, surface-id
+// parse failure, …) we fall back to creating a separate workspace so the
+// session always opens SOMEWHERE.
 //
 // Auth: cmux's socket only accepts processes started inside cmux. When run
 // from outside, the call errors and the TUI falls back to inline ExecProcess.
-func (cmuxSpawner) Spawn(script, cwd, title string, focusExisting bool) error {
+func (cmuxSpawner) Spawn(script, cwd, wsTitle, tabTitle string, focusExisting bool) error {
 	cli := cmuxCLIPath()
 	if cli == "" {
 		return fmt.Errorf("cmux CLI not found (install /Applications/cmux.app)")
@@ -85,27 +86,119 @@ func (cmuxSpawner) Spawn(script, cwd, title string, focusExisting bool) error {
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
 	}
-	// Try focus-existing first. Errors here aren't fatal — we just fall
-	// through to creation; the existing-workspace fast path is a UX
-	// optimization, not a correctness requirement.
-	if focusExisting && title != "" {
-		if id, ok := findCmuxWorkspaceByName(cli, title); ok {
-			out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput()
-			if err == nil {
-				log().Info("cmux-focus-existing", "id", id, "title", title)
-				return nil
+	if wsTitle != "" {
+		if id, ok := findCmuxWorkspaceByName(cli, wsTitle); ok {
+			if focusExisting {
+				out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput()
+				if err == nil {
+					log().Info("cmux-focus-existing", "id", id, "ws", wsTitle)
+					return nil
+				}
+				log().Debug("cmux-select-workspace-fail", "id", id, "ws", wsTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+				// fall through to add-tab: running the wrapper is still
+				// correct, just less elegant than focusing.
 			}
-			log().Debug("cmux-select-workspace-fail", "id", id, "title", title, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			if err := addCmuxTab(cli, id, script, tabTitle); err == nil {
+				log().Info("cmux-add-tab", "id", id, "ws", wsTitle, "tab", tabTitle)
+				return nil
+			} else {
+				log().Warn("cmux-add-tab-fail (falling back to new workspace)",
+					"id", id, "ws", wsTitle, "tab", tabTitle, "err", err.Error())
+			}
 		}
 	}
-	args, err := cmuxNewWorkspaceArgs(script, cwd, title)
+	args, err := cmuxNewWorkspaceArgs(script, cwd, wsTitle)
 	if err != nil {
 		return fmt.Errorf("cmux build args: %w", err)
 	}
 	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("cmux new-workspace: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	// Best-effort: label the fresh workspace's only tab with the session
+	// name so the tab bar reads "<session>" instead of a shell default.
+	if wsTitle != "" && tabTitle != "" {
+		if id, ok := findCmuxWorkspaceByName(cli, wsTitle); ok {
+			out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", tabTitle).CombinedOutput()
+			if err != nil {
+				log().Debug("cmux-rename-tab-fail", "id", id, "tab", tabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			}
+		}
+	}
 	return nil
+}
+
+// addCmuxTab opens a new terminal tab (surface) in the given workspace,
+// runs the wrapper script in it, and names it after the session. Returns
+// an error if the surface can't be created or its id can't be determined —
+// the caller falls back to a separate workspace in that case.
+func addCmuxTab(cli, wsID, script, tabTitle string) error {
+	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", "true").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("new-surface: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	sid := parseCmuxSurfaceID(string(out))
+	if sid == "" {
+		// new-surface's output didn't include a recognizable id; ask for
+		// the workspace's surfaces and take the newest (listed last).
+		lout, lerr := exec.Command(cli, "--id-format", "uuids", "list-pane-surfaces", "--workspace", wsID).Output()
+		if lerr == nil {
+			sid = lastCmuxListedID(string(lout))
+		}
+	}
+	if sid == "" {
+		return fmt.Errorf("could not determine new surface id (new-surface said: %s)", strings.TrimSpace(string(out)))
+	}
+	// The fresh surface runs the user's default shell; respawn-pane sends
+	// it the wrapper-script path to execute. When the wrapper exits the
+	// shell survives, so the tab stays usable.
+	if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", script).CombinedOutput(); err != nil {
+		return fmt.Errorf("respawn-pane: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if tabTitle != "" {
+		if out, err := exec.Command(cli, "rename-tab", "--workspace", wsID, "--tab", sid, tabTitle).CombinedOutput(); err != nil {
+			log().Debug("cmux-rename-tab-fail", "surface", sid, "tab", tabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		}
+	}
+	// Land the user on the workspace; the new surface was created with
+	// --focus true so the right tab is already selected within it.
+	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+		log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// cmuxUUIDRe / cmuxSurfaceRefRe match the two id shapes the cmux CLI
+// prints depending on --id-format: full UUIDs and short "surface:N" refs.
+var (
+	cmuxUUIDRe       = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
+	cmuxSurfaceRefRe = regexp.MustCompile(`surface:\d+`)
+)
+
+// parseCmuxSurfaceID pulls a surface identifier out of `new-surface`
+// output, accepting either a UUID or a "surface:N" short ref anywhere in
+// the text. Returns "" when neither appears.
+func parseCmuxSurfaceID(out string) string {
+	if m := cmuxUUIDRe.FindString(out); m != "" {
+		return m
+	}
+	if m := cmuxSurfaceRefRe.FindString(out); m != "" {
+		return m
+	}
+	return ""
+}
+
+// lastCmuxListedID returns the first token of the last non-empty line —
+// the id column of the newest entry in a cmux list-* output.
+func lastCmuxListedID(out string) string {
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.TrimSpace(lines[i])
+		if line == "" {
+			continue
+		}
+		return strings.Fields(line)[0]
+	}
+	return ""
 }
 
 // findCmuxWorkspaceByName returns the UUID of the first workspace whose

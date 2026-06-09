@@ -475,13 +475,14 @@ type retryProbeMsg struct {
 }
 
 type prepareDoneMsg struct {
-	server  Server
-	useMosh bool
-	cmdStr  string
-	cwd     string // suggested workspace cwd (used by cmuxSpawner)
-	title   string // human label for the new tab/workspace (cmux rename-workspace)
-	label   string
-	refresh string
+	server   Server
+	useMosh  bool
+	cmdStr   string
+	cwd      string // suggested workspace cwd (used by cmuxSpawner)
+	wsTitle  string // workspace label: "repo/worktree" (one workspace per worktree)
+	tabTitle string // tab label inside the workspace: the session name
+	label    string
+	refresh  string
 	// focusExisting allows the spawner to focus a same-titled workspace
 	// instead of creating one. Only safe when a live tmux client is known
 	// to sit in that tab (attach-to-attached-session); see Spawner.
@@ -514,7 +515,7 @@ type refreshServerMsg struct {
 // We always write a tiny wrapper script first so each Spawner only ever
 // has to hand its terminal one filesystem path; this dodges all the
 // arg-quoting/splitting pitfalls.
-func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, title string, focusExisting bool) (string, error) {
+func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, wsTitle, tabTitle string, focusExisting bool) (string, error) {
 	inner, err := interactiveCmd(s, useMosh, cmdStr)
 	if err != nil {
 		return "", fmt.Errorf("build interactive cmd: %w", err)
@@ -528,8 +529,8 @@ func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, title st
 		pref = cfg.Defaults.Spawn
 	}
 	sp, reason := detectSpawner(pref)
-	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script, "cwd", cwd, "title", title, "focusExisting", focusExisting)
-	if err := sp.Spawn(script, cwd, title, focusExisting); err != nil {
+	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script, "cwd", cwd, "ws", wsTitle, "tab", tabTitle, "focusExisting", focusExisting)
+	if err := sp.Spawn(script, cwd, wsTitle, tabTitle, focusExisting); err != nil {
 		os.Remove(script)
 		return sp.Name(), err
 	}
@@ -849,7 +850,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, m.finishTask(msg.taskID, msg.label+": prepare failed", msg.err)
 		}
-		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.title, msg.focusExisting)
+		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.wsTitle, msg.tabTitle, msg.focusExisting)
 		if err != nil {
 			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
 			return m, m.finishTask(msg.taskID, provider+" spawn failed", err)
@@ -1417,13 +1418,14 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
 		}
 		return prepareDoneMsg{
-			server:  r.Server,
-			useMosh: r.UseMosh,
-			cmdStr:  attachOrRespawn(r, sess.Name, cwd),
-			cwd:     workspaceCwd(r, sess.Worktree),
-			title:   fmt.Sprintf("%s/%s/%s", repoName, sess.Worktree, sess.Session),
-			label:   fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
-			refresh: serverName,
+			server:   r.Server,
+			useMosh:  r.UseMosh,
+			cmdStr:   attachOrRespawn(r, sess.Name, cwd),
+			cwd:      workspaceCwd(r, sess.Worktree),
+			wsTitle:  fmt.Sprintf("%s/%s", repoName, sess.Worktree),
+			tabTitle: sess.Session,
+			label:    fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
+			refresh:  serverName,
 			// Reuse the existing cmux tab only when a tmux client is
 			// already attached — that's the tab holding it. A detached
 			// session's old tab (if any) is a dead shell; the wrapper
@@ -1453,14 +1455,15 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
 		return prepareDoneMsg{
-			server:  r.Server,
-			useMosh: r.UseMosh,
-			cmdStr:  cmdStr,
-			cwd:     workspaceCwd(r, worktree),
-			title:   fmt.Sprintf("%s/%s/%s", repoName, worktree, sessionName),
-			label:   fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
-			refresh: serverName,
-			taskID:  taskID,
+			server:   r.Server,
+			useMosh:  r.UseMosh,
+			cmdStr:   cmdStr,
+			cwd:      workspaceCwd(r, worktree),
+			wsTitle:  fmt.Sprintf("%s/%s", repoName, worktree),
+			tabTitle: sessionName,
+			label:    fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
+			refresh:  serverName,
+			taskID:   taskID,
 		}
 	}
 }

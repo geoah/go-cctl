@@ -935,6 +935,37 @@ func TestCmuxWorkspaceListParser(t *testing.T) {
 	}
 }
 
+// TestParseCmuxSurfaceID accepts both id shapes the cmux CLI can print —
+// full UUIDs and "surface:N" short refs — anywhere in the output text,
+// since the exact phrasing around them isn't part of the CLI contract.
+func TestParseCmuxSurfaceID(t *testing.T) {
+	cases := []struct{ out, want string }{
+		{"surface:7", "surface:7"},
+		{"Created surface surface:12 in pane:1", "surface:12"},
+		{"3FA85F64-5717-4562-B3FC-2C963F66AFA6", "3FA85F64-5717-4562-B3FC-2C963F66AFA6"},
+		{"created 3fa85f64-5717-4562-b3fc-2c963f66afa6 (surface)", "3fa85f64-5717-4562-b3fc-2c963f66afa6"},
+		{"ok", ""},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := parseCmuxSurfaceID(c.out); got != c.want {
+			t.Errorf("parseCmuxSurfaceID(%q) = %q want %q", c.out, got, c.want)
+		}
+	}
+}
+
+// TestLastCmuxListedID picks the id column of the newest (last) entry —
+// the fallback used when new-surface's output carries no recognizable id.
+func TestLastCmuxListedID(t *testing.T) {
+	out := "uuid-1 first tab\nuuid-2 second tab\n\nuuid-3 newest tab\n\n"
+	if got := lastCmuxListedID(out); got != "uuid-3" {
+		t.Errorf("lastCmuxListedID = %q want uuid-3", got)
+	}
+	if got := lastCmuxListedID("\n \n"); got != "" {
+		t.Errorf("blank list should yield empty id, got %q", got)
+	}
+}
+
 // ---- dd refusal on repo/server rows ---------------------------------------
 
 // lastTask returns the most recently added task (test helper).
