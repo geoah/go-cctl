@@ -262,6 +262,15 @@ func (m *tuiModel) finishTask(id int, label string, err error) tea.Cmd {
 		t.clearAt = time.Now().Add(4 * time.Second)
 	}
 	log().Debug("tui-task-done", "id", t.id, "label", t.label, "err", errString(err))
+	// Surface outcomes the user may have walked away from as native cmux
+	// notifications: every failure, and successes of long-running tasks
+	// (claude upgrades, restores). Quick successes stay footer-only —
+	// the user is still looking at them.
+	if t.failed || time.Since(t.started) > 10*time.Second {
+		title := "cctl: " + t.label
+		detail := t.detail
+		go notifyCmux(title, detail, "")
+	}
 	return m.scheduleTick()
 }
 

@@ -379,6 +379,30 @@ func buildCmuxLayout(command string) (string, error) {
 	return string(b), nil
 }
 
+// notifyCmux posts a native cmux notification (sidebar badge +
+// notification center) so task outcomes reach the user even when the
+// cctl tab isn't focused. When wsTitle resolves to a workspace, the
+// notification is attached to it (clicking jumps there). Fire-and-forget
+// and best-effort: cctl works fine without a cmux socket.
+func notifyCmux(title, body, wsTitle string) {
+	cli := cmuxCLIPath()
+	if cli == "" {
+		return
+	}
+	args := []string{"notify", "--title", title}
+	if body != "" {
+		args = append(args, "--body", abbrev(body, 300))
+	}
+	if wsTitle != "" {
+		if id, ok := findCmuxWorkspaceByName(cli, wsTitle); ok {
+			args = append(args, "--workspace", id)
+		}
+	}
+	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
+		log().Debug("cmux-notify-fail", "title", title, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	}
+}
+
 // cmuxCLIPath finds the cmux CLI binary. On macOS it's bundled inside the
 // app at Contents/Resources/bin/cmux; users don't always have the symlink
 // in $PATH (cmux ships a "Install CLI" action they may not have run).
