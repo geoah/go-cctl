@@ -24,6 +24,11 @@ func runTUI() error {
 	log().Info("tui-start", "config", path, "servers", len(cfg.Servers))
 	p := tea.NewProgram(newTUIModel(cfg), tea.WithAltScreen())
 	final, err := p.Run()
+	// Kill the notification-bridge ssh tails on every exit path so they
+	// can't outlive the TUI.
+	if fm, ok := final.(*tuiModel); ok {
+		fm.stopNotifyWatchers()
+	}
 	if err != nil {
 		log().Error("tui-error", "err", err.Error())
 		return err
@@ -90,6 +95,33 @@ type serverState struct {
 	conn         connState
 	connAttempts int   // number of probes issued (including current/last)
 	connErr      error // last probe failure
+}
+
+// ensureNotifyWatcher starts (or restarts after a transport drop) the
+// claude→cmux notification bridge for a remote server. Local servers are
+// covered natively by cmux's claude wrapper.
+func (m *tuiModel) ensureNotifyWatcher(serverName string) {
+	srv, ok := m.cfg.Servers[serverName]
+	if !ok || srv.Local {
+		return
+	}
+	if m.notifyWatchers == nil {
+		m.notifyWatchers = map[string]*notifyWatcher{}
+	}
+	if w := m.notifyWatchers[serverName]; w != nil && !w.isDead() {
+		return
+	}
+	m.notifyWatchers[serverName] = newNotifyWatcher(serverName, srv)
+}
+
+// stopNotifyWatchers kills every bridge transport; called when the TUI
+// exits so no ssh tail outlives the process.
+func (m *tuiModel) stopNotifyWatchers() {
+	for _, w := range m.notifyWatchers {
+		if w != nil && w.stop != nil {
+			w.stop()
+		}
+	}
 }
 
 // normalizeSessionNames maps the tmux-sanitized repo/worktree components
@@ -387,6 +419,11 @@ type tuiModel struct {
 	pendingD bool
 	pendingU bool
 
+	// notifyWatchers holds the per-remote-server claude→cmux notification
+	// bridges (ssh tail of ~/.cctl/notify.jsonl). Started on probe
+	// success, restarted on reconnect, killed when the TUI exits.
+	notifyWatchers map[string]*notifyWatcher
+
 	exitErr error
 }
 
@@ -405,13 +442,14 @@ func newTUIModel(cfg *Config) *tuiModel {
 		return ti
 	}
 	m := &tuiModel{
-		cfg:         cfg,
-		serverNames: names,
-		state:       state,
-		expanded:    map[string]bool{},
-		wtInput:     mkInput("worktree-name (e.g. audit)", 64),
-		nameInput:   mkInput("session-name (e.g. quickcheck)", 64),
-		promptInput: mkInput("initial prompt (optional)", 800),
+		cfg:            cfg,
+		serverNames:    names,
+		state:          state,
+		expanded:       map[string]bool{},
+		notifyWatchers: map[string]*notifyWatcher{},
+		wtInput:        mkInput("worktree-name (e.g. audit)", 64),
+		nameInput:      mkInput("session-name (e.g. quickcheck)", 64),
+		promptInput:    mkInput("initial prompt (optional)", 800),
 	}
 	// Initial expansion state is derived from the data — see isExpanded.
 	// Anything with a running session expands automatically once data
@@ -875,6 +913,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Reset attempts on success so the next failure starts
 			// backoff from scratch.
 			st.connAttempts = 0
+			m.ensureNotifyWatcher(msg.server)
 			m.rebuildRows()
 			return m, tea.Batch(m.fetchServerCmd(msg.server)...)
 		}

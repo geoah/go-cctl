@@ -317,11 +317,44 @@ func lastCmuxListedID(out string) string {
 // We accept "uuid<sep>name" with whitespace separation and trim the
 // match candidate before comparison.
 func findCmuxWorkspaceByName(cli, name string) (string, bool) {
+	target := strings.TrimSpace(name)
+	for _, ws := range listCmuxWorkspaces(cli) {
+		if ws.name == target {
+			return ws.id, true
+		}
+	}
+	return "", false
+}
+
+// findCmuxWorkspaceNameBySafeTitle matches workspaces through tmux's
+// name sanitization: events parsed from tmux session names carry
+// sanitized components ("rxtx_dev/main") while workspace titles use the
+// real names ("rxtx.dev/main"). Returns the real workspace name so
+// callers can target it directly.
+func findCmuxWorkspaceNameBySafeTitle(cli, safeTitle string) (string, bool) {
+	target := strings.TrimSpace(safeTitle)
+	for _, ws := range listCmuxWorkspaces(cli) {
+		if tmuxSafeName(ws.name) == target {
+			return ws.name, true
+		}
+	}
+	return "", false
+}
+
+type cmuxWorkspace struct {
+	id   string
+	name string
+}
+
+// listCmuxWorkspaces parses `--id-format uuids list-workspaces`: one
+// workspace per line, UUID first, then the name (which may contain
+// spaces) and any extra metadata cmux includes.
+func listCmuxWorkspaces(cli string) []cmuxWorkspace {
 	out, err := exec.Command(cli, "--id-format", "uuids", "list-workspaces").Output()
 	if err != nil {
-		return "", false
+		return nil
 	}
-	target := strings.TrimSpace(name)
+	var result []cmuxWorkspace
 	for _, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -331,14 +364,12 @@ func findCmuxWorkspaceByName(cli, name string) (string, bool) {
 		if len(fields) < 2 {
 			continue
 		}
-		id := fields[0]
-		// Name may contain spaces; rejoin every field past the UUID.
-		candidate := strings.TrimSpace(strings.Join(fields[1:], " "))
-		if candidate == target {
-			return id, true
-		}
+		result = append(result, cmuxWorkspace{
+			id:   fields[0],
+			name: strings.TrimSpace(strings.Join(fields[1:], " ")),
+		})
 	}
-	return "", false
+	return result
 }
 
 // cmuxNewWorkspaceArgs builds the argv for `cmux new-workspace ...` with a

@@ -10,6 +10,14 @@ import (
 	"time"
 )
 
+// Unit tests drive probedMsg against fake hosts; never let that spawn a
+// real ssh tail. Integration tests don't exercise the bridge.
+func init() {
+	newNotifyWatcher = func(serverName string, srv Server) *notifyWatcher {
+		return &notifyWatcher{server: serverName, dead: true}
+	}
+}
+
 // ---- worktree porcelain parser --------------------------------------------
 
 func TestParseWorktreePorcelain_MultipleWorktrees(t *testing.T) {
@@ -398,7 +406,7 @@ func TestRemoveWorktreeScript_HasFallbackRm(t *testing.T) {
 // ---- claudeLaunchScript ----------------------------------------------------
 
 func TestClaudeLaunchScript_UsesContinueWhenProjectsDirExists(t *testing.T) {
-	got := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "")
+	got := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "", false)
 	if !strings.Contains(got, "claude --continue") {
 		t.Error("launch script should include claude --continue branch")
 	}
@@ -411,14 +419,14 @@ func TestClaudeLaunchScript_UsesContinueWhenProjectsDirExists(t *testing.T) {
 }
 
 func TestClaudeLaunchScript_AppendsPromptWhenProvided(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "say hi")
+	got := claudeLaunchScript("/wt", nil, "say hi", false)
 	if !strings.Contains(got, "say hi") {
 		t.Errorf("prompt should be shell-included in the launch script; got:\n%s", got)
 	}
 }
 
 func TestClaudeLaunchScript_GuardsAgainstMissingCwd(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "")
+	got := claudeLaunchScript("/wt", nil, "", false)
 	// If the worktree was deleted, the cd must abort the script (after a
 	// readable pause) instead of letting claude launch in whatever
 	// directory the shell happened to start in.
@@ -450,7 +458,7 @@ func TestAttachOrRespawn_SurvivesDeadSession(t *testing.T) {
 }
 
 func TestClaudeLaunchScript_PrependsCmuxBinWhenInsideCmux(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "")
+	got := claudeLaunchScript("/wt", nil, "", false)
 	// The script must guard with CMUX_WORKSPACE_ID so it's a no-op when
 	// not running inside cmux (e.g., remote target via mosh).
 	if !strings.Contains(got, `CMUX_WORKSPACE_ID`) {

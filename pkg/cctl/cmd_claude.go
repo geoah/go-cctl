@@ -146,7 +146,7 @@ func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, promp
 		}
 	}
 
-	launch := claudeLaunchScript(cwd, r.ClaudeFlags, prompt)
+	launch := claudeLaunchScript(cwd, r.ClaudeFlags, prompt, !r.Server.Local)
 	// `new-session -A` creates if absent, attaches if present — which is what we
 	// want, and avoids a race between has-session and new-session.
 	return fmt.Sprintf("tmux new-session -A -s %s %s", shellQuote(tname), shellQuote(launch)), nil
@@ -169,7 +169,7 @@ func attachOrRespawn(r *Resolved, tname, cwd string) string {
 	if _, _, sess, ok := parseTmuxName(tname); ok && isTerminalSession(sess) {
 		return terminalCmd(tname, cwd)
 	}
-	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "")
+	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local)
 	return fmt.Sprintf("tmux new-session -A -s %s %s", shellQuote(tname), shellQuote(launch))
 }
 

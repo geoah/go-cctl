@@ -194,19 +194,35 @@ func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 // On claude exit the wrapper waits for Enter, keeping the tmux session alive
 // so you can detach (Ctrl-b d) and resume later if you want, without losing
 // the exit output.
-func claudeLaunchScript(cwd string, claudeFlags []string, prompt string) string {
+//
+// `bridge` (remote sessions) installs the cctl→cmux notification bridge:
+// a hook script + claude --settings overlay under ~/.cctl/ on the remote
+// host, so Notification/Stop events land in ~/.cctl/notify.jsonl where
+// the TUI's notifyWatcher picks them up. Local sessions get the same
+// effect natively from cmux's claude wrapper via the PATH injection.
+func claudeLaunchScript(cwd string, claudeFlags []string, prompt string, bridge bool) string {
 	fresh := append([]string{"claude"}, claudeFlags...)
 	resume := append([]string{"claude", "--continue"}, claudeFlags...)
 	if prompt != "" {
 		fresh = append(fresh, prompt)
 		resume = append(resume, prompt)
 	}
+	resumeCmd := joinShell(resume)
+	freshCmd := joinShell(fresh)
+	ensure := ""
+	if bridge {
+		// The settings flag is appended OUTSIDE joinShell so $HOME
+		// expands on the remote.
+		resumeCmd += notifyBridgeSettingsFlag
+		freshCmd += notifyBridgeSettingsFlag
+		ensure = notifyBridgeEnsureBlock() + "\n"
+	}
 	return fmt.Sprintf(`cd %s || {
   echo "cctl: worktree directory is gone — press Enter to close"
   read _ || true
   exit 1
 }
-# Route claude through cmux's wrapper when running inside cmux so the
+%s# Route claude through cmux's wrapper when running inside cmux so the
 # notification + session-tracking hooks attach. Harmless on remote
 # (the path simply doesn't exist).
 if [ -n "${CMUX_WORKSPACE_ID:-}" ] && [ -x /Applications/cmux.app/Contents/Resources/bin/claude ]; then
@@ -223,7 +239,8 @@ echo
 echo "(claude exited with status $status — press Enter to close, Ctrl-b d to keep session)"
 read _ || true`,
 		shellPath(cwd),
-		joinShell(resume),
-		joinShell(fresh),
+		ensure,
+		resumeCmd,
+		freshCmd,
 	)
 }
