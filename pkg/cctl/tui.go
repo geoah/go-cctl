@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -1797,13 +1798,32 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 // name on the local server ("rxtx.dev"), server-qualified elsewhere
 // ("workspace/olympus") so same-named repos on different hosts don't
 // merge into one group. The cwd anchors the group's header workspace —
-// only meaningful for local repos; remote paths don't exist on this
-// machine, so the anchor falls back to cmux's default.
+// the repo checkout locally, the stand-in project dir for remotes.
 func repoGroup(r *Resolved) (name, cwd string) {
 	if r.Server.Local {
 		return r.RepoName, expandPath(r.Repo.Path)
 	}
-	return r.ServerName + "/" + r.RepoName, ""
+	return r.ServerName + "/" + r.RepoName, standInRepoDir(r)
+}
+
+// standInRepoDir returns (and lazily creates) a local placeholder
+// directory representing a REMOTE repo: ~/.cctl/remotes/<server>/<repo>,
+// marked with an empty .git dir. cmux derives a workspace's "project"
+// by walking its LOCAL working directory up to the nearest .git — remote
+// paths don't exist here, so without a stand-in every remote workspace
+// lands in the sidebar's "No Folder" bucket. With it, all of a remote
+// repo's worktree workspaces group under the repo name.
+func standInRepoDir(r *Resolved) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(home, ".cctl", "remotes", r.ServerName, r.RepoName)
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		log().Debug("standin-mkdir-fail", "dir", dir, "err", err.Error())
+		return ""
+	}
+	return dir
 }
 
 // workspaceCwd is the directory hint we pass to Spawner.Spawn — for cmux
@@ -1819,9 +1839,22 @@ func repoGroup(r *Resolved) (name, cwd string) {
 func workspaceCwd(r *Resolved, worktreeName string) string {
 	// For remote servers, the worktree path only exists on the remote
 	// host. cmux/wezterm/etc. spawn locally and would error with "Path
-	// does not exist". Fall back to $HOME so the spawn opens cleanly;
-	// the wrapper script's mosh/ssh handles the remote cd.
+	// does not exist". Use a per-worktree subdir of the local stand-in
+	// project dir (see standInRepoDir) so cmux's project-root walk
+	// groups the workspace under its repo instead of "No Folder"; fall
+	// back to $HOME when the stand-in can't be created. The wrapper
+	// script's mosh/ssh handles the real remote cd.
 	if !r.Server.Local {
+		if repoDir := standInRepoDir(r); repoDir != "" {
+			wt := worktreeName
+			if wt == "" {
+				wt = "main"
+			}
+			dir := filepath.Join(repoDir, wt)
+			if err := os.MkdirAll(dir, 0o755); err == nil {
+				return dir
+			}
+		}
 		if home, err := os.UserHomeDir(); err == nil {
 			return home
 		}

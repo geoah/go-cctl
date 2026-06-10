@@ -3,6 +3,8 @@ package cctl
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -968,8 +970,22 @@ func TestRepoGroup(t *testing.T) {
 	}
 	remote := &Resolved{ServerName: "workspace", Server: Server{Host: "h"},
 		RepoName: "olympus", Repo: Repo{Path: "~/olympus"}}
-	if name, cwd := repoGroup(remote); name != "workspace/olympus" || cwd != "" {
-		t.Errorf("remote repoGroup = %q,%q", name, cwd)
+	name, cwd := repoGroup(remote)
+	if name != "workspace/olympus" {
+		t.Errorf("remote repoGroup name = %q", name)
+	}
+	// Remote repos anchor at the local stand-in project dir, which must
+	// carry a .git marker so cmux's project-root walk resolves it.
+	if !strings.HasSuffix(cwd, filepath.Join(".cctl", "remotes", "workspace", "olympus")) {
+		t.Errorf("remote repoGroup cwd = %q, want the stand-in dir", cwd)
+	}
+	if fi, err := os.Stat(filepath.Join(cwd, ".git")); err != nil || !fi.IsDir() {
+		t.Errorf("stand-in dir must contain a .git marker, stat err=%v", err)
+	}
+	// Workspace cwd for a remote worktree is a subdir of the stand-in,
+	// so the .git walk lands on the repo dir.
+	if got := workspaceCwd(remote, "b300"); got != filepath.Join(cwd, "b300") {
+		t.Errorf("workspaceCwd(remote) = %q, want stand-in subdir", got)
 	}
 }
 
