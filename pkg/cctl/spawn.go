@@ -24,21 +24,44 @@ import (
 // the worktree name. The inline spawner ignores it; the wrapper script
 // does its own cd anyway.
 //
-// The mapping to cmux's model is one workspace per WORKTREE and one tab
-// (surface) per SESSION: `wsTitle` ("repo/worktree") names the workspace,
-// `tabTitle` (the session name) names the tab inside it. Spawning into a
-// worktree that already has a workspace adds a tab there instead of
-// creating another workspace.
-//
-// `focusExisting` says reaching the existing workspace is enough — don't
-// run the script at all. Only the attach-to-a-live-session path sets it:
-// there a tab in that workspace already holds the attached tmux client,
-// and running a second client would just mirror it. Everywhere else (new
-// session, detached resurrect) the wrapper script MUST actually run.
+// The mapping to cmux's model is one sidebar GROUP per repo, one
+// workspace per WORKTREE, and one tab (surface) per SESSION. Spawning
+// into a worktree that already has a workspace adds a tab there instead
+// of creating another workspace; workspaces are added to their repo's
+// group as they're created.
 type Spawner interface {
 	Name() string
 	Available() bool
-	Spawn(scriptPath, cwd, wsTitle, tabTitle string, focusExisting bool) error
+	Spawn(spec SpawnSpec) error
+}
+
+// SpawnSpec describes one open-this-session request to a Spawner.
+type SpawnSpec struct {
+	// Script is the wrapper-script path; the only thing that must run.
+	Script string
+	// Cwd is the working-directory hint for a newly created workspace
+	// (cmux uses it for the sidebar directory label + Files panel root
+	// on local servers).
+	Cwd string
+	// WsTitle names the worktree's workspace: "repo/worktree".
+	WsTitle string
+	// TabTitle names the session's tab inside the workspace.
+	TabTitle string
+	// GroupTitle names the sidebar group the workspace belongs to — the
+	// repo ("rxtx.dev" locally, "workspace/olympus" for remotes). Empty
+	// disables grouping.
+	GroupTitle string
+	// GroupCwd seeds the group anchor's working directory when the group
+	// is first created (the repo checkout path on local servers). cmux
+	// keys per-group cmux.json customization on this path.
+	GroupCwd string
+	// FocusExisting says reaching the existing workspace is enough —
+	// don't run the script at all. Only the attach-to-a-live-session
+	// path sets it: there a tab in that workspace already holds the
+	// attached tmux client, and running a second client would just
+	// mirror it. Everywhere else (new session, detached resurrect) the
+	// wrapper script MUST actually run.
+	FocusExisting bool
 }
 
 // ---- cmux ------------------------------------------------------------------
@@ -59,10 +82,11 @@ func (cmuxSpawner) Available() bool {
 	return err == nil
 }
 
-// Spawn maps cctl's tree onto cmux: one workspace per worktree (named
-// `wsTitle`, "repo/worktree"), one tab per session (named `tabTitle`).
+// Spawn maps cctl's tree onto cmux: one sidebar group per repo, one
+// workspace per worktree (named `WsTitle`, "repo/worktree"), one tab per
+// session (named `TabTitle`).
 //
-//   - workspace exists + focusExisting → just select it (a tab in there
+//   - workspace exists + FocusExisting → just select it (a tab in there
 //     already holds the attached tmux client; running the script again
 //     would only mirror the session).
 //   - workspace exists → add a tab: new-surface, run the wrapper in it
@@ -71,60 +95,142 @@ func (cmuxSpawner) Available() bool {
 //     terminal surface running the wrapper (bypasses cmux's default
 //     template with its Files panel), then best-effort rename its tab.
 //
-// Every cmux call past the first is best-effort with logging: if adding a
-// tab to an existing workspace fails (cmux version drift, surface-id
-// parse failure, …) we fall back to creating a separate workspace so the
-// session always opens SOMEWHERE.
+// After either path the workspace is added to its repo's sidebar group
+// (created on first use, anchored at the repo path). Every cmux call past
+// the first is best-effort with logging: if adding a tab to an existing
+// workspace fails (cmux version drift, surface-id parse failure, …) we
+// fall back to creating a separate workspace so the session always opens
+// SOMEWHERE, and a failed grouping never blocks the spawn.
 //
 // Auth: cmux's socket only accepts processes started inside cmux. When run
 // from outside, the call errors and the TUI falls back to inline ExecProcess.
-func (cmuxSpawner) Spawn(script, cwd, wsTitle, tabTitle string, focusExisting bool) error {
+func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 	cli := cmuxCLIPath()
 	if cli == "" {
 		return fmt.Errorf("cmux CLI not found (install /Applications/cmux.app)")
 	}
+	cwd := spec.Cwd
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
 	}
-	if wsTitle != "" {
-		if id, ok := findCmuxWorkspaceByName(cli, wsTitle); ok {
-			if focusExisting {
+	if spec.WsTitle != "" {
+		if id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle); ok {
+			// Workspaces created before grouping existed (or whose group
+			// was dissolved) get healed into their repo's group here.
+			ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
+			if spec.FocusExisting {
 				out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput()
 				if err == nil {
-					log().Info("cmux-focus-existing", "id", id, "ws", wsTitle)
+					log().Info("cmux-focus-existing", "id", id, "ws", spec.WsTitle)
 					return nil
 				}
-				log().Debug("cmux-select-workspace-fail", "id", id, "ws", wsTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+				log().Debug("cmux-select-workspace-fail", "id", id, "ws", spec.WsTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 				// fall through to add-tab: running the wrapper is still
 				// correct, just less elegant than focusing.
 			}
-			if err := addCmuxTab(cli, id, script, tabTitle); err == nil {
-				log().Info("cmux-add-tab", "id", id, "ws", wsTitle, "tab", tabTitle)
+			if err := addCmuxTab(cli, id, spec.Script, spec.TabTitle); err == nil {
+				log().Info("cmux-add-tab", "id", id, "ws", spec.WsTitle, "tab", spec.TabTitle)
 				return nil
 			} else {
 				log().Warn("cmux-add-tab-fail (falling back to new workspace)",
-					"id", id, "ws", wsTitle, "tab", tabTitle, "err", err.Error())
+					"id", id, "ws", spec.WsTitle, "tab", spec.TabTitle, "err", err.Error())
 			}
 		}
 	}
-	args, err := cmuxNewWorkspaceArgs(script, cwd, wsTitle)
+	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle)
 	if err != nil {
 		return fmt.Errorf("cmux build args: %w", err)
 	}
 	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("cmux new-workspace: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	// Best-effort: label the fresh workspace's only tab with the session
-	// name so the tab bar reads "<session>" instead of a shell default.
-	if wsTitle != "" && tabTitle != "" {
-		if id, ok := findCmuxWorkspaceByName(cli, wsTitle); ok {
-			out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", tabTitle).CombinedOutput()
-			if err != nil {
-				log().Debug("cmux-rename-tab-fail", "id", id, "tab", tabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	if spec.WsTitle != "" {
+		if id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle); ok {
+			// Best-effort: label the fresh workspace's only tab with the
+			// session name so the tab bar reads "<session>" instead of a
+			// shell default, and file the workspace under its repo group.
+			if spec.TabTitle != "" {
+				out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", spec.TabTitle).CombinedOutput()
+				if err != nil {
+					log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+				}
 			}
+			ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
 		}
 	}
 	return nil
+}
+
+// ensureCmuxGroupMembership files a workspace under the sidebar group
+// named `group`, creating the group when it doesn't exist yet (anchored
+// at groupCwd — the repo checkout). Adding a workspace that's already a
+// member is harmless. Purely cosmetic, so failures only log.
+//
+// Note: `workspace-group create` defaults --from to the user's current
+// sidebar selection, so we always pass the workspace id explicitly.
+func ensureCmuxGroupMembership(cli, group, groupCwd, wsID string) {
+	if group == "" || wsID == "" {
+		return
+	}
+	if gid, ok := findCmuxGroupByName(cli, group); ok {
+		out, err := exec.Command(cli, "workspace-group", "add", "--group", gid, "--workspace", wsID).CombinedOutput()
+		if err != nil {
+			log().Debug("cmux-group-add-fail", "group", group, "gid", gid, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			return
+		}
+		log().Debug("cmux-group-add", "group", group, "gid", gid, "ws", wsID)
+		return
+	}
+	args := []string{"workspace-group", "create", "--name", group, "--from", wsID}
+	if groupCwd != "" {
+		args = append(args, "--cwd", groupCwd)
+	}
+	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
+		log().Debug("cmux-group-create-fail", "group", group, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		return
+	}
+	log().Info("cmux-group-create", "group", group, "ws", wsID)
+}
+
+// findCmuxGroupByName looks a sidebar group up by exact name via
+// `workspace-group list --json` and returns its id. The JSON payload is
+// {"groups":[{"id":…,"name":…,…}]} (see cmux's v2WorkspaceGroupPayload).
+func findCmuxGroupByName(cli, name string) (string, bool) {
+	out, err := exec.Command(cli, "workspace-group", "list", "--json").Output()
+	if err != nil {
+		return "", false
+	}
+	return parseCmuxGroupList(string(out), name)
+}
+
+// parseCmuxGroupList extracts the id of the group with the given name
+// from `workspace-group list --json` output. Split from the exec call so
+// the parsing is unit-testable. Falls back to the "ref" handle when "id"
+// is absent — both are accepted by group-targeting commands.
+func parseCmuxGroupList(raw, name string) (string, bool) {
+	var payload struct {
+		Groups []struct {
+			ID   string `json:"id"`
+			Ref  string `json:"ref"`
+			Name string `json:"name"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		log().Debug("cmux-group-list-parse-fail", "err", err.Error())
+		return "", false
+	}
+	for _, g := range payload.Groups {
+		if g.Name != name {
+			continue
+		}
+		if g.ID != "" {
+			return g.ID, true
+		}
+		if g.Ref != "" {
+			return g.Ref, true
+		}
+	}
+	return "", false
 }
 
 // addCmuxTab opens a new terminal tab (surface) in the given workspace,

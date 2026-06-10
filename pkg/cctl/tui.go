@@ -528,6 +528,8 @@ type prepareDoneMsg struct {
 	cwd      string // suggested workspace cwd (used by cmuxSpawner)
 	wsTitle  string // workspace label: "repo/worktree" (one workspace per worktree)
 	tabTitle string // tab label inside the workspace: the session name
+	group    string // sidebar group: the repo ("rxtx.dev" local, "server/repo" remote)
+	groupCwd string // anchor cwd when the group is first created (repo path)
 	label    string
 	refresh  string
 	// focusExisting allows the spawner to focus a same-titled workspace
@@ -562,7 +564,7 @@ type refreshServerMsg struct {
 // We always write a tiny wrapper script first so each Spawner only ever
 // has to hand its terminal one filesystem path; this dodges all the
 // arg-quoting/splitting pitfalls.
-func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, wsTitle, tabTitle string, focusExisting bool) (string, error) {
+func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr string, spec SpawnSpec) (string, error) {
 	inner, err := interactiveCmd(s, useMosh, cmdStr)
 	if err != nil {
 		return "", fmt.Errorf("build interactive cmd: %w", err)
@@ -571,13 +573,16 @@ func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr, cwd, wsTitle,
 	if err != nil {
 		return "", err
 	}
+	spec.Script = script
 	pref := ""
 	if cfg != nil {
 		pref = cfg.Defaults.Spawn
 	}
 	sp, reason := detectSpawner(pref)
-	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script, "cwd", cwd, "ws", wsTitle, "tab", tabTitle, "focusExisting", focusExisting)
-	if err := sp.Spawn(script, cwd, wsTitle, tabTitle, focusExisting); err != nil {
+	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script,
+		"cwd", spec.Cwd, "ws", spec.WsTitle, "tab", spec.TabTitle,
+		"group", spec.GroupTitle, "focusExisting", spec.FocusExisting)
+	if err := sp.Spawn(spec); err != nil {
 		os.Remove(script)
 		return sp.Name(), err
 	}
@@ -900,7 +905,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, m.finishTask(msg.taskID, msg.label+": prepare failed", msg.err)
 		}
-		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, msg.cwd, msg.wsTitle, msg.tabTitle, msg.focusExisting)
+		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, SpawnSpec{
+			Cwd:           msg.cwd,
+			WsTitle:       msg.wsTitle,
+			TabTitle:      msg.tabTitle,
+			GroupTitle:    msg.group,
+			GroupCwd:      msg.groupCwd,
+			FocusExisting: msg.focusExisting,
+		})
 		if err != nil {
 			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
 			return m, m.finishTask(msg.taskID, provider+" spawn failed", err)
@@ -1534,6 +1546,7 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 		if worktree != "" && worktree != "main" {
 			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktree)
 		}
+		group, groupCwd := repoGroup(r)
 		return prepareDoneMsg{
 			server:   r.Server,
 			useMosh:  r.UseMosh,
@@ -1541,6 +1554,8 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 			cwd:      workspaceCwd(r, worktree),
 			wsTitle:  fmt.Sprintf("%s/%s", repoName, worktree),
 			tabTitle: name,
+			group:    group,
+			groupCwd: groupCwd,
 			label:    fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, name),
 			refresh:  serverName,
 			taskID:   taskID,
@@ -1596,12 +1611,16 @@ func (m *tuiModel) restoreCmd(items []restoreItem, taskID int) tea.Cmd {
 				if it.sess.Worktree != "" && it.sess.Worktree != "main" {
 					cwd = worktreePath(r.WorktreeBase, r.RepoName, it.sess.Worktree)
 				}
+				group, groupCwd := repoGroup(r)
 				_, err = spawnInNewWindow(m.cfg, r.Server, r.UseMosh,
 					attachOrRespawn(r, it.sess.Name, cwd),
-					workspaceCwd(r, it.sess.Worktree),
-					fmt.Sprintf("%s/%s", it.repo, it.sess.Worktree),
-					it.sess.Session,
-					false)
+					SpawnSpec{
+						Cwd:        workspaceCwd(r, it.sess.Worktree),
+						WsTitle:    fmt.Sprintf("%s/%s", it.repo, it.sess.Worktree),
+						TabTitle:   it.sess.Session,
+						GroupTitle: group,
+						GroupCwd:   groupCwd,
+					})
 			}
 			if err != nil {
 				if firstErr == nil {
@@ -1717,6 +1736,7 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 		if sess.Worktree != "" && sess.Worktree != "main" {
 			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
 		}
+		group, groupCwd := repoGroup(r)
 		return prepareDoneMsg{
 			server:   r.Server,
 			useMosh:  r.UseMosh,
@@ -1724,6 +1744,8 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 			cwd:      workspaceCwd(r, sess.Worktree),
 			wsTitle:  fmt.Sprintf("%s/%s", repoName, sess.Worktree),
 			tabTitle: sess.Session,
+			group:    group,
+			groupCwd: groupCwd,
 			label:    fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
 			refresh:  serverName,
 			// Reuse the existing cmux tab only when a tmux client is
@@ -1754,6 +1776,7 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 		if err != nil {
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
+		group, groupCwd := repoGroup(r)
 		return prepareDoneMsg{
 			server:   r.Server,
 			useMosh:  r.UseMosh,
@@ -1761,11 +1784,26 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 			cwd:      workspaceCwd(r, worktree),
 			wsTitle:  fmt.Sprintf("%s/%s", repoName, worktree),
 			tabTitle: sessionName,
+			group:    group,
+			groupCwd: groupCwd,
 			label:    fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
 			refresh:  serverName,
 			taskID:   taskID,
 		}
 	}
+}
+
+// repoGroup returns the sidebar-group identity for a repo: the bare repo
+// name on the local server ("rxtx.dev"), server-qualified elsewhere
+// ("workspace/olympus") so same-named repos on different hosts don't
+// merge into one group. The cwd anchors the group's header workspace —
+// only meaningful for local repos; remote paths don't exist on this
+// machine, so the anchor falls back to cmux's default.
+func repoGroup(r *Resolved) (name, cwd string) {
+	if r.Server.Local {
+		return r.RepoName, expandPath(r.Repo.Path)
+	}
+	return r.ServerName + "/" + r.RepoName, ""
 }
 
 // workspaceCwd is the directory hint we pass to Spawner.Spawn — for cmux

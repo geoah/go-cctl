@@ -935,6 +935,44 @@ func TestCmuxWorkspaceListParser(t *testing.T) {
 	}
 }
 
+// TestParseCmuxGroupList pins the `workspace-group list --json` payload
+// shape ({"groups":[{"id","ref","name",…}]} — cmux's
+// v2WorkspaceGroupPayload) and the id-then-ref fallback.
+func TestParseCmuxGroupList(t *testing.T) {
+	raw := `{"groups":[
+		{"id":"AAA-1","ref":"workspace_group:1","name":"rxtx.dev","member_count":2},
+		{"id":"","ref":"workspace_group:2","name":"workspace/olympus","member_count":5}
+	]}`
+	if id, ok := parseCmuxGroupList(raw, "rxtx.dev"); !ok || id != "AAA-1" {
+		t.Errorf("want id AAA-1, got %q ok=%v", id, ok)
+	}
+	if id, ok := parseCmuxGroupList(raw, "workspace/olympus"); !ok || id != "workspace_group:2" {
+		t.Errorf("empty id should fall back to ref, got %q ok=%v", id, ok)
+	}
+	if _, ok := parseCmuxGroupList(raw, "nope"); ok {
+		t.Errorf("unknown group name must not match")
+	}
+	if _, ok := parseCmuxGroupList("not json", "x"); ok {
+		t.Errorf("malformed payload must not match")
+	}
+}
+
+// TestRepoGroup pins the sidebar-group naming: bare repo name locally,
+// server-qualified for remotes (so same-named repos on different hosts
+// don't merge), with the anchor cwd only set for local repos.
+func TestRepoGroup(t *testing.T) {
+	local := &Resolved{ServerName: "local", Server: Server{Local: true},
+		RepoName: "rxtx.dev", Repo: Repo{Path: "/Users/me/src/rxtx.dev"}}
+	if name, cwd := repoGroup(local); name != "rxtx.dev" || cwd != "/Users/me/src/rxtx.dev" {
+		t.Errorf("local repoGroup = %q,%q", name, cwd)
+	}
+	remote := &Resolved{ServerName: "workspace", Server: Server{Host: "h"},
+		RepoName: "olympus", Repo: Repo{Path: "~/olympus"}}
+	if name, cwd := repoGroup(remote); name != "workspace/olympus" || cwd != "" {
+		t.Errorf("remote repoGroup = %q,%q", name, cwd)
+	}
+}
+
 // TestParseCmuxSurfaceID accepts both id shapes the cmux CLI can print —
 // full UUIDs and "surface:N" short refs — anywhere in the output text,
 // since the exact phrasing around them isn't part of the CLI contract.
