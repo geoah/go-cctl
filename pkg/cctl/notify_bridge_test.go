@@ -98,6 +98,72 @@ func TestNotifyHookScript_EndToEnd(t *testing.T) {
 	}
 }
 
+// TestCmuxSSHArgs pins the `cmux ssh` argv for remote-SSH workspaces:
+// destination first, workspace name, ssh details, and the remote command
+// after `--` through a login shell.
+func TestCmuxSSHArgs(t *testing.T) {
+	spec := SpawnSpec{
+		WsTitle: "olympus/b300",
+		Remote: &RemoteSpawn{
+			Destination: "geoah@10.0.0.1",
+			Port:        2222,
+			Identity:    "/Users/me/.ssh/key",
+			SSHOptions:  []string{"IdentitiesOnly=yes", "StrictHostKeyChecking=accept-new"},
+			Command:     "tmux new-session -A -s cctl/olympus/b300/poc 'x'",
+		},
+	}
+	got := strings.Join(cmuxSSHArgs(spec), " | ")
+	for _, want := range []string{
+		"ssh | geoah@10.0.0.1",
+		"--name | olympus/b300",
+		"--port | 2222",
+		"--identity | /Users/me/.ssh/key",
+		"--ssh-option | IdentitiesOnly=yes",
+		"--ssh-option | StrictHostKeyChecking=accept-new",
+		"-- | sh | -lc | tmux new-session -A -s cctl/olympus/b300/poc 'x'",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("cmuxSSHArgs missing %q in:\n%s", want, got)
+		}
+	}
+
+	minimal := SpawnSpec{Remote: &RemoteSpawn{Destination: "u@h", Command: "c"}}
+	got = strings.Join(cmuxSSHArgs(minimal), " ")
+	if strings.Contains(got, "--port") || strings.Contains(got, "--identity") || strings.Contains(got, "--name") {
+		t.Errorf("minimal spec must omit empty flags: %s", got)
+	}
+}
+
+// TestSSHOptionValues maps cctl's raw ssh_opts argv form onto the bare
+// option values cmux ssh wants.
+func TestSSHOptionValues(t *testing.T) {
+	got := sshOptionValues([]string{"-o", "IdentitiesOnly=yes", "-oStrictHostKeyChecking=no", "-4", "-o", "PubkeyAuthentication=yes"})
+	want := []string{"IdentitiesOnly=yes", "StrictHostKeyChecking=no", "PubkeyAuthentication=yes"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("sshOptionValues = %v want %v", got, want)
+	}
+}
+
+// TestServerUseCmuxSSH pins the transport gate: only explicit cmux-ssh
+// on a non-local server activates it.
+func TestServerUseCmuxSSH(t *testing.T) {
+	if (Server{Host: "h", Transport: "cmux-ssh"}).useCmuxSSH() != true {
+		t.Errorf("cmux-ssh transport should activate")
+	}
+	if (Server{Host: "h", Transport: "CMUX-SSH "}).useCmuxSSH() != true {
+		t.Errorf("transport value should be case/space tolerant")
+	}
+	for _, s := range []Server{
+		{Host: "h"},
+		{Host: "h", Transport: "mosh"},
+		{Local: true, Transport: "cmux-ssh"},
+	} {
+		if s.useCmuxSSH() {
+			t.Errorf("server %+v must not use cmux-ssh", s)
+		}
+	}
+}
+
 // TestClaudeLaunchScript_BridgeSurvivesQuoting syntax-checks the whole
 // chain: the bridge launch script (heredocs with single quotes inside)
 // gets shellQuoted into a tmux new-session command — both layers must

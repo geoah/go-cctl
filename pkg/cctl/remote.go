@@ -111,6 +111,28 @@ func runRemoteCode(s Server, cmd string) (int, string, error) {
 	return 0, stdout.String(), nil
 }
 
+// sshOptionValues extracts the bare option values ("IdentitiesOnly=yes")
+// from a raw ssh argv-style opts list ("-o", "IdentitiesOnly=yes", …) —
+// the form `cmux ssh --ssh-option` wants. Both "-o value" pairs and
+// "-ovalue" single tokens are handled; flags that aren't -o options
+// (rare in ssh_opts) are skipped with a log line since cmux ssh has no
+// generic passthrough for them.
+func sshOptionValues(opts []string) []string {
+	var out []string
+	for i := 0; i < len(opts); i++ {
+		switch {
+		case opts[i] == "-o" && i+1 < len(opts):
+			out = append(out, opts[i+1])
+			i++
+		case strings.HasPrefix(opts[i], "-o") && len(opts[i]) > 2:
+			out = append(out, opts[i][2:])
+		default:
+			log().Debug("ssh-opt-skipped-for-cmux-ssh", "opt", opts[i])
+		}
+	}
+	return out
+}
+
 // transportLabel produces a stable identifier for logs ("local" or
 // "user@host"). Avoids spamming logs with full ssh argv.
 func transportLabel(s Server) string {

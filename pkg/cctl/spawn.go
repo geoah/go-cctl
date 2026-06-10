@@ -62,6 +62,21 @@ type SpawnSpec struct {
 	// mirror it. Everywhere else (new session, detached resurrect) the
 	// wrapper script MUST actually run.
 	FocusExisting bool
+	// Remote, when set, requests a cmux remote-SSH workspace instead of
+	// a local one running the wrapper Script: the workspace is created
+	// via `cmux ssh` and tabs run Remote.Command in remote shells. The
+	// Script stays populated as the fallback when the cmux-ssh path
+	// fails (older cmux, ssh auth quirks).
+	Remote *RemoteSpawn
+}
+
+// RemoteSpawn describes the `cmux ssh` target for a remote-SSH workspace.
+type RemoteSpawn struct {
+	Destination string   // user@host
+	Port        int      // 0 = default
+	Identity    string   // expanded ssh key path, "" = default
+	SSHOptions  []string // bare -o values ("IdentitiesOnly=yes", …)
+	Command     string   // remote shell command (the idempotent tmux attach)
 }
 
 // ---- cmux ------------------------------------------------------------------
@@ -113,6 +128,14 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
 	}
+	// The command a tab in this workspace should run: the local wrapper
+	// script normally, the raw remote command in a cmux-ssh workspace
+	// (the surface shell already lives on the remote there — a local
+	// script path would mean nothing to it).
+	tabCommand := spec.Script
+	if spec.Remote != nil {
+		tabCommand = spec.Remote.Command
+	}
 	if spec.WsTitle != "" {
 		if id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle); ok {
 			// Workspaces created before grouping existed (or whose group
@@ -128,13 +151,22 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 				// fall through to add-tab: running the wrapper is still
 				// correct, just less elegant than focusing.
 			}
-			if err := addCmuxTab(cli, id, spec.Script, spec.TabTitle); err == nil {
+			if err := addCmuxTab(cli, id, tabCommand, spec.TabTitle); err == nil {
 				log().Info("cmux-add-tab", "id", id, "ws", spec.WsTitle, "tab", spec.TabTitle)
 				return nil
 			} else {
 				log().Warn("cmux-add-tab-fail (falling back to new workspace)",
 					"id", id, "ws", spec.WsTitle, "tab", spec.TabTitle, "err", err.Error())
 			}
+		}
+	}
+	if spec.Remote != nil {
+		if err := spawnCmuxSSHWorkspace(cli, spec); err == nil {
+			return nil
+		} else if spec.Script == "" {
+			return err
+		} else {
+			log().Warn("cmux-ssh-spawn-fail (falling back to local wrapper workspace)", "ws", spec.WsTitle, "err", err.Error())
 		}
 	}
 	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle)
@@ -144,21 +176,64 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("cmux new-workspace: %w: %s", err, strings.TrimSpace(string(out)))
 	}
+	finishCmuxWorkspace(cli, spec)
+	return nil
+}
+
+// spawnCmuxSSHWorkspace creates a remote-SSH workspace via `cmux ssh`:
+// cmux opens the transport, bootstraps its remote daemon (Files panel
+// over ssh, browser proxying, CLI relay for notifications), and runs the
+// remote command — our idempotent tmux attach — in the first tab.
+func spawnCmuxSSHWorkspace(cli string, spec SpawnSpec) error {
+	args := cmuxSSHArgs(spec)
+	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
+		return fmt.Errorf("cmux ssh: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	log().Info("cmux-ssh-workspace", "ws", spec.WsTitle, "dest", spec.Remote.Destination)
+	finishCmuxWorkspace(cli, spec)
+	return nil
+}
+
+// cmuxSSHArgs builds the `cmux ssh` argv for a remote-SSH workspace.
+// Split out for testability. The remote command goes through `sh -lc` so
+// the user's login PATH applies (tmux may live in /usr/local/bin etc.).
+func cmuxSSHArgs(spec SpawnSpec) []string {
+	r := spec.Remote
+	args := []string{"ssh", r.Destination}
 	if spec.WsTitle != "" {
-		if id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle); ok {
-			// Best-effort: label the fresh workspace's only tab with the
-			// session name so the tab bar reads "<session>" instead of a
-			// shell default, and file the workspace under its repo group.
-			if spec.TabTitle != "" {
-				out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", spec.TabTitle).CombinedOutput()
-				if err != nil {
-					log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
-				}
-			}
-			ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
+		args = append(args, "--name", spec.WsTitle)
+	}
+	if r.Port != 0 {
+		args = append(args, "--port", fmt.Sprintf("%d", r.Port))
+	}
+	if r.Identity != "" {
+		args = append(args, "--identity", r.Identity)
+	}
+	for _, opt := range r.SSHOptions {
+		args = append(args, "--ssh-option", opt)
+	}
+	args = append(args, "--", "sh", "-lc", r.Command)
+	return args
+}
+
+// finishCmuxWorkspace applies the post-create cosmetics shared by both
+// workspace flavors: label the first tab with the session name and file
+// the workspace under its repo group. Best-effort.
+func finishCmuxWorkspace(cli string, spec SpawnSpec) {
+	if spec.WsTitle == "" {
+		return
+	}
+	id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle)
+	if !ok {
+		return
+	}
+	if spec.TabTitle != "" {
+		out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", spec.TabTitle).CombinedOutput()
+		if err != nil {
+			log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
-	return nil
+	ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
 }
 
 // ensureCmuxGroupMembership files a workspace under the sidebar group

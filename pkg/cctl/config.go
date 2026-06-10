@@ -65,6 +65,21 @@ type Server struct {
 	Local       bool            `yaml:"local"` // run commands locally instead of via ssh/mosh
 	RepoSources []RepoSource    `yaml:"repo_sources"`
 	Repos       map[string]Repo `yaml:"repos"`
+	// Transport selects how the TUI opens this server's sessions in cmux.
+	// "" / "mosh" (default): a local workspace running mosh/ssh inside a
+	// wrapper script. "cmux-ssh": a cmux remote-SSH workspace (`cmux ssh`)
+	// — the Files panel lists the REMOTE filesystem, browser panes route
+	// through the remote network, and the cmux CLI relay works on the
+	// remote — at the cost of mosh (cmux reconnects over ssh instead).
+	// Non-interactive commands (list/kill/worktree ops) always use ssh
+	// regardless.
+	Transport string `yaml:"transport"`
+}
+
+// useCmuxSSH reports whether interactive sessions on this server should
+// open as cmux remote-SSH workspaces.
+func (s Server) useCmuxSSH() bool {
+	return !s.Local && strings.EqualFold(strings.TrimSpace(s.Transport), "cmux-ssh")
 }
 
 // RepoSource is a search root: cctl walks it up to MaxDepth looking for git

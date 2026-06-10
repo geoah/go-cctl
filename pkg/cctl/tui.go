@@ -622,6 +622,18 @@ func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr string, spec S
 		return "", err
 	}
 	spec.Script = script
+	// transport: cmux-ssh — request a remote-SSH workspace running the
+	// raw remote command; the wrapper script above stays as the fallback
+	// if the cmux ssh path fails.
+	if s.useCmuxSSH() {
+		spec.Remote = &RemoteSpawn{
+			Destination: sshTarget(s),
+			Port:        s.Port,
+			Identity:    expandPath(s.SSHKey),
+			SSHOptions:  sshOptionValues(s.SSHOpts),
+			Command:     cmdStr,
+		}
+	}
 	pref := ""
 	if cfg != nil {
 		pref = cfg.Defaults.Spawn

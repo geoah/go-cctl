@@ -76,6 +76,10 @@ servers:
     ssh_opts:
       - "-o"
       - "IdentitiesOnly=yes"
+    # transport: cmux-ssh  # open sessions as cmux remote-SSH workspaces:
+    #                      # Files panel lists the REMOTE fs, browser panes
+    #                      # route through the remote, cmux CLI works there.
+    #                      # Default (omitted) uses mosh/ssh in a local tab.
     repo_sources:
       - path: "~/"
         max_depth: 4
