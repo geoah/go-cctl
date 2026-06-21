@@ -95,6 +95,11 @@ type serverState struct {
 	conn         connState
 	connAttempts int   // number of probes issued (including current/last)
 	connErr      error // last probe failure
+	// pendingSync marks that this server (re)connected and, once it finishes
+	// loading, should trigger a cmux↔cctl sync. Set on every probe success
+	// (including a manual refresh), cleared when the sync is requested. This
+	// is what makes "refresh a remote → sync runs" work post-startup.
+	pendingSync bool
 }
 
 // ensureNotifyWatcher starts (or restarts after a transport drop) the
@@ -433,6 +438,10 @@ type tuiModel struct {
 	startupConnectTasks map[string]int // server -> task id (deleted once finished)
 	startupSyncTaskID   int
 	startupSynced       bool
+	// syncPending debounces post-startup re-syncs: when one or more servers
+	// reconnect+load in a burst (e.g. a manual refresh), they coalesce into a
+	// single sync fired by runSyncMsg.
+	syncPending bool
 
 	// scrollOffset is the index of the first tree row drawn in the main
 	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
@@ -614,6 +623,10 @@ type retryProbeMsg struct {
 	server string
 }
 
+// runSyncMsg fires (debounced) after one or more servers reconnect+load, to
+// run the cmux↔cctl sync once for the burst. See requestSync.
+type runSyncMsg struct{}
+
 type prepareDoneMsg struct {
 	server   Server
 	useMosh  bool
@@ -644,8 +657,8 @@ type prepareDoneMsg struct {
 type actionDoneMsg struct {
 	msg     string
 	refresh string
-	// refreshAll reloads every server after the action (used by the sync
-	// pass, which can revive/close sessions across all of them).
+	// refreshAll reloads every server after the action (used by restore,
+	// which can bring sessions back across all of them).
 	refreshAll bool
 	taskID     int
 	err        error
@@ -798,11 +811,33 @@ func (m *tuiModel) Init() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
-// startupProgress advances the startup queue after a server's state changed:
-// finish its connect entry if it just settled, then run the sync step if all
-// servers are now settled. tea.Batch tolerates the nil cmds.
+// startupProgress advances the queue after a server's state changed. During
+// startup it finishes the server's connect entry and runs the one-shot sync
+// once every server has settled. After startup, a server that just
+// (re)connected and finished loading triggers a fresh (debounced) sync — this
+// is the "refresh a remote → sync runs" path. tea.Batch tolerates nil cmds.
 func (m *tuiModel) startupProgress(server string) tea.Cmd {
-	return tea.Batch(m.settleServerTask(server), m.maybeStartupSync())
+	settle := m.settleServerTask(server)
+	if !m.startupSynced {
+		return tea.Batch(settle, m.maybeStartupSync())
+	}
+	st := m.state[server]
+	if st != nil && st.pendingSync && st.conn == connConnected &&
+		st.sessionsLoaded && st.reposLoaded && st.worktreesLoaded {
+		st.pendingSync = false
+		return tea.Batch(settle, m.requestSync())
+	}
+	return settle
+}
+
+// requestSync schedules a single post-startup sync shortly after now,
+// coalescing a burst of reconnects (e.g. a refresh of every server) into one.
+func (m *tuiModel) requestSync() tea.Cmd {
+	if m.syncPending {
+		return nil
+	}
+	m.syncPending = true
+	return tea.Tick(400*time.Millisecond, func(time.Time) tea.Msg { return runSyncMsg{} })
 }
 
 // settleServerTask finishes a server's startup "connecting…" queue entry once
@@ -866,6 +901,13 @@ func (m *tuiModel) maybeStartupSync() tea.Cmd {
 	}
 	m.startupSynced = true
 	sweepLegacySpawnScripts()
+	// The startup sync covers every server, so clear their pendingSync flags
+	// — otherwise the post-startup reconnect path would immediately re-sync.
+	for _, st := range m.state {
+		if st != nil {
+			st.pendingSync = false
+		}
+	}
 	// Flip the queued "sync" step to running and execute it.
 	m.markTaskRunning(m.startupSyncTaskID)
 	return tea.Batch(m.syncCmd(m.startupSyncTaskID, false), m.scheduleTick())
@@ -1081,6 +1123,9 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Reset attempts on success so the next failure starts
 			// backoff from scratch.
 			st.connAttempts = 0
+			// (Re)connected — once its data loads, trigger a sync. This is
+			// what makes a manual refresh of a remote run the cmux sync.
+			st.pendingSync = true
 			m.ensureNotifyWatcher(msg.server)
 			m.rebuildRows()
 			return m, tea.Batch(m.fetchServerCmd(msg.server)...)
@@ -1163,6 +1208,12 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, c)
 		}
 		return m, tea.Batch(cmds...)
+
+	case runSyncMsg:
+		// Debounced post-startup sync (a server reconnected/refreshed).
+		m.syncPending = false
+		id, tick := m.startTask("sync", "syncing cmux ↔ cctl…")
+		return m, tea.Batch(m.syncCmd(id, false), tick)
 
 	case actionDoneMsg:
 		// Note: this no longer forces the mode back to browse — the user
@@ -1842,10 +1893,10 @@ func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 				msg = "cmux already in sync with cctl"
 			}
 		}
-		// Reload the tree so closed sessions disappear — but only when
-		// something actually changed, to avoid a needless refresh storm on
-		// every quiet startup pass.
-		return actionDoneMsg{msg: msg, refreshAll: res.touched(), taskID: taskID}
+		// No tree refresh: sync only touches cmux workspaces + the manifest,
+		// never the tmux sessions the tree displays. Refreshing here would
+		// also re-probe every server and loop straight back into another sync.
+		return actionDoneMsg{msg: msg, taskID: taskID}
 	}
 }
 

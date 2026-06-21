@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.6.1] - 2026-06-21
+- fix(tui): run cmux sync when a server (re)connects after refresh
+
 ## [0.6.0] - 2026-06-21
 - feat(config): per-server ssh connect timeout (default 10s) + single retry
 

@@ -72,6 +72,65 @@ func TestStartupQueue(t *testing.T) {
 	}
 }
 
+// TestReconnectTriggersSync pins the "refresh a remote → sync runs" fix: once
+// startup is done, a server that (re)connects and finishes loading requests a
+// (debounced) sync.
+func TestReconnectTriggersSync(t *testing.T) {
+	loaded := func() *serverState {
+		return &serverState{conn: connConnected, sessionsLoaded: true, reposLoaded: true, worktreesLoaded: true}
+	}
+	m := &tuiModel{
+		cfg:                 &Config{Servers: map[string]Server{"ws": {Host: "h"}}},
+		serverNames:         []string{"ws"},
+		state:               map[string]*serverState{"ws": loaded()},
+		startupConnectTasks: map[string]int{},
+		startupSynced:       true, // past the startup one-shot
+	}
+	m.state["ws"].pendingSync = true // just reconnected
+
+	cmd := m.startupProgress("ws")
+	if cmd == nil {
+		t.Fatal("reconnect of a fully-loaded server should request a sync")
+	}
+	if !m.syncPending {
+		t.Error("syncPending should be set after a reconnect")
+	}
+	if m.state["ws"].pendingSync {
+		t.Error("pendingSync should be cleared once the sync is requested")
+	}
+	// Debounce: another reconnect while a sync is already queued is a no-op.
+	if c := m.requestSync(); c != nil {
+		t.Error("requestSync must not double-schedule while one is pending")
+	}
+
+	// Without pendingSync (a plain re-render), no sync is requested.
+	m.syncPending = false
+	if c := m.startupProgress("ws"); c != nil {
+		t.Error("a loaded server with no pendingSync should not request a sync")
+	}
+}
+
+// TestMaybeStartupSyncClearsPending: the one-shot startup sync clears every
+// server's pendingSync so the reconnect path doesn't immediately re-fire.
+func TestMaybeStartupSyncClearsPending(t *testing.T) {
+	m := &tuiModel{
+		cfg:               &Config{Servers: map[string]Server{"ws": {Host: "h"}}},
+		serverNames:       []string{"ws"},
+		state:             map[string]*serverState{"ws": {conn: connConnected, sessionsLoaded: true, reposLoaded: true, worktreesLoaded: true, pendingSync: true}},
+		startupSyncTaskID: 1,
+		tasks:             []*bgTask{{id: 1, label: "sync", pending: true}},
+	}
+	if cmd := m.maybeStartupSync(); cmd == nil {
+		t.Fatal("startup sync should fire once all settle")
+	}
+	if !m.startupSynced {
+		t.Error("startupSynced should be set")
+	}
+	if m.state["ws"].pendingSync {
+		t.Error("startup sync must clear pendingSync to avoid an immediate re-sync")
+	}
+}
+
 func TestEnsureCursorVisible(t *testing.T) {
 	m := &tuiModel{rows: make([]treeRow, 20)}
 
