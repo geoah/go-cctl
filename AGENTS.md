@@ -105,17 +105,23 @@ If a regression is "obvious in hindsight," the test is too.
   environment round trips on local + workspace. Always extend this when
   you add or fix anything in the session lifecycle.
 
-## Build + install loop
+## ⚠️ Build + install loop — ALWAYS install after a change ⚠️
 
-After any change touching cctl, the full sanity loop is:
+**Every change touching cctl ends with `mise run cctl:install`. No exceptions.**
+The user runs cctl from `$PATH` (`~/.local/bin/cctl`); a change that
+compiles but isn't installed is invisible to them and gives false
+"it's fixed" signals. Installing is part of "done", same as testing.
+
+After any change touching cctl, run the full loop:
 
 ```bash
 go build ./...
 mise run cctl:test
 mise run cctl:test:integration   # require this when changing session lifecycle
-mise run cctl:install
+mise run cctl:install            # MANDATORY — every change, not just "final" ones
 ```
 
 `cctl:install` writes the binary to `~/.local/bin/` so it survives Go
 version upgrades and stays on `$PATH` even when mise's go shim isn't
-active.
+active. If you made several edits across a turn, install at the end of
+the turn so the running binary always reflects the latest code.
