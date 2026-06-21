@@ -260,6 +260,57 @@ func TestParseCmuxGroups(t *testing.T) {
 
 // TestMapWorkspaceMeta_ServerDerivation: a "<remoteServer>/repo" group marks
 // members as that remote server's (and cctl-owned); a bare-repo group → local.
+func TestSyncCloseUnmatchedDefault(t *testing.T) {
+	if (&Config{}).syncCloseUnmatched() {
+		t.Error("sync_close_unmatched should default to false")
+	}
+	tr := true
+	if !(&Config{Defaults: Defaults{SyncCloseUnmatched: &tr}}).syncCloseUnmatched() {
+		t.Error("explicit true should enable")
+	}
+}
+
+func TestShouldCloseDeadWorkspace(t *testing.T) {
+	tracked := tmuxName("rxtx.dev", "main", "audit")
+	desired := map[string]bool{"rxtx.dev/main/audit": true}
+	remoteMeta := wsMeta{server: "ws", remote: true, repoRoot: "olympus"}
+	localMeta := wsMeta{server: "local", repoRoot: "rxtx.dev"}
+
+	// alive tracked → keep
+	live := map[string]bool{tracked: true}
+	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, live, desired, false) {
+		t.Error("alive session must never be closed")
+	}
+	// dead + tracked → close even with the flag off
+	if !shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, map[string]bool{}, desired, false) {
+		t.Error("dead tracked workspace should close")
+	}
+	// dead + untracked + flag OFF → keep (protects manual tabs)
+	if shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, false) {
+		t.Error("dead untracked workspace must be kept when close-unmatched is off")
+	}
+	// dead + untracked + flag ON → close (opt-in pruning), but only cctl-shaped
+	if !shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, true) {
+		t.Error("dead untracked 3-part workspace should close when close-unmatched is on")
+	}
+	// non-cctl-shaped (single component) → never closed, even with flag on
+	if shouldCloseDeadWorkspace("my-notes", localMeta, map[string]bool{}, desired, true) {
+		t.Error("non-cctl-shaped workspace must never be auto-closed")
+	}
+	// 2-part: closed only in a cctl remote group, never via close-unmatched
+	if shouldCloseDeadWorkspace("olympus/lethe", localMeta, map[string]bool{}, desired, true) {
+		t.Error("2-part local workspace must not be closed even with flag on")
+	}
+	if !shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, map[string]bool{}, desired, false) {
+		t.Error("dead 2-part workspace in a cctl remote group should close")
+	}
+	// 2-part in remote group but a session there is alive → keep
+	liveWt := map[string]bool{tmuxName("olympus", "lethe", "poc"): true}
+	if shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, liveWt, desired, false) {
+		t.Error("2-part workspace with a live session must be kept")
+	}
+}
+
 func TestDeriveWsMeta(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"mac":       {Local: true},

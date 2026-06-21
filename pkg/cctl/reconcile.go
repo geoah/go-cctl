@@ -143,7 +143,7 @@ func syncCmuxState(cfg *Config) syncResult {
 	// Close cctl workspaces whose tmux session is dead. Sync NEVER revives and
 	// sets NO resume bindings: that churn is what triggered cmux's "auto
 	// restore?" prompts. Bringing sessions back is the explicit R key.
-	closeDead(cli, views, wsMetaByID, liveByServer, localName, entries, &res)
+	closeDead(cli, views, wsMetaByID, liveByServer, localName, entries, cfg.syncCloseUnmatched(), &res)
 	return res
 }
 
@@ -207,7 +207,7 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 // duplicate same-named workspaces). Never closes a live session's workspace,
 // never closes when a server's liveness is unknown (unreachable), and never
 // prunes the manifest (so the R key can still restore it).
-func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByServer map[string]map[string]bool, localName string, entries []wsEntry, res *syncResult) {
+func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByServer map[string]map[string]bool, localName string, entries []wsEntry, closeUnmatched bool, res *syncResult) {
 	desired := manifestWsSet()
 	srvByWs := map[string]string{}
 	for _, e := range entries {
@@ -226,33 +226,8 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		if live == nil {
 			continue // server unreachable — can't tell; leave it
 		}
-		// inCctlRemoteGroup: cmux would never name a group "<remoteServer>/repo"
-		// itself, so a member whose name sits under that repo is unambiguously
-		// a cctl workspace — safe to close even legacy two-part ones.
-		inCctlRemoteGroup := meta.remote && meta.repoRoot != "" && strings.HasPrefix(w.name, meta.repoRoot+"/")
-
-		parts := strings.Split(w.name, "/")
-		switch len(parts) {
-		case 3:
-			repo, wt, sess := parts[0], parts[1], parts[2]
-			if live[tmuxName(repo, wt, sess)] {
-				continue // alive — keep
-			}
-			if !desired[w.name] && !inCctlRemoteGroup {
-				continue // dead but not provably ours
-			}
-		case 2:
-			// Legacy name (no session). Only act inside a verified cctl remote
-			// group; close when no session on that worktree is alive. Local
-			// two-part groups can be cmux's own project grouping — leave them.
-			if !inCctlRemoteGroup {
-				continue
-			}
-			if anyLiveForWorktree(live, parts[0], parts[1]) {
-				continue // a session there is alive — migration will rename it
-			}
-		default:
-			continue // "cctl" control workspace, user workspaces, etc.
+		if !shouldCloseDeadWorkspace(w.name, meta, live, desired, closeUnmatched) {
+			continue
 		}
 		if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
 			log().Debug("sync-close-workspace-fail", "ws", w.name, "err", err.Error(), "out", strings.TrimSpace(string(out)))
@@ -260,6 +235,40 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		}
 		log().Info("sync-close-dead-workspace", "ws", w.name, "server", server)
 		res.closed++
+	}
+}
+
+// shouldCloseDeadWorkspace is the pure decision behind closeDead. `live` is
+// the workspace's server's live tmux-session set (caller guarantees non-nil —
+// an unreachable server is never pruned). Returns true only for a workspace
+// whose session is dead AND that cctl may close:
+//
+//   - 3-part "repo/worktree/session": close when tracked in the manifest, in a
+//     verified cctl remote group, or — only with closeUnmatched — any dead
+//     cctl-shaped name (the opt-in that prunes tabs cctl can't otherwise prove
+//     it owns).
+//   - 2-part legacy "repo/worktree": close only inside a verified cctl remote
+//     group (cmux would never name such a group itself). Never via
+//     closeUnmatched — a bare two-part name is exactly what a manual tab or
+//     cmux's own project grouping looks like.
+//   - anything else (the "cctl" control workspace, single-name or custom
+//     workspaces): never closed.
+func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired map[string]bool, closeUnmatched bool) bool {
+	inCctlRemoteGroup := meta.remote && meta.repoRoot != "" && strings.HasPrefix(name, meta.repoRoot+"/")
+	parts := strings.Split(name, "/")
+	switch len(parts) {
+	case 3:
+		if live[tmuxName(parts[0], parts[1], parts[2])] {
+			return false // alive — keep
+		}
+		return desired[name] || inCctlRemoteGroup || closeUnmatched
+	case 2:
+		if !inCctlRemoteGroup {
+			return false
+		}
+		return !anyLiveForWorktree(live, parts[0], parts[1])
+	default:
+		return false
 	}
 }
 

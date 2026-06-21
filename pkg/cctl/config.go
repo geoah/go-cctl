@@ -32,6 +32,13 @@ type Defaults struct {
 	// just the local one. Default true. Set false to limit liveness/close to
 	// the local server (remote tabs then left to cmux's own ssh restore).
 	SyncAllServers *bool `yaml:"sync_all_servers"`
+	// SyncCloseUnmatched controls whether sync also closes a DEAD workspace
+	// that follows cctl's "repo/worktree/session" naming but can't be matched
+	// to a tracked or live session (i.e. cctl can't prove it owns it). Default
+	// false: such tabs are left alone so a manually-opened tab is never
+	// closed. Set true to aggressively prune them. Tabs whose name isn't
+	// cctl-shaped (plain shells, custom names) are never auto-closed either way.
+	SyncCloseUnmatched *bool `yaml:"sync_close_unmatched"`
 	// Spawn chooses the terminal-spawn provider when launching sessions
 	// from the TUI: "auto" (default — detect from $TERM_PROGRAM), or one
 	// of "ghostty", "cmux", "wezterm", "kitty", "iterm2", "inline".
@@ -58,6 +65,16 @@ func (c *Config) syncAllServers() bool {
 		return *c.Defaults.SyncAllServers
 	}
 	return true
+}
+
+// syncCloseUnmatched reports whether sync may close dead cctl-shaped
+// workspaces it can't match to a tracked/live session. Default false (protect
+// manually-opened tabs).
+func (c *Config) syncCloseUnmatched() bool {
+	if c.Defaults.SyncCloseUnmatched != nil {
+		return *c.Defaults.SyncCloseUnmatched
+	}
+	return false
 }
 
 // claudeUpdateCmd returns the configured upgrade command, defaulting to
