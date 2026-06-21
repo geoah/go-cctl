@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.2.4] - 2026-06-21
+- fix(cmux): group local repo worktrees under one sidebar group per repo
+
 ## [0.2.3] - 2026-06-21
 - fix(sync): close dead legacy 2-part workspaces in remote cctl groups
 

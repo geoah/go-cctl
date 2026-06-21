@@ -35,16 +35,17 @@ type syncResult struct {
 	restored int
 	closed   int
 	migrated int
+	grouped  int
 	errs     int
 }
 
 func (r syncResult) touched() bool {
-	return r.adopted+r.restored+r.closed+r.migrated+r.errs > 0
+	return r.adopted+r.restored+r.closed+r.migrated+r.grouped+r.errs > 0
 }
 
 func (r syncResult) summary() string {
-	return fmt.Sprintf("synced cmux — closed %d, renamed %d, adopted %d, restored %d",
-		r.closed, r.migrated, r.adopted, r.restored)
+	return fmt.Sprintf("synced cmux — closed %d, renamed %d, grouped %d, adopted %d, restored %d",
+		r.closed, r.migrated, r.grouped, r.adopted, r.restored)
 }
 
 // findLocalServer returns the (first) server marked local, the only one
@@ -131,6 +132,11 @@ func syncCmuxState(cfg *Config) syncResult {
 	for name, s := range targets {
 		res.adopted += adoptFromTmux(name, s, sessionsByServer[name])
 	}
+
+	// File local repo worktrees under one sidebar group per repo (remote ones
+	// are grouped at spawn). Fixes a repo's worktrees splitting into separate
+	// per-worktree folders.
+	res.grouped = ensureLocalRepoGrouping(cli, cfg, localName, views, wsMetaByID)
 
 	// Re-read after adoption so close sees the full tracked set.
 	entries := loadManifestEntries()
@@ -256,6 +262,49 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		log().Info("sync-close-dead-workspace", "ws", w.name, "server", server)
 		res.closed++
 	}
+}
+
+// ensureLocalRepoGrouping files every local cctl workspace under one sidebar
+// group per repo (named after the repo). Without this, cmux groups local
+// worktrees by each worktree's own directory — so a repo with several
+// worktrees splits into separate "ergogen"/"agent-sdk"/… folders instead of
+// one "rxtx.dev". Remote workspaces already get a "server/repo" group at
+// spawn; this is the local equivalent, healed on every sync. Only touches
+// workspaces whose first path component is a known local repo (so the user's
+// own cmux folders are left alone). Returns how many it (re)grouped.
+func ensureLocalRepoGrouping(cli string, cfg *Config, localName string, views []cmuxWsView, wsMeta map[string]wsMeta) int {
+	if localName == "" {
+		return 0
+	}
+	localSrv := cfg.Servers[localName]
+	repos := mergeRepos(localSrv)
+	if discovered, err := discoverRepos(localSrv); err == nil {
+		for k, v := range discovered {
+			repos[k] = v
+		}
+	}
+	grouped := 0
+	for _, w := range views {
+		meta := wsMeta[w.id]
+		if meta.remote {
+			continue // remote — already grouped under "server/repo"
+		}
+		parts := strings.Split(w.name, "/")
+		if len(parts) < 2 || parts[0] == "" {
+			continue // "cctl" control / single-name / user workspace
+		}
+		repo := parts[0]
+		r, ok := repos[repo]
+		if !ok {
+			continue // first component isn't a known local repo → not ours
+		}
+		if meta.repoRoot == repo {
+			continue // already in the repo's group
+		}
+		ensureCmuxGroupMembership(cli, repo, expandPath(r.Path), w.id)
+		grouped++
+	}
+	return grouped
 }
 
 // migrateCmuxWorkspaceNames renames legacy two-part "repo/worktree" cctl
