@@ -194,6 +194,7 @@ type bgTask struct {
 	label   string
 	detail  string // sub-line, usually the error text on failure
 	started time.Time
+	pending bool // queued but not started yet (shown with ○, no spinner)
 	done    bool
 	failed  bool
 	clearAt time.Time // done only: when the entry drops from the footer
@@ -215,7 +216,10 @@ const tickInterval = 100 * time.Millisecond
 // Used to decide whether to schedule another tick after the current one.
 func (m *tuiModel) needTick() bool {
 	for _, t := range m.tasks {
-		if !t.done {
+		// A pending task doesn't animate by itself — it flips to running on a
+		// state-change message, which re-renders anyway. Counting it here
+		// would spin the tick loop forever while nothing moves.
+		if !t.done && !t.pending {
 			return true
 		}
 		if !t.clearAt.IsZero() && time.Now().Before(t.clearAt) {
@@ -262,6 +266,34 @@ func (m *tuiModel) startTask(key, label string) (int, tea.Cmd) {
 	})
 	log().Debug("tui-task-start", "id", m.nextTaskID, "key", key, "label", label)
 	return m.nextTaskID, m.scheduleTick()
+}
+
+// startPendingTask registers a queued task that hasn't started running yet —
+// shown in the queue with a ○ instead of a spinner. markTaskRunning flips it
+// to active. Used for the startup "sync" step so the user sees it waiting in
+// line behind the per-server connects.
+func (m *tuiModel) startPendingTask(key, label string) int {
+	m.nextTaskID++
+	m.tasks = append(m.tasks, &bgTask{
+		id:      m.nextTaskID,
+		key:     key,
+		label:   label,
+		started: time.Now(),
+		pending: true,
+	})
+	return m.nextTaskID
+}
+
+// markTaskRunning flips a pending task to running and (re)stamps its start
+// time so the elapsed clock counts from when it actually began.
+func (m *tuiModel) markTaskRunning(id int) {
+	for _, t := range m.tasks {
+		if t.id == id {
+			t.pending = false
+			t.started = time.Now()
+			return
+		}
+	}
 }
 
 // finishTask marks the task done. A non-empty label replaces the running
@@ -352,7 +384,7 @@ func taskKeysConflict(a, b string) bool {
 // render the per-row spinner.
 func (m *tuiModel) runningTaskFor(key string) *bgTask {
 	for _, t := range m.tasks {
-		if !t.done && taskKeysConflict(t.key, key) {
+		if !t.done && !t.pending && taskKeysConflict(t.key, key) {
 			return t
 		}
 	}
@@ -394,11 +426,13 @@ type tuiModel struct {
 	tasks      []*bgTask
 	nextTaskID int
 
-	// startupTaskID tracks the "synchronizing servers…" footer task; once
-	// every server has settled it's marked done and the cmux↔cctl sync
-	// kicks off. startupSynced guards that sync so it fires exactly once.
-	startupTaskID int
-	startupSynced bool
+	// Startup queue: one connect task per server ("<server>: connecting…")
+	// plus a pending "sync cmux ↔ cctl" task. Each connect task finishes when
+	// its server settles; once all have, the sync task flips from pending to
+	// running. startupSynced guards that the sync fires exactly once.
+	startupConnectTasks map[string]int // server -> task id (deleted once finished)
+	startupSyncTaskID   int
+	startupSynced       bool
 
 	// scrollOffset is the index of the first tree row drawn in the main
 	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
@@ -744,17 +778,58 @@ func (m *tuiModel) Init() tea.Cmd {
 	if c := m.scheduleTick(); c != nil {
 		cmds = append(cmds, c)
 	}
-	// Show the startup work as a visible queue. Step 1 ("synchronizing
-	// servers…") covers the per-server fetches kicked off above; step 2
-	// (the cmux↔cctl sync) fires automatically once every server settles —
-	// see maybeStartupSync. NOT a fixed timer: the old 2s tick raced ahead
-	// of the remote fetches and synced against an empty session list.
-	id, tick := m.startTask("startup:servers", "synchronizing servers…")
-	m.startupTaskID = id
-	if tick != nil {
-		cmds = append(cmds, tick)
+	// Show the startup work as a visible queue, done one by one: one
+	// "<server>: connecting…" task per server (each finishes when that server
+	// settles), then a "sync cmux ↔ cctl" step that waits in line (pending,
+	// ○) until every server has settled — see maybeStartupSync. NOT a fixed
+	// timer: the old 2s tick raced ahead of the remote fetches.
+	m.startupConnectTasks = map[string]int{}
+	for _, n := range m.serverNames {
+		id, tick := m.startTask("startup:connect:"+n, n+": connecting…")
+		m.startupConnectTasks[n] = id
+		if tick != nil {
+			cmds = append(cmds, tick)
+		}
 	}
+	m.startupSyncTaskID = m.startPendingTask("startup:sync", "sync cmux ↔ cctl")
 	return tea.Batch(cmds...)
+}
+
+// startupProgress advances the startup queue after a server's state changed:
+// finish its connect entry if it just settled, then run the sync step if all
+// servers are now settled. tea.Batch tolerates the nil cmds.
+func (m *tuiModel) startupProgress(server string) tea.Cmd {
+	return tea.Batch(m.settleServerTask(server), m.maybeStartupSync())
+}
+
+// settleServerTask finishes a server's startup "connecting…" queue entry once
+// that server has settled — loaded (ready) or given up (unreachable). No-op
+// until then, and only fires once per server.
+func (m *tuiModel) settleServerTask(server string) tea.Cmd {
+	id, tracked := m.startupConnectTasks[server]
+	if !tracked {
+		return nil
+	}
+	st := m.state[server]
+	if st == nil {
+		return nil
+	}
+	switch st.conn {
+	case connConnected:
+		if !st.sessionsLoaded || !st.reposLoaded || !st.worktreesLoaded {
+			return nil
+		}
+		delete(m.startupConnectTasks, server)
+		return m.finishTask(id, fmt.Sprintf("%s: ready (%d session(s))", server, len(st.sessions)), nil)
+	case connDisconnected:
+		delete(m.startupConnectTasks, server)
+		err := st.connErr
+		if err == nil {
+			err = fmt.Errorf("unreachable")
+		}
+		return m.finishTask(id, server+": unreachable", err)
+	}
+	return nil
 }
 
 // allServersSettled reports whether every server has finished its initial
@@ -788,13 +863,9 @@ func (m *tuiModel) maybeStartupSync() tea.Cmd {
 	}
 	m.startupSynced = true
 	sweepLegacySpawnScripts()
-	finish := m.finishTask(m.startupTaskID, "servers synchronized", nil)
-	id, tick := m.startTask("startup:sync", "syncing cmux ↔ cctl…")
-	cmds := []tea.Cmd{finish, m.syncCmd(id, false)}
-	if tick != nil {
-		cmds = append(cmds, tick)
-	}
-	return tea.Batch(cmds...)
+	// Flip the queued "sync" step to running and execute it.
+	m.markTaskRunning(m.startupSyncTaskID)
+	return tea.Batch(m.syncCmd(m.startupSyncTaskID, false), m.scheduleTick())
 }
 
 // loadServerCmd issues a reachability probe first, then (once connected)
@@ -985,7 +1056,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.sessionsLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, m.maybeStartupSync()
+		return m, m.startupProgress(msg.server)
 
 	case loadedReposMsg:
 		st := m.state[msg.server]
@@ -997,7 +1068,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.reposLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, m.maybeStartupSync()
+		return m, m.startupProgress(msg.server)
 
 	case loadedWorktreesMsg:
 		st := m.state[msg.server]
@@ -1010,7 +1081,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.worktreesLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, m.maybeStartupSync()
+		return m, m.startupProgress(msg.server)
 
 	case probedMsg:
 		st := m.state[msg.server]
@@ -1042,7 +1113,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// reconciles the local cmux instead of waiting forever).
 		return m, tea.Batch(
 			tea.Tick(delay, func(time.Time) tea.Msg { return retryProbeMsg{server: server} }),
-			m.maybeStartupSync(),
+			m.startupProgress(server),
 		)
 
 	case retryProbeMsg:
@@ -2462,9 +2533,17 @@ func (m *tuiModel) browseView() string {
 
 	title := m.renderTitleBar()
 	status := m.bottomStatus()
-	statusH := lipgloss.Height(status)
 
-	bodyH := m.height - lipgloss.Height(title) - statusH
+	// The activity queue sits in its own strip just above the status line —
+	// the "things the system is doing", checked off one by one. Present only
+	// while there's work (startup connects + sync, deletes, restores…).
+	queue := m.renderQueueStrip(m.width)
+	queueH := 0
+	if queue != "" {
+		queueH = lipgloss.Height(queue) + 1 // +1 for the blank spacer line
+	}
+
+	bodyH := m.height - lipgloss.Height(title) - lipgloss.Height(status) - queueH
 	if bodyH < 3 {
 		bodyH = 3
 	}
@@ -2493,7 +2572,31 @@ func (m *tuiModel) browseView() string {
 		body = lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, sideBlock)
 	}
 
-	return title + "\n" + body + "\n" + status
+	out := title + "\n" + body
+	if queue != "" {
+		out += "\n\n" + queue
+	}
+	return out + "\n" + status
+}
+
+// renderQueueStrip draws the activity queue as a bordered-top strip: a faint
+// rule + "ACTIVITY", then each task (running spinner / pending ○ / done ✓✗),
+// one per line. Empty string when nothing is queued. Width-truncated.
+func (m *tuiModel) renderQueueStrip(w int) string {
+	tasks := m.renderTaskLines()
+	if len(tasks) == 0 {
+		return ""
+	}
+	maxW := w
+	if maxW < 1 {
+		maxW = 1
+	}
+	trunc := lipgloss.NewStyle().MaxWidth(maxW)
+	lines := []string{dimStyle.Render("ACTIVITY")}
+	for _, t := range tasks {
+		lines = append(lines, trunc.Render(t))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // linearView is the small-terminal / pre-size fallback: title, the tree, then
@@ -2605,10 +2708,10 @@ func (m *tuiModel) ensureCursorVisible(visible int) {
 	}
 }
 
-// renderSidebar draws the right column: an ACTIVITY section (the background
-// task queue) over a KEYS section (compact shortcuts). Each line is prefixed
-// with a faint vertical rule that doubles as the panel separator, and
-// truncated to the column so nothing wraps.
+// renderSidebar draws the right column: a KEYS section (compact shortcuts).
+// Each line is prefixed with a faint vertical rule that doubles as the panel
+// separator, and truncated to the column so nothing wraps. The activity queue
+// lives in its own strip at the bottom (renderQueueStrip), not here.
 func (m *tuiModel) renderSidebar(w, h int) string {
 	body := w - 2 // "│ " prefix
 	if body < 1 {
@@ -2618,16 +2721,6 @@ func (m *tuiModel) renderSidebar(w, h int) string {
 	add := func(s string) {
 		lines = append(lines, dimStyle.Render("│ ")+lipgloss.NewStyle().MaxWidth(body).Render(s))
 	}
-	add(headerStyle.Render("ACTIVITY"))
-	tasks := m.renderTaskLines()
-	if len(tasks) == 0 {
-		add(dimStyle.Render("idle"))
-	} else {
-		for _, t := range tasks {
-			add(t)
-		}
-	}
-	add("")
 	add(headerStyle.Render("KEYS"))
 	for _, k := range sidebarKeys {
 		add(dimStyle.Render(k))
@@ -3021,11 +3114,14 @@ const maxTaskLines = 6
 // first (spinner + label + elapsed), then recently finished (✓ / ✗ +
 // label, with the error detail on failures).
 func (m *tuiModel) renderTaskLines() []string {
-	var running, finished []*bgTask
+	var running, pending, finished []*bgTask
 	for _, t := range m.tasks {
-		if t.done {
+		switch {
+		case t.done:
 			finished = append(finished, t)
-		} else {
+		case t.pending:
+			pending = append(pending, t)
+		default:
 			running = append(running, t)
 		}
 	}
@@ -3041,6 +3137,12 @@ func (m *tuiModel) renderTaskLines() []string {
 		}
 		lines = append(lines, line)
 	}
+	for _, t := range pending {
+		if len(lines) >= maxTaskLines {
+			break
+		}
+		lines = append(lines, dimStyle.Render("○ "+t.label))
+	}
 	for _, t := range finished {
 		if len(lines) >= maxTaskLines {
 			break
@@ -3055,7 +3157,7 @@ func (m *tuiModel) renderTaskLines() []string {
 			lines = append(lines, okStyle.Bold(true).Render("✓ "+t.label))
 		}
 	}
-	if hidden := len(running) + len(finished) - len(lines); hidden > 0 {
+	if hidden := len(running) + len(pending) + len(finished) - len(lines); hidden > 0 {
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("… and %d more", hidden)))
 	}
 	return lines

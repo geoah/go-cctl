@@ -7,6 +7,71 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// TestStartupQueue pins the startup queue: one connect task per server plus a
+// pending sync step; each connect finishes when its server settles, and the
+// sync flips from pending to running once all have.
+func TestStartupQueue(t *testing.T) {
+	m := &tuiModel{
+		cfg:         &Config{Servers: map[string]Server{"local": {Local: true}, "ws": {Host: "h"}}},
+		serverNames: []string{"local", "ws"},
+		state: map[string]*serverState{
+			"local": {conn: connConnecting},
+			"ws":    {conn: connConnecting},
+		},
+		startupConnectTasks: map[string]int{},
+	}
+	// Seed the queue the way Init does.
+	for _, n := range m.serverNames {
+		id, _ := m.startTask("startup:connect:"+n, n+": connecting…")
+		m.startupConnectTasks[n] = id
+	}
+	m.startupSyncTaskID = m.startPendingTask("startup:sync", "sync cmux ↔ cctl")
+
+	if got := len(m.startupConnectTasks); got != 2 {
+		t.Fatalf("want 2 connect tasks, got %d", got)
+	}
+	syncTask := func() *bgTask {
+		for _, tk := range m.tasks {
+			if tk.id == m.startupSyncTaskID {
+				return tk
+			}
+		}
+		return nil
+	}
+	if !syncTask().pending {
+		t.Fatal("sync task should start pending")
+	}
+
+	// local settles (connected + loaded) → its connect task finishes.
+	st := m.state["local"]
+	st.conn = connConnected
+	st.sessionsLoaded, st.reposLoaded, st.worktreesLoaded = true, true, true
+	m.settleServerTask("local")
+	if _, still := m.startupConnectTasks["local"]; still {
+		t.Error("local connect task should be removed after settle")
+	}
+	// Not all settled yet → sync still pending.
+	if c := m.maybeStartupSync(); c != nil || !syncTask().pending {
+		t.Error("sync must stay pending until every server settles")
+	}
+
+	// ws settles → all settled → sync flips to running.
+	ws := m.state["ws"]
+	ws.conn = connConnected
+	ws.sessionsLoaded, ws.reposLoaded, ws.worktreesLoaded = true, true, true
+	m.settleServerTask("ws")
+	if c := m.maybeStartupSync(); c == nil {
+		t.Fatal("maybeStartupSync should fire once all settle")
+	}
+	if syncTask().pending {
+		t.Error("sync task should be running after all servers settle")
+	}
+	// Idempotent: a second call does nothing.
+	if c := m.maybeStartupSync(); c != nil {
+		t.Error("maybeStartupSync should fire exactly once")
+	}
+}
+
 func TestEnsureCursorVisible(t *testing.T) {
 	m := &tuiModel{rows: make([]treeRow, 20)}
 

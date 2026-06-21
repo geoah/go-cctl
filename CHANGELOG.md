@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.3.0] - 2026-06-21
+- feat(tui): startup queue strip — steps done one by one above the status
+
 ## [0.2.4] - 2026-06-21
 - fix(cmux): group local repo worktrees under one sidebar group per repo
 
