@@ -399,6 +399,11 @@ type tuiModel struct {
 	// kicks off. startupSynced guards that sync so it fires exactly once.
 	startupTaskID int
 	startupSynced bool
+
+	// scrollOffset is the index of the first tree row drawn in the main
+	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
+	// follows the cursor (k9s-style). Clamped each render in browseView.
+	scrollOffset int
 	// spinnerFrame ticks while anything in the model is animating (any
 	// running task, or any server connecting / still loading). Shared so
 	// every spinner in the UI advances in lockstep.
@@ -1147,6 +1152,18 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor > 0 {
 			m.cursor--
 		}
+	case "pgdown", "ctrl+f":
+		if n := len(m.rows); n > 0 {
+			m.cursor = min(m.cursor+m.pageStep(), n-1)
+		}
+	case "pgup", "ctrl+b":
+		m.cursor = max(m.cursor-m.pageStep(), 0)
+	case "ctrl+d":
+		if n := len(m.rows); n > 0 {
+			m.cursor = min(m.cursor+m.pageStep()/2, n-1)
+		}
+	case "ctrl+u":
+		m.cursor = max(m.cursor-m.pageStep()/2, 0)
 	case "g", "home":
 		m.cursor = 0
 	case "G", "end":
@@ -1236,7 +1253,7 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · ←→ collapse/expand · ⏎ attach · n new · t terminal · dd delete · R/S sync cmux · UU upgrade claude · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · R/S sync · UU upgrade · / filter · r refresh · q quit"
 	default:
 		// any other key cancels a pending dd/UU so the next press starts fresh
 		m.clearPending()
@@ -2410,44 +2427,62 @@ func (m *tuiModel) View() string {
 	}
 }
 
+// browseView is the main screen: a title bar, a scrollable tree panel on the
+// left, an ACTIVITY (task queue) + KEYS sidebar on the right, and a full-width
+// status line at the bottom. On very small / not-yet-sized terminals it falls
+// back to a simple linear render.
 func (m *tuiModel) browseView() string {
+	if m.width < 50 || m.height < 12 {
+		return m.linearView()
+	}
+
+	title := m.renderTitleBar()
+	status := m.bottomStatus()
+	statusH := lipgloss.Height(status)
+
+	bodyH := m.height - lipgloss.Height(title) - statusH
+	if bodyH < 3 {
+		bodyH = 3
+	}
+
+	// Sidebar appears only when the terminal is wide enough to spare it;
+	// otherwise the tree gets the full width.
+	sidebarW := 0
+	switch {
+	case m.width >= 100:
+		sidebarW = 32
+	case m.width >= 78:
+		sidebarW = 26
+	}
+	leftW := m.width
+	if sidebarW > 0 {
+		leftW = m.width - sidebarW
+	}
+
+	leftBlock := lipgloss.NewStyle().Width(leftW).Height(bodyH).MaxHeight(bodyH).
+		Render(m.renderMainPanel(leftW, bodyH))
+
+	body := leftBlock
+	if sidebarW > 0 {
+		sideBlock := lipgloss.NewStyle().Width(sidebarW).Height(bodyH).MaxHeight(bodyH).
+			Render(m.renderSidebar(sidebarW, bodyH))
+		body = lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, sideBlock)
+	}
+
+	return title + "\n" + body + "\n" + status
+}
+
+// linearView is the small-terminal / pre-size fallback: title, the tree, then
+// the task queue + legend below (the pre-redesign layout).
+func (m *tuiModel) linearView() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("cctl"))
-	b.WriteString(dimStyle.Render("  — claude sessions"))
-	// Surface the detected spawn provider in the header so the user can
-	// verify cctl is launching new sessions where they expect (esp.
-	// important because cmux inherits TERM_PROGRAM=ghostty from
-	// libghostty, so what cctl picks isn't always obvious).
-	pref := ""
-	if m.cfg != nil {
-		pref = m.cfg.Defaults.Spawn
+	b.WriteString(m.renderTitleBar() + "\n\n")
+	avail := m.width
+	if avail <= 0 {
+		avail = 100
 	}
-	sp, reason := detectSpawner(pref)
-	b.WriteString(dimStyle.Render(fmt.Sprintf("   [spawn=%s · %s]", sp.Name(), reason)))
-	b.WriteString("\n\n")
-
-	// Filter bar (k9s-style): always visible above the table when active.
-	if m.mode == modeFilter || m.filter != "" {
-		prompt := dimStyle.Render("/")
-		// Use a contrasting style while the user is editing the filter.
-		fstyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
-		if m.mode != modeFilter {
-			fstyle = dimStyle
-		}
-		b.WriteString(prompt + fstyle.Render(m.filter))
-		if m.mode == modeFilter {
-			b.WriteString(cursorStyle.Render("▎"))
-		}
-		b.WriteString(dimStyle.Render(fmt.Sprintf("   (%d rows)", len(m.rows))))
-		b.WriteString("\n\n")
-	}
-
-	// Measure column widths from actual cell contents.
-	nameW, infoW, ageW := m.measureColumns()
-
-	b.WriteString(m.renderHeader(nameW, infoW, ageW))
-	b.WriteString("\n")
-
+	nameW, infoW, ageW := m.measureColumns(avail)
+	b.WriteString(m.renderHeader(nameW, infoW, ageW) + "\n")
 	if len(m.rows) == 0 {
 		hint := "(no servers configured — run `cctl init`)"
 		if m.filter != "" {
@@ -2456,18 +2491,187 @@ func (m *tuiModel) browseView() string {
 		b.WriteString(dimStyle.Render(hint) + "\n")
 	}
 	for i, r := range m.rows {
-		b.WriteString(m.renderRow(r, i == m.cursor, nameW, infoW, ageW))
-		b.WriteString("\n")
+		b.WriteString(m.renderRow(r, i == m.cursor, nameW, infoW, ageW) + "\n")
 	}
-	b.WriteString("\n")
-	b.WriteString(m.footer())
+	b.WriteString("\n" + m.footer())
 	return b.String()
+}
+
+// renderTitleBar is the top line: app name + version on the left, the detected
+// spawn provider on the right (cmux inherits TERM_PROGRAM=ghostty, so what
+// cctl picks isn't always obvious — surfacing it helps).
+func (m *tuiModel) renderTitleBar() string {
+	pref := ""
+	if m.cfg != nil {
+		pref = m.cfg.Defaults.Spawn
+	}
+	sp, _ := detectSpawner(pref)
+	left := titleStyle.Render("cctl") + dimStyle.Render(" "+Version+" — claude sessions")
+	right := dimStyle.Render("spawn=" + sp.Name())
+	gap := m.width - lipgloss.Width(left) - lipgloss.Width(right)
+	if gap < 1 || m.width <= 0 {
+		gap = 1
+	}
+	return left + strings.Repeat(" ", gap) + right
+}
+
+// renderMainPanel draws the column header plus the visible window of tree
+// rows, scrolled so the cursor stays on screen.
+func (m *tuiModel) renderMainPanel(w, h int) string {
+	nameW, infoW, ageW := m.measureColumns(w)
+	var b strings.Builder
+	b.WriteString(m.renderHeader(nameW, infoW, ageW))
+
+	visible := h - 1 // column header takes one line
+	if visible < 1 {
+		visible = 1
+	}
+	m.ensureCursorVisible(visible)
+
+	if len(m.rows) == 0 {
+		hint := "(no servers configured — run `cctl init`)"
+		if m.filter != "" {
+			hint = "(no rows match filter — esc to clear)"
+		}
+		b.WriteString("\n" + dimStyle.Render(hint))
+		return b.String()
+	}
+	end := m.scrollOffset + visible
+	if end > len(m.rows) {
+		end = len(m.rows)
+	}
+	for i := m.scrollOffset; i < end; i++ {
+		b.WriteString("\n" + m.renderRow(m.rows[i], i == m.cursor, nameW, infoW, ageW))
+	}
+	return b.String()
+}
+
+// pageStep is the cursor jump for PageUp/PageDown (roughly one screen of
+// rows); ctrl+d/ctrl+u use half of it. Derived from the terminal height
+// minus the title/header/status chrome.
+func (m *tuiModel) pageStep() int {
+	s := m.height - 6
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
+// ensureCursorVisible clamps scrollOffset so the cursor row sits within the
+// visible window (and the window never runs past the end of the list).
+func (m *tuiModel) ensureCursorVisible(visible int) {
+	if m.cursor < 0 {
+		m.cursor = 0
+	}
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	}
+	if m.cursor >= m.scrollOffset+visible {
+		m.scrollOffset = m.cursor - visible + 1
+	}
+	maxOff := len(m.rows) - visible
+	if maxOff < 0 {
+		maxOff = 0
+	}
+	if m.scrollOffset > maxOff {
+		m.scrollOffset = maxOff
+	}
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+}
+
+// renderSidebar draws the right column: an ACTIVITY section (the background
+// task queue) over a KEYS section (compact shortcuts). Each line is prefixed
+// with a faint vertical rule that doubles as the panel separator, and
+// truncated to the column so nothing wraps.
+func (m *tuiModel) renderSidebar(w, h int) string {
+	body := w - 2 // "│ " prefix
+	if body < 1 {
+		body = 1
+	}
+	var lines []string
+	add := func(s string) {
+		lines = append(lines, dimStyle.Render("│ ")+lipgloss.NewStyle().MaxWidth(body).Render(s))
+	}
+	add(headerStyle.Render("ACTIVITY"))
+	tasks := m.renderTaskLines()
+	if len(tasks) == 0 {
+		add(dimStyle.Render("idle"))
+	} else {
+		for _, t := range tasks {
+			add(t)
+		}
+	}
+	add("")
+	add(headerStyle.Render("KEYS"))
+	for _, k := range sidebarKeys {
+		add(dimStyle.Render(k))
+	}
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// bottomStatus is the full-width line under the body: armed-action prompts and
+// errors (loud), the filter editor, a transient status message, or the idle
+// hint with the scroll position.
+func (m *tuiModel) bottomStatus() string {
+	switch {
+	case m.pendingD:
+		return errorStyle.Bold(true).Render("press d again to delete — any other key cancels")
+	case m.pendingU:
+		server, names := m.upgradeTarget()
+		return errorStyle.Bold(true).Render(fmt.Sprintf(
+			"press U again to upgrade claude on %s and restart %d claude session(s) — any other key cancels",
+			server, len(names)))
+	case m.statusErr != "":
+		return errorStyle.Render("error: " + m.statusErr)
+	case m.mode == modeFilter || m.filter != "":
+		fstyle := lipgloss.NewStyle().Foreground(lipgloss.Color("11"))
+		if m.mode != modeFilter {
+			fstyle = dimStyle
+		}
+		line := dimStyle.Render("/") + fstyle.Render(m.filter)
+		if m.mode == modeFilter {
+			line += cursorStyle.Render("▎")
+		}
+		return line + dimStyle.Render(fmt.Sprintf("   (%d rows)", len(m.rows)))
+	case m.statusMsg != "":
+		return dimStyle.Render(m.statusMsg)
+	default:
+		pos := ""
+		if len(m.rows) > 0 {
+			pos = fmt.Sprintf("row %d/%d · ", m.cursor+1, len(m.rows))
+		}
+		return dimStyle.Render(pos + "? help · q quit")
+	}
+}
+
+// sidebarKeys is the compact shortcut legend for the right panel (narrower
+// than legendLines, which the linear fallback still uses).
+var sidebarKeys = []string{
+	"↑↓  move",
+	"PgUp/Dn ⌃d/⌃u scroll",
+	"g/G top / bottom",
+	"←→  fold / expand",
+	"⏎   open / attach",
+	"n   new session",
+	"t   terminal",
+	"dd  delete",
+	"R/S sync cmux",
+	"UU  upgrade claude",
+	"/   filter",
+	"r   refresh",
+	"?   help",
+	"q   quit",
 }
 
 // measureColumns returns the natural width of each column based on actual row
 // contents (and the header labels as minimums). If the sum overflows the
 // terminal, the NAME column absorbs the squeeze.
-func (m *tuiModel) measureColumns() (nameW, infoW, ageW int) {
+func (m *tuiModel) measureColumns(avail int) (nameW, infoW, ageW int) {
 	nameW = lipgloss.Width(hdrName)
 	infoW = lipgloss.Width(hdrInfo)
 	ageW = lipgloss.Width(hdrAge)
@@ -2484,10 +2688,10 @@ func (m *tuiModel) measureColumns() (nameW, infoW, ageW int) {
 		}
 	}
 	// 2 leading mark + 2 single-space gaps between columns = 4 cells.
-	if m.width > 0 {
+	if avail > 0 {
 		total := nameW + infoW + ageW + 4
-		if total > m.width {
-			shrink := total - m.width
+		if total > avail {
+			shrink := total - avail
 			if nameW-shrink >= lipgloss.Width(hdrName) {
 				nameW -= shrink
 			} else {
@@ -2836,7 +3040,7 @@ func (m *tuiModel) renderTaskLines() []string {
 // One shortcut per line so the footer doesn't depend on terminal width.
 // Aligned with a soft tab so the keys line up visually.
 var legendLines = []string{
-	"↑↓        move",
+	"↑↓        move   ·  PgUp/PgDn, ⌃d/⌃u scroll  ·  g/G top/bottom",
 	"←→        collapse / expand",
 	"⏎         open in new cmux tab (r/w → form, s → attach)",
 	"n         new session on selected row",

@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.2.0] - 2026-06-21
+- feat(tui): scrollable k9s-style layout with panels
+
 ## [0.1.0] - 2026-06-21
 
 Baseline release — summarizes everything prior to automated versioning.
