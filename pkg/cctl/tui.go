@@ -792,6 +792,9 @@ func (m *tuiModel) Init() tea.Cmd {
 		}
 	}
 	m.startupSyncTaskID = m.startPendingTask("startup:sync", "sync cmux ↔ cctl")
+	// Pin + redden the workspace cctl is running in, so its tab stands out and
+	// stays put. Fire-and-forget; no-op outside cmux.
+	cmds = append(cmds, func() tea.Msg { markSelfCmuxWorkspace(); return nil })
 	return tea.Batch(cmds...)
 }
 
@@ -2527,56 +2530,48 @@ func (m *tuiModel) View() string {
 // status line at the bottom. On very small / not-yet-sized terminals it falls
 // back to a simple linear render.
 func (m *tuiModel) browseView() string {
-	if m.width < 50 || m.height < 12 {
+	if m.width < 40 || m.height < 10 {
 		return m.linearView()
 	}
 
 	title := m.renderTitleBar()
 	status := m.bottomStatus()
+	// Key hints live at the bottom now (not a right sidebar) so the tree —
+	// the NAME column especially — gets the full terminal width.
+	hints := m.renderKeyHints(m.width)
 
-	// The activity queue sits in its own strip just above the status line —
-	// the "things the system is doing", checked off one by one. Present only
-	// while there's work (startup connects + sync, deletes, restores…).
+	// The activity queue sits in its own strip just above the hints — the
+	// "things the system is doing", checked off one by one. Present only while
+	// there's work (startup connects + sync, deletes, restores…).
 	queue := m.renderQueueStrip(m.width)
 	queueH := 0
 	if queue != "" {
 		queueH = lipgloss.Height(queue) + 1 // +1 for the blank spacer line
 	}
 
-	bodyH := m.height - lipgloss.Height(title) - lipgloss.Height(status) - queueH
+	bodyH := m.height - lipgloss.Height(title) - lipgloss.Height(hints) - lipgloss.Height(status) - queueH
 	if bodyH < 3 {
 		bodyH = 3
 	}
 
-	// Sidebar appears only when the terminal is wide enough to spare it;
-	// otherwise the tree gets the full width.
-	sidebarW := 0
-	switch {
-	case m.width >= 100:
-		sidebarW = 32
-	case m.width >= 78:
-		sidebarW = 26
-	}
-	leftW := m.width
-	if sidebarW > 0 {
-		leftW = m.width - sidebarW
-	}
-
-	leftBlock := lipgloss.NewStyle().Width(leftW).Height(bodyH).MaxHeight(bodyH).
-		Render(m.renderMainPanel(leftW, bodyH))
-
-	body := leftBlock
-	if sidebarW > 0 {
-		sideBlock := lipgloss.NewStyle().Width(sidebarW).Height(bodyH).MaxHeight(bodyH).
-			Render(m.renderSidebar(sidebarW, bodyH))
-		body = lipgloss.JoinHorizontal(lipgloss.Top, leftBlock, sideBlock)
-	}
+	body := lipgloss.NewStyle().Width(m.width).Height(bodyH).MaxHeight(bodyH).
+		Render(m.renderMainPanel(m.width, bodyH))
 
 	out := title + "\n" + body
 	if queue != "" {
 		out += "\n\n" + queue
 	}
-	return out + "\n" + status
+	return out + "\n" + hints + "\n" + status
+}
+
+// renderKeyHints is the compact, dim shortcut legend shown along the bottom.
+// It's one " · "-joined string wrapped to the terminal width — horizontal, so
+// it costs one or two lines instead of a full-height right column.
+func (m *tuiModel) renderKeyHints(w int) string {
+	if w < 1 {
+		w = 1
+	}
+	return dimStyle.Width(w).Render(strings.Join(keyHints, "  ·  "))
 }
 
 // renderQueueStrip draws the activity queue as a bordered-top strip: a faint
@@ -2708,29 +2703,6 @@ func (m *tuiModel) ensureCursorVisible(visible int) {
 	}
 }
 
-// renderSidebar draws the right column: a KEYS section (compact shortcuts).
-// Each line is prefixed with a faint vertical rule that doubles as the panel
-// separator, and truncated to the column so nothing wraps. The activity queue
-// lives in its own strip at the bottom (renderQueueStrip), not here.
-func (m *tuiModel) renderSidebar(w, h int) string {
-	body := w - 2 // "│ " prefix
-	if body < 1 {
-		body = 1
-	}
-	var lines []string
-	add := func(s string) {
-		lines = append(lines, dimStyle.Render("│ ")+lipgloss.NewStyle().MaxWidth(body).Render(s))
-	}
-	add(headerStyle.Render("KEYS"))
-	for _, k := range sidebarKeys {
-		add(dimStyle.Render(k))
-	}
-	if len(lines) > h {
-		lines = lines[:h]
-	}
-	return strings.Join(lines, "\n")
-}
-
 // bottomStatus is the full-width line under the body: armed-action prompts and
 // errors (loud), the filter editor, a transient status message, or the idle
 // hint with the scroll position.
@@ -2758,37 +2730,37 @@ func (m *tuiModel) bottomStatus() string {
 	case m.statusMsg != "":
 		return dimStyle.Render(m.statusMsg)
 	default:
-		pos := ""
+		// Just the scroll position — the key hints line above already covers
+		// help/quit, so don't repeat them here.
 		if len(m.rows) > 0 {
-			pos = fmt.Sprintf("row %d/%d · ", m.cursor+1, len(m.rows))
+			return dimStyle.Render(fmt.Sprintf("row %d/%d", m.cursor+1, len(m.rows)))
 		}
-		return dimStyle.Render(pos + "? help · q quit")
+		return ""
 	}
 }
 
-// sidebarKeys is the compact shortcut legend for the right panel (narrower
-// than legendLines, which the linear fallback still uses).
-var sidebarKeys = []string{
-	"↑↓  move",
-	"PgUp/Dn ⌃d/⌃u scroll",
-	"g/G top / bottom",
-	"←→  fold / expand",
-	"⏎   open / attach",
-	"n   new session",
-	"t   terminal",
-	"dd  delete",
-	"S   sync (close dead)",
-	"R   restore sessions",
-	"UU  upgrade claude",
-	"/   filter",
-	"r   refresh",
-	"?   help",
-	"q   quit",
+// keyHints is the compact one-liner legend along the bottom (renderKeyHints
+// joins + wraps it). The full reference is `?` (legendLines).
+var keyHints = []string{
+	"↑↓ move",
+	"←→ fold",
+	"⏎ open",
+	"n new",
+	"t term",
+	"dd delete",
+	"S sync",
+	"R restore",
+	"UU upgrade",
+	"/ filter",
+	"r refresh",
+	"? help",
+	"q quit",
 }
 
 // measureColumns returns the natural width of each column based on actual row
-// contents (and the header labels as minimums). If the sum overflows the
-// terminal, the NAME column absorbs the squeeze.
+// contents (and the header labels as minimums). NAME is the important column
+// (the session tree), so when the row overflows the terminal the squeeze falls
+// on DETAIL first, then AGE, and only touches NAME as a last resort.
 func (m *tuiModel) measureColumns(avail int) (nameW, infoW, ageW int) {
 	nameW = lipgloss.Width(hdrName)
 	infoW = lipgloss.Width(hdrInfo)
@@ -2806,15 +2778,33 @@ func (m *tuiModel) measureColumns(avail int) (nameW, infoW, ageW int) {
 		}
 	}
 	// 2 leading mark + 2 single-space gaps between columns = 4 cells.
-	if avail > 0 {
-		total := nameW + infoW + ageW + 4
-		if total > avail {
-			shrink := total - avail
-			if nameW-shrink >= lipgloss.Width(hdrName) {
-				nameW -= shrink
-			} else {
-				nameW = lipgloss.Width(hdrName)
-			}
+	if avail <= 0 {
+		return nameW, infoW, ageW
+	}
+	over := nameW + infoW + ageW + 4 - avail
+	if over <= 0 {
+		return nameW, infoW, ageW
+	}
+	// Shrink DETAIL first, down to its header label.
+	if floor := lipgloss.Width(hdrInfo); infoW > floor {
+		cut := min(over, infoW-floor)
+		infoW -= cut
+		over -= cut
+	}
+	// Then AGE.
+	if over > 0 {
+		if floor := lipgloss.Width(hdrAge); ageW > floor {
+			cut := min(over, ageW-floor)
+			ageW -= cut
+			over -= cut
+		}
+	}
+	// Only then NAME (so it stays full whenever the line can possibly fit it).
+	if over > 0 {
+		if nameW-over >= lipgloss.Width(hdrName) {
+			nameW -= over
+		} else {
+			nameW = lipgloss.Width(hdrName)
 		}
 	}
 	return nameW, infoW, ageW

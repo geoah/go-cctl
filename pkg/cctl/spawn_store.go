@@ -362,5 +362,41 @@ func ensureCctlControlWorkspace(cli string) error {
 		return fmt.Errorf("create cctl workspace: %w: %s", err, strings.TrimSpace(string(out)))
 	}
 	log().Info("cctl-control-workspace-created", "script", script)
+	if id, ok := findCmuxWorkspaceByName(cli, "cctl"); ok {
+		markCctlWorkspace(cli, id)
+	}
 	return nil
+}
+
+// markCctlWorkspace pins a cmux workspace and colors it red, so the cctl
+// control pane stands out and stays put in the sidebar. wsID may be "" to
+// target the current workspace ($CMUX_WORKSPACE_ID). Best-effort.
+func markCctlWorkspace(cli, wsID string) {
+	if cli == "" {
+		return
+	}
+	for _, action := range [][]string{
+		{"workspace-action", "--action", "pin"},
+		{"workspace-action", "--action", "set-color", "--color", "Red"},
+	} {
+		args := action
+		if wsID != "" {
+			args = append([]string{action[0], "--workspace", wsID}, action[1:]...)
+		}
+		if out, err := cmuxCmd(cli, args...).CombinedOutput(); err != nil {
+			log().Debug("cmux-mark-workspace-fail", "action", action, "ws", wsID,
+				"err", err.Error(), "out", strings.TrimSpace(string(out)))
+		}
+	}
+	log().Debug("cmux-mark-workspace", "ws", wsID)
+}
+
+// markSelfCmuxWorkspace pins + reddens the workspace the cctl TUI is running
+// in (read from $CMUX_WORKSPACE_ID). No-op outside cmux.
+func markSelfCmuxWorkspace() {
+	wsID := os.Getenv("CMUX_WORKSPACE_ID")
+	if wsID == "" {
+		return
+	}
+	markCctlWorkspace(cmuxCLIPath(), wsID)
 }

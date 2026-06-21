@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.5.0] - 2026-06-21
+- feat(tui): full-width tree + bottom key hints; pin & redden cctl's workspace
+
 ## [0.4.0] - 2026-06-21
 - feat(sync): opt-in sync_close_unmatched to prune unowned cctl-shaped tabs
 
