@@ -37,6 +37,17 @@ type Spawner interface {
 
 // SpawnSpec describes one open-this-session request to a Spawner.
 type SpawnSpec struct {
+	// Server, Repo, Worktree, Session identify the cctl session this spawn
+	// represents. They drive the durable wrapper-script filename
+	// (~/.cctl/spawn/<server>__<repo>__<worktree>__<session>.sh) and the
+	// restore manifest entry. All four set => the spawn is tracked and
+	// reboot-durable; any empty => it falls back to a disposable script and
+	// isn't recorded. Repo/Worktree/Session are the REAL names (tmuxName
+	// sanitizes them when building the tmux target).
+	Server   string
+	Repo     string
+	Worktree string
+	Session  string
 	// Script is the wrapper-script path; the only thing that must run.
 	Script string
 	// Cwd is the working-directory hint for a newly created workspace
@@ -151,7 +162,7 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 				// fall through to add-tab: running the wrapper is still
 				// correct, just less elegant than focusing.
 			}
-			if err := addCmuxTab(cli, id, tabCommand, spec.TabTitle); err == nil {
+			if err := addCmuxTab(cli, id, spec, tabCommand); err == nil {
 				log().Info("cmux-add-tab", "id", id, "ws", spec.WsTitle, "tab", spec.TabTitle)
 				return nil
 			} else {
@@ -232,6 +243,12 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 		if err != nil {
 			log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
+		// Pin the freshly created tab's resume binding to the durable
+		// wrapper (new local workspaces only; bindCmuxResume no-ops for
+		// remote/identity-less specs).
+		if sid, ok := findCmuxSurfaceByTitle(cli, id, spec.TabTitle); ok {
+			bindCmuxResume(cli, id, sid, spec)
+		}
 	}
 	ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
 }
@@ -308,11 +325,31 @@ func parseCmuxGroupList(raw, name string) (string, bool) {
 	return "", false
 }
 
-// addCmuxTab opens a new terminal tab (surface) in the given workspace,
-// runs the wrapper script in it, and names it after the session. Returns
-// an error if the surface can't be created or its id can't be determined —
-// the caller falls back to a separate workspace in that case.
-func addCmuxTab(cli, wsID, script, tabTitle string) error {
+// addCmuxTab makes the session's tab exist in an existing workspace and run
+// `tabCommand`. If a same-titled tab is already there — the common case on
+// restore, where cmux re-created a now-dead tab — it heals that tab in place
+// (respawn + rebind) instead of stacking a duplicate; otherwise it opens a
+// fresh surface. Either way it pins the surface's cmux resume binding to the
+// durable wrapper so a reboot resurrects+resumes the session. Returns an
+// error if the surface can't be created or its id can't be determined — the
+// caller falls back to a separate workspace in that case.
+func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
+	// Reuse an existing same-titled tab when present: this is what makes
+	// restore idempotent (no duplicate tabs) and heals the stale-command
+	// tabs that motivated all this.
+	if spec.TabTitle != "" {
+		if sid, ok := findCmuxSurfaceByTitle(cli, wsID, spec.TabTitle); ok {
+			if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
+				return fmt.Errorf("respawn-pane (heal existing tab): %w: %s", err, strings.TrimSpace(string(out)))
+			}
+			bindCmuxResume(cli, wsID, sid, spec)
+			if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+				log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			}
+			log().Info("cmux-heal-tab", "ws", wsID, "surface", sid, "tab", spec.TabTitle)
+			return nil
+		}
+	}
 	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", "true").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("new-surface: %w: %s", err, strings.TrimSpace(string(out)))
@@ -332,20 +369,33 @@ func addCmuxTab(cli, wsID, script, tabTitle string) error {
 	// The fresh surface runs the user's default shell; respawn-pane sends
 	// it the wrapper-script path to execute. When the wrapper exits the
 	// shell survives, so the tab stays usable.
-	if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", script).CombinedOutput(); err != nil {
+	if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
 		return fmt.Errorf("respawn-pane: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	if tabTitle != "" {
-		if out, err := exec.Command(cli, "rename-tab", "--workspace", wsID, "--tab", sid, tabTitle).CombinedOutput(); err != nil {
-			log().Debug("cmux-rename-tab-fail", "surface", sid, "tab", tabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	if spec.TabTitle != "" {
+		if out, err := exec.Command(cli, "rename-tab", "--workspace", wsID, "--tab", sid, spec.TabTitle).CombinedOutput(); err != nil {
+			log().Debug("cmux-rename-tab-fail", "surface", sid, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
+	bindCmuxResume(cli, wsID, sid, spec)
 	// Land the user on the workspace; the new surface was created with
 	// --focus true so the right tab is already selected within it.
 	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
 		log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// bindCmuxResume pins a surface's cmux resume binding to cctl's durable
+// wrapper so a reboot replays it (tmux new-session -A → claude --continue)
+// rather than a vanished $TMPDIR path or a bare `tmux attach`. Skipped for
+// remote cmux-ssh workspaces (cmux manages their restore over ssh) and when
+// there's no durable script / identity to point at.
+func bindCmuxResume(cli, wsID, surfaceID string, spec SpawnSpec) {
+	if spec.Remote != nil || spec.Script == "" || !spec.hasIdentity() {
+		return
+	}
+	setCmuxResumeBinding(cli, wsID, surfaceID, spec.Cwd, spec.TabTitle, spec.Script)
 }
 
 // cmuxUUIDRe / cmuxSurfaceRefRe match the two id shapes the cmux CLI

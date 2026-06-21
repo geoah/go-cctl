@@ -58,7 +58,7 @@ func TestParseWorktreePorcelain_Empty(t *testing.T) {
 func TestParseAllWorktrees_GroupsBySentinel(t *testing.T) {
 	repos := map[string]Repo{
 		"rxtx.dev": {Path: "/Users/me/src/github.com/me/rxtx.dev"},
-		"my-app":  {Path: "/Users/me/src/github.com/my-org/my-app"},
+		"my-app":   {Path: "/Users/me/src/github.com/my-org/my-app"},
 	}
 	raw := strings.Join([]string{
 		"@@CCTL_REPO=rxtx.dev",
@@ -1181,7 +1181,7 @@ func TestTmuxName_SanitizesLikeTmux(t *testing.T) {
 func TestNormalizeSessionNames(t *testing.T) {
 	st := &serverState{
 		repos: map[string]Repo{
-			"rxtx.dev": {Path: "/r/rxtx.dev"},
+			"rxtx.dev":  {Path: "/r/rxtx.dev"},
 			"exact_one": {Path: "/r/exact_one"},
 		},
 		worktrees: map[string][]Worktree{
@@ -1300,51 +1300,29 @@ func TestRestoreCursor_FollowsRowIdentity(t *testing.T) {
 	}
 }
 
-// ---- restore (R) and upgrade (UU) -------------------------------------------
+// ---- sync (R/S) and upgrade (UU) --------------------------------------------
 
-// TestRestoreAll_PicksOnlyDetachedSessionsOnConnectedServers pins R's
-// selection rule: attached sessions already have a live client in some
-// tab (restoring would mirror them), and servers that aren't connected
-// have stale lists.
-func TestRestoreAll_PicksOnlyDetachedSessionsOnConnectedServers(t *testing.T) {
+// TestSyncCmux_RegistersRunningTask pins the R/S entrypoint: it always kicks
+// off the reconcile as a tracked background task (the actual adopt/heal/
+// restore/close work runs off-thread in syncCmuxState, which talks to live
+// cmux+tmux and is covered by the pure-helper tests). The old detached-only
+// selection rule moved into syncCmuxState.
+func TestSyncCmux_RegistersRunningTask(t *testing.T) {
 	m := &tuiModel{
-		cfg:         &Config{Servers: map[string]Server{"up": {Local: true}, "down": {}}},
-		serverNames: []string{"down", "up"},
-		state: map[string]*serverState{
-			"up": {conn: connConnected, sessionsLoaded: true, sessions: []SessionInfo{
-				{Repo: "r", Worktree: "wt", Session: "a", Name: "cctl/r/wt/a", Attached: false},
-				{Repo: "r", Worktree: "wt", Session: "b", Name: "cctl/r/wt/b", Attached: true},
-			}},
-			"down": {conn: connDisconnected, sessionsLoaded: true, sessions: []SessionInfo{
-				{Repo: "r", Worktree: "wt", Session: "c", Name: "cctl/r/wt/c", Attached: false},
-			}},
-		},
+		cfg:         &Config{Servers: map[string]Server{"up": {Local: true}}},
+		serverNames: []string{"up"},
+		state:       map[string]*serverState{"up": {conn: connConnected, sessionsLoaded: true}},
 	}
-	_, cmd := m.restoreAll()
+	_, cmd := m.syncCmux()
 	if cmd == nil {
-		t.Fatalf("restoreAll with a detached session should produce a cmd")
+		t.Fatalf("syncCmux should produce a cmd")
 	}
 	last := lastTask(m)
 	if last == nil || last.done {
-		t.Fatalf("restoreAll should register a running task, got %+v", last)
+		t.Fatalf("syncCmux should register a running task, got %+v", last)
 	}
-	if !strings.Contains(last.label, "1 session tab") {
-		t.Errorf("only session 'a' qualifies (b attached, c's server down); label = %q", last.label)
-	}
-
-	// All-attached: nothing to do, instant success notice.
-	m2 := &tuiModel{
-		cfg:         m.cfg,
-		serverNames: []string{"up"},
-		state: map[string]*serverState{
-			"up": {conn: connConnected, sessionsLoaded: true, sessions: []SessionInfo{
-				{Repo: "r", Worktree: "wt", Session: "b", Attached: true},
-			}},
-		},
-	}
-	_, _ = m2.restoreAll()
-	if last := lastTask(m2); last == nil || !last.done || last.failed {
-		t.Errorf("restoreAll with nothing to do should note success, got %+v", last)
+	if !strings.Contains(last.label, "sync") {
+		t.Errorf("task label should mention sync; got %q", last.label)
 	}
 }
 

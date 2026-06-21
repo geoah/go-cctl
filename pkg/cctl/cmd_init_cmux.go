@@ -51,9 +51,10 @@ var cmuxConfigDefaults = map[string]map[string]any{
 
 func newInitCmuxCmd() *cobra.Command {
 	var (
-		force      bool
-		skipHooks  bool
-		skipReload bool
+		force       bool
+		skipHooks   bool
+		skipReload  bool
+		skipControl bool
 	)
 	cmd := &cobra.Command{
 		Use:   "cmux",
@@ -82,16 +83,17 @@ belong in ~/.config/ghostty/config — run ` + "`cctl init ghostty`" + ` for
 those. For tmux on a remote server, run ` + "`cctl init tmux --server <name>`" + `.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInitCmux(force, skipHooks, skipReload)
+			return runInitCmux(force, skipHooks, skipReload, skipControl)
 		},
 	}
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite cmux.json keys even if already present")
 	cmd.Flags().BoolVar(&skipHooks, "no-hooks", false, "don't run `cmux hooks setup --agent claude`")
 	cmd.Flags().BoolVar(&skipReload, "no-reload", false, "don't call `cmux reload-config` afterwards")
+	cmd.Flags().BoolVar(&skipControl, "no-control", false, "don't set up the persistent cctl control workspace (keeps the TUI alive across cmux restarts/reboots)")
 	return cmd
 }
 
-func runInitCmux(force, skipHooks, skipReload bool) error {
+func runInitCmux(force, skipHooks, skipReload, skipControl bool) error {
 	cli := cmuxCLIPath()
 	if cli == "" {
 		return fmt.Errorf("cmux CLI not found — install cmux from https://cmux.com or via `brew tap manaflow-ai/cmux && brew install --cask cmux`")
@@ -202,6 +204,18 @@ func runInitCmux(force, skipHooks, skipReload bool) error {
 			// auth). If not, no big deal — settings will apply at next launch.
 			fmt.Fprintf(os.Stderr, "  reload skipped (%v) — restart cmux or run `cmux reload-config` from inside cmux to apply.\n", err)
 			_ = out
+		}
+	}
+
+	if !skipControl {
+		// Make the cctl TUI a durable cmux workspace so it survives cmux
+		// restarts and relaunches (and reconciles) after a reboot. Requires
+		// running from inside cmux for socket auth.
+		fmt.Fprintln(os.Stderr, "cmux: setting up the persistent cctl control workspace...")
+		if err := ensureCctlControlWorkspace(cli); err != nil {
+			fmt.Fprintf(os.Stderr, "  control workspace skipped (%v) — run `cctl init cmux` from inside cmux to enable it.\n", err)
+		} else {
+			fmt.Fprintln(os.Stderr, "  cctl now reopens automatically with cmux (and syncs your tabs on launch).")
 		}
 	}
 
