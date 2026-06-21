@@ -29,7 +29,7 @@ type wsEntry struct {
 	// TmuxName is the canonical (sanitized) tmux session name, cached so
 	// reconcile can match against `tmux list-sessions` without re-deriving.
 	TmuxName string `json:"tmux_name"`
-	WsTitle  string `json:"ws_title"`  // cmux workspace title: "repo/worktree"
+	WsTitle  string `json:"ws_title"`  // cmux workspace name: "repo/worktree/session"
 	TabTitle string `json:"tab_title"` // cmux tab title: the session name
 	Group    string `json:"group"`     // sidebar group
 	GroupCwd string `json:"group_cwd"`

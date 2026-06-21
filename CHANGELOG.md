@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.2.2] - 2026-06-21
+- fix(cmux): one workspace per session (name includes session); de-dup
+
 ## [0.2.1] - 2026-06-21
 - fix(sync): stop cmux restore-prompt spam; actually close dead sessions
 

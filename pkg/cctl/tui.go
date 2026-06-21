@@ -1740,7 +1740,7 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 			useMosh:    r.UseMosh,
 			cmdStr:     terminalCmd(tmuxName(r.RepoName, worktree, name), cwd),
 			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    fmt.Sprintf("%s/%s", repoName, worktree),
+			wsTitle:    cmuxWsTitle(repoName, worktree, name),
 			tabTitle:   name,
 			serverName: serverName,
 			repo:       repoName,
@@ -1904,7 +1904,7 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 			useMosh:    r.UseMosh,
 			cmdStr:     attachOrRespawn(r, sess.Name, cwd),
 			cwd:        workspaceCwd(r, sess.Worktree),
-			wsTitle:    fmt.Sprintf("%s/%s", repoName, sess.Worktree),
+			wsTitle:    cmuxWsTitle(repoName, sess.Worktree, sess.Session),
 			tabTitle:   sess.Session,
 			serverName: serverName,
 			repo:       repoName,
@@ -1948,7 +1948,7 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 			useMosh:    r.UseMosh,
 			cmdStr:     cmdStr,
 			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    fmt.Sprintf("%s/%s", repoName, worktree),
+			wsTitle:    cmuxWsTitle(repoName, worktree, sessionName),
 			tabTitle:   sessionName,
 			serverName: serverName,
 			repo:       repoName,
@@ -2045,10 +2045,10 @@ func (m *tuiModel) killCmd(serverName, repoName, tmuxFullName, worktreeName, ses
 			return actionDoneMsg{err: fmt.Errorf("kill %s: %w", tmuxFullName, err), taskID: taskID}
 		}
 		// dd removes the session everywhere: forget it in the restore
-		// manifest (so sync won't bring it back) and close its cmux tab so
-		// the window matches cctl. Best-effort — a missing tab is fine.
+		// manifest (so sync won't bring it back) and close its cmux workspace
+		// so the window matches cctl. Best-effort — a missing one is fine.
 		manifestRemove(serverName, repoName, worktreeName, session)
-		closeCmuxTabByTitle(fmt.Sprintf("%s/%s", repoName, worktreeName), session)
+		closeCmuxWorkspaceByTitle(cmuxWsTitle(repoName, worktreeName, session))
 		// "main" worktree is the original checkout — never delete it.
 		if removeWorktree && worktreeName != "main" {
 			wt := worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
@@ -2122,12 +2122,12 @@ func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath st
 				log().Warn("tui-kill-worktree-session-fail", "name", name, "err", err.Error())
 			}
 		}
-		// The worktree's sessions are dead now, so its cmux workspace is a
-		// stale shell: forget the worktree in the manifest and close the
-		// whole workspace so cmux matches cctl (done before the git removal
-		// so it happens even if that fails).
+		// The worktree's sessions are dead now, so their per-session cmux
+		// workspaces are stale shells: forget the worktree in the manifest and
+		// close every "repo/worktree/*" workspace so cmux matches cctl (done
+		// before the git removal so it happens even if that fails).
 		manifestRemoveWorktree(serverName, repoName, worktreeName)
-		closeCmuxWorkspaceByTitle(fmt.Sprintf("%s/%s", repoName, worktreeName))
+		closeCmuxWorkspacesByPrefix(repoName + "/" + worktreeName + "/")
 		if _, err := runRemote(r.Server, removeWorktreeScript(r.Repo.Path, wt, r.WorktreeBase)); err != nil {
 			return actionDoneMsg{
 				msg:     fmt.Sprintf("killed %d session(s); worktree removal failed", len(victims)),

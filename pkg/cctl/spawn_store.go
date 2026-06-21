@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 )
 
 // This file makes cctl's session tabs survive a machine reboot.
@@ -162,39 +161,6 @@ func cmuxCmd(cli string, args ...string) *exec.Cmd {
 	return c
 }
 
-// cmuxCapsMu guards the lazily-fetched capability set. cmux's `capabilities`
-// lists the RPC methods this build supports; cctl gates optional features
-// (resume bindings) on it so an older cmux degrades cleanly instead of
-// erroring on every spawn.
-var (
-	cmuxCapsMu    sync.Mutex
-	cmuxCapsCache map[string]bool
-)
-
-// cmuxSupports reports whether the running cmux advertises a method. The
-// result is cached on first success; a failed probe (cmux unreachable) is
-// not cached, so a later call retries once cmux is up.
-func cmuxSupports(cli, method string) bool {
-	cmuxCapsMu.Lock()
-	defer cmuxCapsMu.Unlock()
-	if cmuxCapsCache == nil {
-		out, err := cmuxCmd(cli, "capabilities").Output()
-		if err == nil {
-			var p struct {
-				Methods []string `json:"methods"`
-			}
-			if json.Unmarshal(out, &p) == nil && len(p.Methods) > 0 {
-				m := make(map[string]bool, len(p.Methods))
-				for _, x := range p.Methods {
-					m[x] = true
-				}
-				cmuxCapsCache = m
-			}
-		}
-	}
-	return cmuxCapsCache[method]
-}
-
 // pruneCctlResumeCommands removes cmux "resume command" bindings cctl created
 // in earlier versions (source=cctl). Those accumulate in cmux.json and make
 // cmux pop up "auto restore?" prompts on launch; cctl no longer creates them
@@ -277,51 +243,6 @@ func stripCctlResumeCommands(raw []byte) ([]byte, int) {
 		return nil, 0
 	}
 	return append(out, '\n'), removed
-}
-
-// cmuxResumeBinding returns the command currently bound to a surface's
-// resume binding and the binding's source label (empty when unbound or
-// unsupported). Used by reconcile to identify cctl tabs and spot stale
-// bindings (a vanished $TMPDIR path or a bare `tmux attach`).
-func cmuxResumeBinding(cli, wsID, surfaceID string) (command, source string) {
-	if !cmuxSupports(cli, "surface.resume.get") {
-		return "", ""
-	}
-	out, err := cmuxCmd(cli, "surface", "resume", "get",
-		"--workspace", wsID, "--surface", surfaceID, "--json").Output()
-	if err != nil {
-		return "", ""
-	}
-	return parseResumeBinding(out)
-}
-
-// parseResumeBinding extracts the bound command and its source label from
-// `surface resume get --json`. cmux stores the command in
-// resume_binding.command (with cwd/kind/source alongside); shell/argv are
-// accepted as cross-version fallbacks. Both empty when unbound. Split out so
-// it's unit-testable without a live cmux.
-func parseResumeBinding(raw []byte) (command, source string) {
-	var p struct {
-		ResumeBinding *struct {
-			Command string   `json:"command"`
-			Shell   string   `json:"shell"`
-			Argv    []string `json:"argv"`
-			Source  string   `json:"source"`
-		} `json:"resume_binding"`
-	}
-	if json.Unmarshal(raw, &p) != nil || p.ResumeBinding == nil {
-		return "", ""
-	}
-	b := p.ResumeBinding
-	switch {
-	case b.Command != "":
-		command = b.Command
-	case b.Shell != "":
-		command = b.Shell
-	default:
-		command = strings.Join(b.Argv, " ")
-	}
-	return command, b.Source
 }
 
 // ---- cmux surface enumeration ----------------------------------------------

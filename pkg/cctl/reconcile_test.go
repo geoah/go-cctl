@@ -58,37 +58,51 @@ func TestSpawnScriptPathDeterministic(t *testing.T) {
 	}
 }
 
-func TestSplitWsTitle(t *testing.T) {
-	if r, w, ok := splitWsTitle("rxtx.dev/main"); !ok || r != "rxtx.dev" || w != "main" {
-		t.Errorf("got %q %q %v", r, w, ok)
+func TestWsTitle(t *testing.T) {
+	if got := cmuxWsTitle("rxtx.dev", "main", "audit"); got != "rxtx.dev/main/audit" {
+		t.Errorf("cmuxWsTitle = %q", got)
 	}
-	for _, bad := range []string{"single", "a/b/c", "/x", "x/", ""} {
-		if _, _, ok := splitWsTitle(bad); ok {
-			t.Errorf("splitWsTitle(%q) should fail", bad)
+	r, w, s, ok := parseWsTitle("rxtx.dev/main/audit")
+	if !ok || r != "rxtx.dev" || w != "main" || s != "audit" {
+		t.Errorf("parseWsTitle got %q %q %q %v", r, w, s, ok)
+	}
+	// Round-trips.
+	if r2, w2, s2, ok := parseWsTitle(cmuxWsTitle("repo", "wt", "sess")); !ok || r2 != "repo" || w2 != "wt" || s2 != "sess" {
+		t.Errorf("round-trip failed: %q %q %q %v", r2, w2, s2, ok)
+	}
+	// Only the exact three-part shape is accepted.
+	for _, bad := range []string{"single", "a/b", "/x/y", "x//y", "a/b/c/d", ""} {
+		if _, _, _, ok := parseWsTitle(bad); ok {
+			t.Errorf("parseWsTitle(%q) should fail", bad)
 		}
 	}
 }
 
-func TestLooksLikeCctlLocal(t *testing.T) {
-	local := []string{
-		"tmux attach -t cctl/go-cctl/main/default",
-		"/Users/x/.cctl/spawn/local__go-cctl__main__default.sh",
-		"tmux new-session -A -s cctl/r/w/s 'claude'",
+// TestSessionForWorkspace pins the migration's session-derivation: from a
+// tmux name embedded in a (terminal-overwritten) tab title, from a clean tab
+// title matching a tracked session, or the sole manifest session.
+func TestSessionForWorkspace(t *testing.T) {
+	tracked := map[string]bool{tmuxName("olympus", "gb300-k8s", "docs"): true}
+
+	// 1. tmux name embedded in a mosh/tmux title.
+	w := cmuxWsView{surfaces: []cmuxSurface{{title: `[mosh] cctl/olympus/gb300-k8s/nfs-temp:0:bash - "…"`}}}
+	if s := sessionForWorkspace(w, "olympus", "gb300-k8s", nil, nil, nil); s != "nfs-temp" {
+		t.Errorf("embedded tmux name: got %q want nfs-temp", s)
 	}
-	for _, s := range local {
-		if !looksLikeCctlLocal(s) {
-			t.Errorf("should be cctl-local: %q", s)
-		}
+	// 2. clean tab title that matches a tracked session.
+	w = cmuxWsView{surfaces: []cmuxSurface{{title: "docs"}}}
+	if s := sessionForWorkspace(w, "olympus", "gb300-k8s", nil, tracked, nil); s != "docs" {
+		t.Errorf("clean tracked title: got %q want docs", s)
 	}
-	notLocal := []string{
-		"", "bash -l", "vim main.go",
-		"mosh host -- tmux new-session -A -s cctl/r/w/s",
-		"ssh host tmux attach -t cctl/r/w/s",
+	// 3. fall back to the sole manifest session for the worktree.
+	w = cmuxWsView{surfaces: []cmuxSurface{{title: "Terminal"}}}
+	if s := sessionForWorkspace(w, "olympus", "main", []string{"random"}, nil, nil); s != "random" {
+		t.Errorf("sole manifest session: got %q want random", s)
 	}
-	for _, s := range notLocal {
-		if looksLikeCctlLocal(s) {
-			t.Errorf("should NOT be cctl-local: %q", s)
-		}
+	// Ambiguous / unknown → empty (don't rename).
+	w = cmuxWsView{surfaces: []cmuxSurface{{title: "Terminal"}}}
+	if s := sessionForWorkspace(w, "olympus", "k8s", []string{"a", "b"}, nil, nil); s != "" {
+		t.Errorf("ambiguous: got %q want empty", s)
 	}
 }
 
@@ -112,27 +126,6 @@ func TestParseCmuxSurfaceLines(t *testing.T) {
 	}
 	if got[2].title != "my feature tab" {
 		t.Errorf("surface[2].title = %q (spaces should survive)", got[2].title)
-	}
-}
-
-func TestParseResumeBinding(t *testing.T) {
-	if c, s := parseResumeBinding([]byte(`{"resume_binding":null}`)); c != "" || s != "" {
-		t.Errorf("null binding should be empty, got cmd=%q src=%q", c, s)
-	}
-	// The real cmux 0.64 shape: command + source live in resume_binding.
-	real := `{"resume_binding":{"command":"tmux new-session -A -s cctl/r/w/s","cwd":"/h","kind":"tmux","source":"cctl"}}`
-	if c, s := parseResumeBinding([]byte(real)); c != "tmux new-session -A -s cctl/r/w/s" || s != "cctl" {
-		t.Errorf("command form = cmd=%q src=%q", c, s)
-	}
-	// Cross-version fallbacks.
-	if c, _ := parseResumeBinding([]byte(`{"resume_binding":{"shell":"tmux attach -t cctl/r/w/s"}}`)); c != "tmux attach -t cctl/r/w/s" {
-		t.Errorf("shell fallback = %q", c)
-	}
-	if c, _ := parseResumeBinding([]byte(`{"resume_binding":{"argv":["tmux","attach","-t","cctl/r/w/s"]}}`)); c != "tmux attach -t cctl/r/w/s" {
-		t.Errorf("argv fallback = %q", c)
-	}
-	if c, s := parseResumeBinding([]byte(`not json`)); c != "" || s != "" {
-		t.Errorf("garbage should be empty, got cmd=%q src=%q", c, s)
 	}
 }
 
@@ -188,14 +181,14 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
-func TestManifestTitleSet(t *testing.T) {
+func TestManifestWsSet(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	manifestUpsert(SpawnSpec{
 		Server: "local", Repo: "r", Worktree: "main", Session: "a",
-		WsTitle: "r/main", TabTitle: "a",
+		WsTitle: "r/main/a", TabTitle: "a",
 	})
-	if set := manifestTitleSet(); !set["r/main\x00a"] {
-		t.Errorf("title set missing expected key: %+v", set)
+	if set := manifestWsSet(); !set["r/main/a"] {
+		t.Errorf("ws set missing expected per-session name: %+v", set)
 	}
 }
 
