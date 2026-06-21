@@ -1007,32 +1007,16 @@ func canDelete(r treeRow) bool {
 	return false
 }
 
-// probeRetryDelay returns how long to wait before the next reachability
-// probe, given how many attempts have already been issued. Backoff caps
-// quickly so a flapping host shows up-to-date status within ~a minute
-// without hammering ssh.
-//
-// Sequence (attempts → delay):
-//
-//	1 → 2s
-//	2 → 5s
-//	3 → 10s
-//	4 → 30s
-//	5+ → 60s
-func probeRetryDelay(attempts int) time.Duration {
-	switch {
-	case attempts <= 1:
-		return 2 * time.Second
-	case attempts == 2:
-		return 5 * time.Second
-	case attempts == 3:
-		return 10 * time.Second
-	case attempts == 4:
-		return 30 * time.Second
-	default:
-		return 60 * time.Second
-	}
-}
+// Probe retry policy: a server gets at most one automatic retry after its
+// first reachability probe fails, then it's left disconnected until the user
+// refreshes (r). Auto-reconnecting forever is pointless here — the ssh
+// ConnectTimeout already bounds each probe, and startup sync only waits for
+// every server to *settle* (a given-up server counts as settled), so one
+// retry is enough to ride out a transient blip without stalling.
+const (
+	maxProbeAttempts = 2 // initial probe + one retry
+	probeRetryDelay  = 2 * time.Second
+)
 
 func (m *tuiModel) refreshAllCmd() tea.Cmd {
 	var cmds []tea.Cmd
@@ -1107,17 +1091,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			"server", msg.server, "attempt", st.connAttempts,
 			"err", msg.err.Error())
 		m.rebuildRows()
-		// Schedule a retry. The backoff caps quickly so a flapping
-		// host doesn't end up in a once-an-hour state.
+		// A server giving up counts as "settled" — advance the startup queue
+		// so an all-remote-down launch still reconciles the local cmux.
 		server := msg.server
-		delay := probeRetryDelay(st.connAttempts)
-		// A server giving up counts as "settled" — re-check whether that
-		// unblocks the startup sync (so an all-remote-down launch still
-		// reconciles the local cmux instead of waiting forever).
-		return m, tea.Batch(
-			tea.Tick(delay, func(time.Time) tea.Msg { return retryProbeMsg{server: server} }),
-			m.startupProgress(server),
-		)
+		cmds := []tea.Cmd{m.startupProgress(server)}
+		// Auto-retry at most once (see maxProbeAttempts); after that the host
+		// stays disconnected until the user hits r.
+		if st.connAttempts < maxProbeAttempts {
+			cmds = append(cmds, tea.Tick(probeRetryDelay, func(time.Time) tea.Msg {
+				return retryProbeMsg{server: server}
+			}))
+		}
+		return m, tea.Batch(cmds...)
 
 	case retryProbeMsg:
 		st := m.state[msg.server]
@@ -2870,8 +2855,10 @@ func (m *tuiModel) rowCells(r treeRow, selected bool) (name, info, age string) {
 			if st.connErr != nil {
 				hint = "disconnected: " + abbrev(st.connErr.Error(), 70)
 			}
-			if st.connAttempts > 1 {
-				hint = fmt.Sprintf("%s (retry in %s, attempt %d)", hint, probeRetryDelay(st.connAttempts).String(), st.connAttempts)
+			if st.connAttempts < maxProbeAttempts {
+				hint += fmt.Sprintf(" (retry in %s)", probeRetryDelay)
+			} else {
+				hint += " (press r to retry)"
 			}
 			info = errorStyle.Render(hint)
 		case st.conn == connConnecting && st.sessionsLoaded && st.reposLoaded:

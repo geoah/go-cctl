@@ -30,6 +30,14 @@ func sshArgs(s Server) []string {
 	if s.Port != 0 {
 		args = append(args, "-p", strconv.Itoa(s.Port))
 	}
+	// Fail fast on an unreachable host instead of the OS TCP default (often
+	// 75s+). ConnectTimeout is integer seconds; round up, floor at 1. A
+	// user-supplied -o ConnectTimeout in SSHOpts still wins (it comes after).
+	secs := int((s.connectTimeout() + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	args = append(args, "-o", "ConnectTimeout="+strconv.Itoa(secs))
 	args = append(args, s.SSHOpts...)
 	return args
 }

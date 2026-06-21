@@ -1,11 +1,45 @@
 package cctl
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestConnectTimeout(t *testing.T) {
+	if d := (Server{}).connectTimeout(); d != 10*time.Second {
+		t.Errorf("default = %s, want 10s", d)
+	}
+	if d := (Server{Timeout: "3s"}).connectTimeout(); d != 3*time.Second {
+		t.Errorf("3s = %s", d)
+	}
+	if d := (Server{Timeout: "1m"}).connectTimeout(); d != time.Minute {
+		t.Errorf("1m = %s", d)
+	}
+	for _, bad := range []string{"nonsense", "0s", "-5s", ""} {
+		if d := (Server{Timeout: bad}).connectTimeout(); d != 10*time.Second {
+			t.Errorf("Timeout=%q -> %s, want default 10s", bad, d)
+		}
+	}
+}
+
+func TestSshArgsConnectTimeout(t *testing.T) {
+	if got := strings.Join(sshArgs(Server{Host: "h"}), " "); !strings.Contains(got, "ConnectTimeout=10") {
+		t.Errorf("default args = %q, want ConnectTimeout=10", got)
+	}
+	// Sub-second rounds up to 1, never 0.
+	if got := strings.Join(sshArgs(Server{Host: "h", Timeout: "500ms"}), " "); !strings.Contains(got, "ConnectTimeout=1") {
+		t.Errorf("500ms args = %q, want ConnectTimeout=1", got)
+	}
+	if got := strings.Join(sshArgs(Server{Host: "h", Timeout: "12s"}), " "); !strings.Contains(got, "ConnectTimeout=12") {
+		t.Errorf("12s args = %q, want ConnectTimeout=12", got)
+	}
+}
 
 func TestShellPath(t *testing.T) {
 	cases := map[string]string{
 		"~":              `"$HOME"`,
-		"~/my-app":      `"$HOME/my-app"`,
+		"~/my-app":       `"$HOME/my-app"`,
 		"~/a b/c":        `"$HOME/a b/c"`,
 		"/abs/path":      `"/abs/path"`,
 		`/with"quote`:    `"/with\"quote"`,

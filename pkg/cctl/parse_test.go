@@ -551,22 +551,15 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 
 // ---- connection state machine ---------------------------------------------
 
-// TestProbeRetryDelay_BackoffShape pins the backoff sequence so a future
-// edit doesn't accidentally turn it into "1s forever" (hammering ssh) or
-// "1h forever" (user sees stale state). Failure mode would be invisible in
-// the UI but very visible in network noise.
-func TestProbeRetryDelay_BackoffShape(t *testing.T) {
-	cases := []struct {
-		attempts int
-		want     string
-	}{
-		{0, "2s"}, {1, "2s"}, {2, "5s"}, {3, "10s"}, {4, "30s"}, {5, "1m0s"}, {99, "1m0s"},
+// TestProbeRetryPolicy pins the single-retry policy: the auto-retry delay is
+// short and there's exactly one retry (initial probe + 1) before a host is
+// left disconnected until a manual refresh.
+func TestProbeRetryPolicy(t *testing.T) {
+	if probeRetryDelay != 2*time.Second {
+		t.Errorf("probeRetryDelay = %s, want 2s", probeRetryDelay)
 	}
-	for _, c := range cases {
-		got := probeRetryDelay(c.attempts).String()
-		if got != c.want {
-			t.Errorf("probeRetryDelay(%d) = %s, want %s", c.attempts, got, c.want)
-		}
+	if maxProbeAttempts != 2 {
+		t.Errorf("maxProbeAttempts = %d, want 2 (initial + one retry)", maxProbeAttempts)
 	}
 }
 

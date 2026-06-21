@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -105,6 +106,27 @@ type Server struct {
 	// Non-interactive commands (list/kill/worktree ops) always use ssh
 	// regardless.
 	Transport string `yaml:"transport"`
+	// Timeout bounds how long ssh waits to connect to this server, as a
+	// Go duration string (e.g. "10s", "1m500ms"). Applied as ssh's
+	// ConnectTimeout so an unreachable host fails fast instead of hanging on
+	// the OS default. Empty / unparseable → defaultConnectTimeout (10s).
+	Timeout string `yaml:"timeout"`
+}
+
+// defaultConnectTimeout is the ssh connect timeout when a server doesn't set
+// one. Short enough that a dead remote settles quickly (startup sync waits on
+// every server settling), long enough to tolerate a slow handshake.
+const defaultConnectTimeout = 10 * time.Second
+
+// connectTimeout returns the server's ssh connect timeout (defaultConnectTimeout
+// when unset or unparseable). Non-positive durations fall back to the default.
+func (s Server) connectTimeout() time.Duration {
+	if s.Timeout != "" {
+		if d, err := time.ParseDuration(s.Timeout); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultConnectTimeout
 }
 
 // useCmuxSSH reports whether interactive sessions on this server should
