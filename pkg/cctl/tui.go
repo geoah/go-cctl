@@ -393,6 +393,12 @@ type tuiModel struct {
 	// task list, per-row spinners, and conflict blocking. Pruned on tick.
 	tasks      []*bgTask
 	nextTaskID int
+
+	// startupTaskID tracks the "synchronizing servers…" footer task; once
+	// every server has settled it's marked done and the cmux↔cctl sync
+	// kicks off. startupSynced guards that sync so it fires exactly once.
+	startupTaskID int
+	startupSynced bool
 	// spinnerFrame ticks while anything in the model is animating (any
 	// running task, or any server connecting / still loading). Shared so
 	// every spinner in the UI advances in lockstep.
@@ -606,12 +612,6 @@ type actionDoneMsg struct {
 	err        error
 }
 
-// startupSyncMsg fires once, a beat after launch, to run the cmux↔cctl
-// reconcile automatically (the same pass R/S trigger). This is the "when
-// you reopen, it syncs and restores" path: heal bindings, bring back tabs a
-// reboot killed, close tabs for sessions that are gone.
-type startupSyncMsg struct{}
-
 // refreshServerMsg triggers a one-server reload, used as a follow-up after
 // spawning a session in a new terminal window (so the tree picks it up).
 type refreshServerMsg struct {
@@ -739,11 +739,56 @@ func (m *tuiModel) Init() tea.Cmd {
 	if c := m.scheduleTick(); c != nil {
 		cmds = append(cmds, c)
 	}
-	// Auto-reconcile cmux ↔ cctl shortly after launch, once servers and
-	// cmux have settled. Quiet unless it actually changes something.
-	cmds = append(cmds, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
-		return startupSyncMsg{}
-	}))
+	// Show the startup work as a visible queue. Step 1 ("synchronizing
+	// servers…") covers the per-server fetches kicked off above; step 2
+	// (the cmux↔cctl sync) fires automatically once every server settles —
+	// see maybeStartupSync. NOT a fixed timer: the old 2s tick raced ahead
+	// of the remote fetches and synced against an empty session list.
+	id, tick := m.startTask("startup:servers", "synchronizing servers…")
+	m.startupTaskID = id
+	if tick != nil {
+		cmds = append(cmds, tick)
+	}
+	return tea.Batch(cmds...)
+}
+
+// allServersSettled reports whether every server has finished its initial
+// load — connected ones fully fetched, unreachable ones given up on (so a
+// dead remote doesn't stall startup forever).
+func (m *tuiModel) allServersSettled() bool {
+	for _, n := range m.serverNames {
+		st := m.state[n]
+		if st == nil {
+			return false
+		}
+		switch st.conn {
+		case connConnecting:
+			return false
+		case connConnected:
+			if !st.sessionsLoaded || !st.reposLoaded || !st.worktreesLoaded {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// maybeStartupSync fires the one-time cmux↔cctl reconcile the moment all
+// servers have settled (sessions/worktrees fetched), then never again this
+// run. Returns nil until then. This is the correct sequencing the fixed-
+// timer version lacked: sync must see the real session lists.
+func (m *tuiModel) maybeStartupSync() tea.Cmd {
+	if m.startupSynced || !m.allServersSettled() {
+		return nil
+	}
+	m.startupSynced = true
+	sweepLegacySpawnScripts()
+	finish := m.finishTask(m.startupTaskID, "servers synchronized", nil)
+	id, tick := m.startTask("startup:sync", "syncing cmux ↔ cctl…")
+	cmds := []tea.Cmd{finish, m.syncCmd(id, false)}
+	if tick != nil {
+		cmds = append(cmds, tick)
+	}
 	return tea.Batch(cmds...)
 }
 
@@ -935,7 +980,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.sessionsLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, nil
+		return m, m.maybeStartupSync()
 
 	case loadedReposMsg:
 		st := m.state[msg.server]
@@ -947,7 +992,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.reposLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, nil
+		return m, m.maybeStartupSync()
 
 	case loadedWorktreesMsg:
 		st := m.state[msg.server]
@@ -960,7 +1005,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		st.worktreesLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
-		return m, nil
+		return m, m.maybeStartupSync()
 
 	case probedMsg:
 		st := m.state[msg.server]
@@ -987,9 +1032,13 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// host doesn't end up in a once-an-hour state.
 		server := msg.server
 		delay := probeRetryDelay(st.connAttempts)
-		return m, tea.Tick(delay, func(time.Time) tea.Msg {
-			return retryProbeMsg{server: server}
-		})
+		// A server giving up counts as "settled" — re-check whether that
+		// unblocks the startup sync (so an all-remote-down launch still
+		// reconciles the local cmux instead of waiting forever).
+		return m, tea.Batch(
+			tea.Tick(delay, func(time.Time) tea.Msg { return retryProbeMsg{server: server} }),
+			m.maybeStartupSync(),
+		)
 
 	case retryProbeMsg:
 		st := m.state[msg.server]
@@ -1038,13 +1087,6 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return refreshServerMsg{server: refresh}
 			}),
 		)
-
-	case startupSyncMsg:
-		// One-time tidy of the obsolete $TMPDIR wrappers, then the same
-		// reconcile R/S run — quiet so a no-op launch doesn't chatter.
-		sweepLegacySpawnScripts()
-		id, tick := m.startTask("", "syncing cmux ↔ cctl…")
-		return m, tea.Batch(tick, m.syncCmd(id, true))
 
 	case refreshServerMsg:
 		var cmds []tea.Cmd

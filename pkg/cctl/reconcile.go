@@ -8,23 +8,26 @@ import (
 )
 
 // This file is the one reconcile pass that keeps cmux and cctl in lockstep.
-// It backs the R/S keys AND runs on startup, so "restore", "sync", and
-// "make-them-match" are all the same operation:
+// It backs the R/S keys AND runs on startup (after every server has settled,
+// not on a fixed timer), so "restore", "sync", and "make-them-match" are all
+// the same operation:
 //
-//   1. Adopt  — record live tmux sessions and existing cctl tabs into the
-//               manifest, so they survive the next reboot.
+//   1. Adopt  — record LIVE local tmux sessions into the manifest so they
+//               survive the next reboot. Dead cmux tabs are deliberately not
+//               adopted — they're what Close removes.
 //   2. Heal   — pin every cctl tab's cmux resume binding to its durable
 //               wrapper (fixes stale `tmux attach` / vanished $TMPDIR paths).
 //   3. Restore— for manifest sessions whose tab is missing, or whose local
 //               tmux session has died, (re)open/revive the tab — resuming
 //               claude via the wrapper's `new-session -A` + `--continue`.
-//   4. Close  — close cctl tabs that are gone for good (deleted, or dead and
-//               no longer tracked) so cmux matches cctl.
+//   4. Close  — close cctl tabs no longer backed by a session, so cmux only
+//               shows what's actually running/tracked. Runs every sync.
 //
 // Safety rails on Close: never touch a tab whose tmux session is still
-// alive; only act on tabs we can positively identify as cctl-local; and on
-// the very first run (no manifest yet) adopt instead of closing, so an
-// upgrade never nukes a screen full of existing work.
+// alive, and only act on tabs we can positively identify as cctl-local
+// (resume source=cctl, or a cctl/ command that isn't ssh/mosh). Because
+// Adopt+Restore populate the manifest first, "not in the manifest" by the
+// time Close runs means "not a live or tracked session" — i.e. junk.
 
 type syncResult struct {
 	adopted  int
@@ -96,7 +99,6 @@ func syncCmuxState(cfg *Config) syncResult {
 	if cli == "" {
 		return res
 	}
-	bootstrap := !manifestFileExists()
 	localName, localSrv, hasLocal := findLocalServer(cfg)
 
 	// Local tmux liveness (sanitized full names) — cheap, no ssh.
@@ -117,7 +119,12 @@ func syncCmuxState(cfg *Config) syncResult {
 		views = append(views, cmuxWsView{id: w.id, name: w.name, surfaces: listCmuxSurfaces(cli, w.id)})
 	}
 
-	res.adopted += adoptFromCmux(cli, localName, hasLocal, views)
+	// Adopt only LIVE local sessions into the manifest. We deliberately do
+	// NOT adopt dead cmux tabs: a tab with no running session is exactly
+	// what the user wants closed, and adopting it would protect it from the
+	// close pass forever. (Sessions spawned through cctl are already in the
+	// manifest; reboot-revival relies on that persisted record, not on
+	// re-adopting dead tabs.)
 	if hasLocal {
 		res.adopted += adoptFromTmux(localName, localSrv, localSessions)
 	}
@@ -126,46 +133,12 @@ func syncCmuxState(cfg *Config) syncResult {
 	entries := loadManifestEntries()
 	healRestore(cfg, cli, views, liveLocal, &res, entries)
 
-	if !bootstrap {
-		closeOrphans(cli, views, liveLocal, &res)
-	}
+	// Close cctl tabs that are no longer backed by a session: not in the
+	// manifest (after adopt+restore) and not currently alive. Runs every
+	// sync — the safety rails live in closeOrphans (cctl-owned + never-
+	// close-alive), so it's safe even on the first, manifest-less run.
+	closeOrphans(cli, views, liveLocal, &res)
 	return res
-}
-
-// adoptFromCmux records existing cctl-local tabs (identified by their resume
-// binding) that aren't in the manifest yet, so they survive the next reboot.
-func adoptFromCmux(cli, localName string, hasLocal bool, views []cmuxWsView) int {
-	if !hasLocal {
-		return 0
-	}
-	have := manifestKeySet()
-	n := 0
-	for _, w := range views {
-		repo, wt, ok := splitWsTitle(w.name)
-		if !ok {
-			continue
-		}
-		for _, sf := range w.surfaces {
-			if sf.title == "" {
-				continue
-			}
-			key := manifestKey(localName, repo, wt, sf.title)
-			if have[key] {
-				continue
-			}
-			if !isCctlLocalSurface(cli, w.id, sf.id) {
-				continue
-			}
-			manifestUpsertEntry(wsEntry{
-				Server: localName, Repo: repo, Worktree: wt, Session: sf.title,
-				TmuxName: tmuxName(repo, wt, sf.title),
-				WsTitle:  w.name, TabTitle: sf.title, Remote: false,
-			})
-			have[key] = true
-			n++
-		}
-	}
-	return n
 }
 
 // adoptFromTmux records live local tmux sessions missing from the manifest

@@ -198,6 +198,38 @@ func TestManifestTitleSet(t *testing.T) {
 	}
 }
 
+func TestAllServersSettled(t *testing.T) {
+	m := &tuiModel{
+		serverNames: []string{"local", "remote"},
+		state: map[string]*serverState{
+			"local":  {conn: connConnected, sessionsLoaded: true, reposLoaded: true, worktreesLoaded: true},
+			"remote": {conn: connConnecting},
+		},
+	}
+	if m.allServersSettled() {
+		t.Error("a still-connecting server means not settled")
+	}
+	// Connected but mid-fetch: still not settled.
+	m.state["remote"].conn = connConnected
+	if m.allServersSettled() {
+		t.Error("connected-but-unloaded means not settled")
+	}
+	// Fully loaded: settled.
+	m.state["remote"].sessionsLoaded = true
+	m.state["remote"].reposLoaded = true
+	m.state["remote"].worktreesLoaded = true
+	if !m.allServersSettled() {
+		t.Error("all servers loaded should be settled")
+	}
+	// A server that gave up (disconnected) counts as settled — don't block
+	// startup on an unreachable remote.
+	m.state["remote"].conn = connDisconnected
+	m.state["remote"].sessionsLoaded = false
+	if !m.allServersSettled() {
+		t.Error("a disconnected (gave-up) server should count as settled")
+	}
+}
+
 func TestFindLocalServer(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"remote": {Host: "h"},
