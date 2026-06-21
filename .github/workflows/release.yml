@@ -1,0 +1,63 @@
+name: release
+
+# Links versions <-> tags <-> changelog: the post-commit hook bumps VERSION
+# and prepends a CHANGELOG section from the Conventional Commit subject; this
+# workflow turns that into a git tag + GitHub Release. Runs only when VERSION
+# changes on main, and is idempotent (skips if the tag already exists).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - VERSION
+
+permissions:
+  contents: write
+
+jobs:
+  tag-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need all tags to test existence
+
+      - name: Read VERSION
+        id: ver
+        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Does the tag already exist?
+        id: tag
+        run: |
+          if git rev-parse "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract changelog section
+        if: steps.tag.outputs.exists == 'false'
+        run: |
+          v='${{ steps.ver.outputs.version }}'
+          # Pull the lines between "## [<v>]" and the next "## [" heading.
+          awk -v ver="$v" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## \[/ { exit }
+            grab { print }
+          ' CHANGELOG.md | sed '/./,$!d' > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "Release v$v" > release-notes.md
+          fi
+          echo "----- notes for v$v -----"; cat release-notes.md
+
+      - name: Create tag and GitHub release
+        if: steps.tag.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v='${{ steps.ver.outputs.version }}'
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$v" -m "v$v"
+          git push origin "v$v"
+          gh release create "v$v" --title "v$v" --notes-file release-notes.md

@@ -148,3 +148,18 @@ mise run hooks:setup    # sets core.hooksPath=.githooks
 So: **write Conventional Commit subjects.** The hook does the rest — no manual
 version edits, no manual changelog. To bypass for a one-off, commit with
 `CCTL_NO_BUMP=1 git commit …` or include `[skip bump]` in the subject.
+
+### Tags & releases (CI)
+
+Every version maps to a `v<x.y.z>` git tag and a GitHub Release. Don't tag by
+hand — `.github/workflows/release.yml` does it: on a push to `main` that
+changes `VERSION`, it creates the tag and a release whose notes are that
+version's `CHANGELOG.md` section. Idempotent (skips if the tag exists), so the
+full chain is:
+
+```
+Conventional Commit  →  (post-commit hook)  VERSION + CHANGELOG
+                     →  (release.yml on main)  v<x.y.z> tag + GitHub Release
+```
+
+`.github/workflows/ci.yml` runs gofmt/vet/build/unit-tests on every push & PR.
