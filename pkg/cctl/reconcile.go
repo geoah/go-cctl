@@ -133,13 +133,12 @@ func syncCmuxState(cfg *Config) syncResult {
 		res.adopted += adoptFromTmux(name, s, sessionsByServer[name])
 	}
 
-	// File local repo worktrees under one sidebar group per repo (remote ones
-	// are grouped at spawn). Fixes a repo's worktrees splitting into separate
-	// per-worktree folders.
-	res.grouped = ensureLocalRepoGrouping(cli, cfg, localName, views, wsMetaByID)
-
-	// Re-read after adoption so close sees the full tracked set.
+	// Re-read after adoption so grouping/close see the full tracked set.
 	entries := loadManifestEntries()
+
+	// File every cctl workspace (local and remote) under one sidebar group per
+	// repo, so a repo's worktrees don't splinter into per-worktree folders.
+	res.grouped = ensureRepoGrouping(cli, cfg, localName, views, wsMetaByID, entries)
 
 	// Close cctl workspaces whose tmux session is dead. Sync NEVER revives and
 	// sets NO resume bindings: that churn is what triggered cmux's "auto
@@ -264,44 +263,66 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 	}
 }
 
-// ensureLocalRepoGrouping files every local cctl workspace under one sidebar
-// group per repo (named after the repo). Without this, cmux groups local
-// worktrees by each worktree's own directory — so a repo with several
-// worktrees splits into separate "ergogen"/"agent-sdk"/… folders instead of
-// one "rxtx.dev". Remote workspaces already get a "server/repo" group at
-// spawn; this is the local equivalent, healed on every sync. Only touches
-// workspaces whose first path component is a known local repo (so the user's
-// own cmux folders are left alone). Returns how many it (re)grouped.
-func ensureLocalRepoGrouping(cli string, cfg *Config, localName string, views []cmuxWsView, wsMeta map[string]wsMeta) int {
-	if localName == "" {
-		return 0
+// ensureRepoGrouping files every cctl workspace under one sidebar group per
+// repo — "repo" for local, "server/repo" for remote (repoGroup decides which,
+// the same way spawn does). cmux otherwise groups workspaces by each one's own
+// cwd directory, which splits a repo's worktrees into separate folders. This
+// is the heal for workspaces that predate spawn-time grouping (or lost it).
+//
+// Local and remote are handled the same way; the only wrinkle is that a
+// workspace's name ("repo/worktree/session") doesn't encode its server, so we
+// take the server from the manifest (which also disambiguates a repo that
+// exists both locally and on a remote). A workspace that's neither tracked nor
+// already in a remote group can only be placed when its first path component
+// is a known local repo — a remote server can't be inferred from the name
+// alone. Returns how many it (re)grouped.
+func ensureRepoGrouping(cli string, cfg *Config, localName string, views []cmuxWsView, wsMeta map[string]wsMeta, entries []wsEntry) int {
+	srvByWs := map[string]string{}
+	for _, e := range entries {
+		srvByWs[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e.Server
 	}
-	localSrv := cfg.Servers[localName]
-	repos := mergeRepos(localSrv)
-	if discovered, err := discoverRepos(localSrv); err == nil {
-		for k, v := range discovered {
-			repos[k] = v
+	localRepos := map[string]Repo{}
+	if localName != "" {
+		localRepos = mergeRepos(cfg.Servers[localName])
+		if d, err := discoverRepos(cfg.Servers[localName]); err == nil {
+			for k, v := range d {
+				localRepos[k] = v
+			}
 		}
 	}
 	grouped := 0
 	for _, w := range views {
-		meta := wsMeta[w.id]
-		if meta.remote {
-			continue // remote — already grouped under "server/repo"
-		}
 		parts := strings.Split(w.name, "/")
 		if len(parts) < 2 || parts[0] == "" {
 			continue // "cctl" control / single-name / user workspace
 		}
 		repo := parts[0]
-		r, ok := repos[repo]
-		if !ok {
-			continue // first component isn't a known local repo → not ours
+		if wsMeta[w.id].repoRoot == repo {
+			continue // already in this repo's group (local or remote)
 		}
-		if meta.repoRoot == repo {
-			continue // already in the repo's group
+
+		// Which server does this workspace belong to? Manifest first (it
+		// disambiguates same-named local/remote repos), then an existing
+		// remote group, else fall back to local.
+		var group, groupCwd string
+		if server := srvByWs[w.name]; server != "" {
+			r, err := cfg.resolve(server, repo)
+			if err != nil {
+				continue
+			}
+			group, groupCwd = repoGroup(r)
+		} else if m := wsMeta[w.id]; m.remote && m.server != "" {
+			r, err := cfg.resolve(m.server, repo)
+			if err != nil {
+				continue
+			}
+			group, groupCwd = repoGroup(r)
+		} else if r, ok := localRepos[repo]; ok {
+			group, groupCwd = repo, expandPath(r.Path)
+		} else {
+			continue // can't place it safely
 		}
-		ensureCmuxGroupMembership(cli, repo, expandPath(r.Path), w.id)
+		ensureCmuxGroupMembership(cli, group, groupCwd, w.id)
 		grouped++
 	}
 	return grouped
