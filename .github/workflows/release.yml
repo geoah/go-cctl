@@ -1,63 +1,30 @@
-name: release
+name: release-please
 
-# Links versions <-> tags <-> changelog: the post-commit hook bumps VERSION
-# and prepends a CHANGELOG section from the Conventional Commit subject; this
-# workflow turns that into a git tag + GitHub Release. Runs only when VERSION
-# changes on main, and is idempotent (skips if the tag already exists).
+# Semantic versioning + Keep-a-Changelog + GitHub Releases, driven by
+# Conventional Commits. On every push to main, release-please maintains a
+# "release PR" that bumps version.txt and regenerates CHANGELOG.md from the
+# commits since the last release. Merging that PR tags v<x.y.z> and publishes
+# the GitHub Release. Config: release-please-config.json +
+# .release-please-manifest.json.
+#
+# One-time repo setting: Settings → Actions → General → "Allow GitHub Actions
+# to create and approve pull requests" must be enabled so the action can open
+# the release PR.
 
 on:
   push:
     branches: [main]
-    paths:
-      - VERSION
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  tag-and-release:
+  release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: googleapis/release-please-action@v4
         with:
-          fetch-depth: 0 # need all tags to test existence
-
-      - name: Read VERSION
-        id: ver
-        run: echo "version=$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
-
-      - name: Does the tag already exist?
-        id: tag
-        run: |
-          if git rev-parse "v${{ steps.ver.outputs.version }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Extract changelog section
-        if: steps.tag.outputs.exists == 'false'
-        run: |
-          v='${{ steps.ver.outputs.version }}'
-          # Pull the lines between "## [<v>]" and the next "## [" heading.
-          awk -v ver="$v" '
-            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
-            grab && /^## \[/ { exit }
-            grab { print }
-          ' CHANGELOG.md | sed '/./,$!d' > release-notes.md
-          if [ ! -s release-notes.md ]; then
-            echo "Release v$v" > release-notes.md
-          fi
-          echo "----- notes for v$v -----"; cat release-notes.md
-
-      - name: Create tag and GitHub release
-        if: steps.tag.outputs.exists == 'false'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          v='${{ steps.ver.outputs.version }}'
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -a "v$v" -m "v$v"
-          git push origin "v$v"
-          gh release create "v$v" --title "v$v" --notes-file release-notes.md
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

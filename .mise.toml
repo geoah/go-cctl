@@ -25,10 +25,10 @@ run = '''
     global_bin="$HOME/.local/bin"
     mkdir -p "$global_bin"
 
-    # Version comes from the VERSION file (bumped by the post-commit hook);
-    # Commit is the short SHA for build provenance. So `cctl version` shows
-    # e.g. "0.3.1 (a1b2c3d)".
-    version="$(cat VERSION 2>/dev/null || echo dev)"
+    # Version comes from version.txt (managed by release-please); Commit is
+    # the short SHA for build provenance. So `cctl version` shows e.g.
+    # "0.3.1 (a1b2c3d)".
+    version="$(cat version.txt 2>/dev/null || echo dev)"
     commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     GOBIN="$global_bin" go install -ldflags "-X github.com/geoah/go-cctl/pkg/cctl.Version=${version} -X github.com/geoah/go-cctl/pkg/cctl.Commit=${commit}" ./cmd/cctl
 
@@ -59,18 +59,19 @@ description = "Build cctl into ./bin/cctl (for quick iteration / smoke tests)"
 run = '''
     set -euo pipefail
     mkdir -p ./bin
-    version="$(cat VERSION 2>/dev/null || echo dev)"
+    version="$(cat version.txt 2>/dev/null || echo dev)"
     commit="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     go build -ldflags "-X github.com/geoah/go-cctl/pkg/cctl.Version=${version} -X github.com/geoah/go-cctl/pkg/cctl.Commit=${commit}" -o ./bin/cctl ./cmd/cctl
     echo "Built ./bin/cctl ($version)"
     '''
 
 [tasks."hooks:setup"]
-description = "Enable the repo git hooks (auto version bump + changelog on commit)"
+description = "Enable the repo git hooks (Conventional Commit lint on commit-msg)"
 run = '''
     set -euo pipefail
     git config core.hooksPath .githooks
     chmod +x .githooks/* 2>/dev/null || true
     echo "Git hooks enabled (core.hooksPath=.githooks)."
-    echo "Commits now auto-bump VERSION + CHANGELOG.md from the commit type."
+    echo "Commit subjects are linted as Conventional Commits; release-please"
+    echo "(CI) turns them into version bumps, CHANGELOG.md, tags + releases."
     '''

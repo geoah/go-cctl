@@ -2,23 +2,34 @@ package cctl
 
 import (
 	"fmt"
+	"runtime/debug"
 
 	"github.com/spf13/cobra"
 )
 
 // Commit is the short git SHA the binary was built from, set at build time
 // via -ldflags (see the cctl:install / cctl:build mise tasks). Empty on a
-// plain `go build`. Version itself comes from the repo's VERSION file, which
-// the post-commit hook bumps per Conventional Commit.
+// plain `go build`. Version comes from version.txt (managed by release-please)
+// injected the same way; `go install …@vX` falls back to the module version
+// embedded in the build info.
 var Commit = ""
 
 // versionString renders the semver plus the build commit when known, e.g.
-// "0.3.1 (a1b2c3d)".
+// "0.3.1 (a1b2c3d)". When the binary was built without the ldflags (a bare
+// `go install …@version`), it recovers the version from the module build info.
 func versionString() string {
-	if Commit != "" {
-		return Version + " (" + Commit + ")"
+	v := Version
+	if v == "" || v == "dev" {
+		if bi, ok := debug.ReadBuildInfo(); ok {
+			if mv := bi.Main.Version; mv != "" && mv != "(devel)" {
+				v = mv
+			}
+		}
 	}
-	return Version
+	if Commit != "" {
+		return v + " (" + Commit + ")"
+	}
+	return v
 }
 
 func newVersionCmd() *cobra.Command {

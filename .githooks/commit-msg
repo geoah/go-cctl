@@ -1,0 +1,25 @@
+#!/bin/sh
+# cctl: validate the commit subject is a Conventional Commit so release-please
+# (CI) can derive the version bump + CHANGELOG from history. Lint only — it
+# never edits the commit. Bypass with CCTL_NO_LINT=1. Enable via
+# `mise run hooks:setup` (sets core.hooksPath=.githooks).
+[ -n "${CCTL_NO_LINT:-}" ] && exit 0
+
+subject=$(head -1 "$1")
+
+# Allow machine-generated / non-feature subjects through untouched.
+case "$subject" in
+	"Merge "*|"Revert "*|"fixup! "*|"squash! "*|"chore(main): release"*) exit 0 ;;
+esac
+
+# <type>[(scope)][!]: <description>
+if printf '%s' "$subject" | grep -Eq '^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: .+'; then
+	exit 0
+fi
+
+echo "✗ not a Conventional Commit subject:" >&2
+echo "    $subject" >&2
+echo "  want: <type>[(scope)][!]: <desc>" >&2
+echo "  types: feat fix docs style refactor perf test build ci chore revert" >&2
+echo "  (feat → minor, fix → patch, ! or BREAKING CHANGE → major; bypass with CCTL_NO_LINT=1)" >&2
+exit 1

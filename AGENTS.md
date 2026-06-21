@@ -126,40 +126,38 @@ version upgrades and stays on `$PATH` even when mise's go shim isn't
 active. If you made several edits across a turn, install at the end of
 the turn so the running binary always reflects the latest code.
 
-## Versioning + changelog (automated)
+## Versioning, changelog & releases ([release-please](https://github.com/googleapis/release-please))
 
-The repo is [semver](https://semver.org/)'d via the `VERSION` file, surfaced
-by `cctl version` (injected at build time from `VERSION` + the short SHA).
+[Semantic versioning](https://semver.org/) + [Keep a Changelog](https://keepachangelog.com/)
++ GitHub Releases are driven by **release-please** from
+[Conventional Commit](https://www.conventionalcommits.org/) subjects. You never
+edit the version or changelog by hand.
 
-A `post-commit` git hook auto-bumps `VERSION` and prepends a `CHANGELOG.md`
-entry from the [Conventional Commit](https://www.conventionalcommits.org/)
-subject, **folding both into the commit you just made** (via a guarded
-`--amend`). Mapping: `feat:` → minor, `fix:`/`perf:` → patch, `<type>!:` or a
-`BREAKING CHANGE` body → major; other types (`docs`/`chore`/`refactor`/
-`test`/`ci`/`build`/`style`) don't bump. `chore(release)` / `[skip bump]`
-subjects are skipped.
-
-Enable it once per clone:
-
-```bash
-mise run hooks:setup    # sets core.hooksPath=.githooks
-```
-
-So: **write Conventional Commit subjects.** The hook does the rest — no manual
-version edits, no manual changelog. To bypass for a one-off, commit with
-`CCTL_NO_BUMP=1 git commit …` or include `[skip bump]` in the subject.
-
-### Tags & releases (CI)
-
-Every version maps to a `v<x.y.z>` git tag and a GitHub Release. Don't tag by
-hand — `.github/workflows/release.yml` does it: on a push to `main` that
-changes `VERSION`, it creates the tag and a release whose notes are that
-version's `CHANGELOG.md` section. Idempotent (skips if the tag exists), so the
-full chain is:
+The flow:
 
 ```
-Conventional Commit  →  (post-commit hook)  VERSION + CHANGELOG
-                     →  (release.yml on main)  v<x.y.z> tag + GitHub Release
+Conventional Commits on main
+  → release-please opens/updates a "release PR" (bumps version.txt,
+    regenerates CHANGELOG.md from the commits since the last release)
+  → you merge the release PR
+  → release-please tags v<x.y.z> + publishes the GitHub Release
 ```
 
-`.github/workflows/ci.yml` runs gofmt/vet/build/unit-tests on every push & PR.
+`feat` → minor, `fix`/`perf` → patch, `!` or `BREAKING CHANGE` → major; other
+types (`docs`/`chore`/`refactor`/`test`/`ci`/`build`/`style`) don't trigger a
+release on their own. Config lives in `release-please-config.json` +
+`.release-please-manifest.json`; the workflow is
+`.github/workflows/release.yml`.
+
+`version.txt` (release-please-managed) is embedded into the binary at build
+time via the mise tasks and shown by `cctl version`; a bare
+`go install …@vX` recovers the version from the module build info instead.
+
+So: **just write Conventional Commit subjects.** A local `commit-msg` hook
+lints that format (enable once with `mise run hooks:setup`; bypass a one-off
+with `CCTL_NO_LINT=1 git commit …`). `.github/workflows/ci.yml` runs
+gofmt/vet/build/unit-tests on every push & PR.
+
+One-time GitHub setting: **Settings → Actions → General → "Allow GitHub Actions
+to create and approve pull requests"** must be on so release-please can open
+its release PR.
