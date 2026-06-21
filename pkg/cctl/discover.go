@@ -84,7 +84,39 @@ func discoverRepos(s Server) (map[string]Repo, error) {
 			})
 		}
 	}
-	return assignRepoNames(found), firstErr
+	return assignRepoNames(dropNestedRepos(found)), firstErr
+}
+
+// dropNestedRepos removes discovered repos that live INSIDE another
+// discovered repo — submodules, vendored clones, or nested projects that
+// sit below a repo's root within max_depth. `find … -name .git -prune` only
+// stops descent into the .git dir itself, so those inner .git dirs are still
+// matched and would each surface as a top-level repo — and each then gets
+// its own cmux sidebar group. Keeping only the outermost repo means one
+// repo = one group. Explicitly-configured repos bypass discovery and are
+// never filtered here.
+func dropNestedRepos(found []discoveredRepo) []discoveredRepo {
+	fullPath := func(d discoveredRepo) string {
+		return strings.TrimRight(d.srcPath, "/") + "/" + strings.Join(d.parts, "/")
+	}
+	var kept []discoveredRepo
+	for i, d := range found {
+		nested := false
+		for j, other := range found {
+			if i == j {
+				continue
+			}
+			// d is nested if its path is strictly below other's path.
+			if strings.HasPrefix(fullPath(d), fullPath(other)+"/") {
+				nested = true
+				break
+			}
+		}
+		if !nested {
+			kept = append(kept, d)
+		}
+	}
+	return kept
 }
 
 // hasNoisyComponent returns true if any path component is hidden
