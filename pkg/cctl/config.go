@@ -27,6 +27,11 @@ type Defaults struct {
 	Mosh         *bool    `yaml:"mosh"`
 	Shell        string   `yaml:"shell"`
 	LogLevel     string   `yaml:"log_level"` // debug, info (default), warn, error
+	// SyncAllServers controls whether the cmux↔cctl sync (R/S + the startup
+	// pass) checks tmux liveness and closes stale tabs on EVERY server, not
+	// just the local one. Default true. Set false to limit liveness/close to
+	// the local server (remote tabs then left to cmux's own ssh restore).
+	SyncAllServers *bool `yaml:"sync_all_servers"`
 	// Spawn chooses the terminal-spawn provider when launching sessions
 	// from the TUI: "auto" (default — detect from $TERM_PROGRAM), or one
 	// of "ghostty", "cmux", "wezterm", "kitty", "iterm2", "inline".
@@ -44,6 +49,15 @@ type Defaults struct {
 	// sessions. Override when claude is managed by npm/mise/brew on a
 	// given setup (e.g. "npm install -g @anthropic-ai/claude-code").
 	ClaudeUpdate string `yaml:"claude_update"`
+}
+
+// syncAllServers reports whether sync should check liveness + close stale
+// tabs on every server (default) or just the local one.
+func (c *Config) syncAllServers() bool {
+	if c.Defaults.SyncAllServers != nil {
+		return *c.Defaults.SyncAllServers
+	}
+	return true
 }
 
 // claudeUpdateCmd returns the configured upgrade command, defaulting to

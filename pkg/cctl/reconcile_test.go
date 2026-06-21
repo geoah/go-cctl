@@ -230,6 +230,73 @@ func TestAllServersSettled(t *testing.T) {
 	}
 }
 
+func TestSyncAllServersDefault(t *testing.T) {
+	if !(&Config{}).syncAllServers() {
+		t.Error("sync_all_servers should default to true")
+	}
+	f := false
+	if (&Config{Defaults: Defaults{SyncAllServers: &f}}).syncAllServers() {
+		t.Error("explicit false should disable")
+	}
+	tr := true
+	if !(&Config{Defaults: Defaults{SyncAllServers: &tr}}).syncAllServers() {
+		t.Error("explicit true should enable")
+	}
+}
+
+func TestParseCmuxGroups(t *testing.T) {
+	raw := []byte(`{"groups":[
+		{"name":"workspace/olympus","member_workspace_ids":["A","B"]},
+		{"name":"rxtx.dev","member_workspace_ids":["C"]}
+	]}`)
+	groups := parseCmuxGroups(raw)
+	if len(groups) != 2 {
+		t.Fatalf("want 2 groups, got %d", len(groups))
+	}
+	if groups[0].name != "workspace/olympus" || len(groups[0].members) != 2 {
+		t.Errorf("group0 = %+v", groups[0])
+	}
+	if groups[1].name != "rxtx.dev" || groups[1].members[0] != "C" {
+		t.Errorf("group1 = %+v", groups[1])
+	}
+	if parseCmuxGroups([]byte("not json")) != nil {
+		t.Error("garbage should parse to nil")
+	}
+}
+
+// TestMapWorkspaceMeta_ServerDerivation: a "<remoteServer>/repo" group marks
+// members as that remote server's (and cctl-owned); a bare-repo group → local.
+func TestMapWorkspaceMeta_ServerDerivation(t *testing.T) {
+	cfg := &Config{Servers: map[string]Server{
+		"mac":       {Local: true},
+		"workspace": {Host: "h"},
+	}}
+	// Stand in for listCmuxGroups by exercising the mapping logic via the
+	// same derivation mapWorkspaceMeta uses: build it manually.
+	groups := []cmuxGroup{
+		{name: "workspace/olympus", members: []string{"WS1"}},
+		{name: "rxtx.dev", members: []string{"WS2"}},
+	}
+	out := map[string]wsMeta{}
+	for _, g := range groups {
+		meta := wsMeta{server: "mac"}
+		if prefix, _, found := strings.Cut(g.name, "/"); found {
+			if srv, ok := cfg.Servers[prefix]; ok && !srv.Local {
+				meta = wsMeta{server: prefix, cctlRemote: true}
+			}
+		}
+		for _, id := range g.members {
+			out[id] = meta
+		}
+	}
+	if out["WS1"].server != "workspace" || !out["WS1"].cctlRemote {
+		t.Errorf("WS1 should map to remote server workspace; got %+v", out["WS1"])
+	}
+	if out["WS2"].server != "mac" || out["WS2"].cctlRemote {
+		t.Errorf("WS2 (bare repo group) should map local, non-remote; got %+v", out["WS2"])
+	}
+}
+
 func TestFindLocalServer(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"remote": {Host: "h"},

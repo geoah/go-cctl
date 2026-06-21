@@ -1,6 +1,7 @@
 package cctl
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -93,65 +94,88 @@ type cmuxWsView struct {
 
 // syncCmuxState runs the full reconcile and returns what it did. Safe to
 // call with no cmux (returns a zero result) — cctl works fine headless.
+//
+// Liveness + adopt + close span every server by default (defaults.
+// sync_all_servers, default true); set false to limit them to the local
+// server. Remote liveness costs one `tmux list-sessions` ssh round-trip per
+// server, but sync is occasional (startup + R/S), so that's acceptable.
 func syncCmuxState(cfg *Config) syncResult {
 	var res syncResult
 	cli := cmuxCLIPath()
 	if cli == "" {
 		return res
 	}
-	localName, localSrv, hasLocal := findLocalServer(cfg)
+	localName, _, hasLocal := findLocalServer(cfg)
 
-	// Local tmux liveness (sanitized full names) — cheap, no ssh.
-	liveLocal := map[string]bool{}
-	var localSessions []SessionInfo
-	if hasLocal {
-		if sessions, err := listSessions(localName, localSrv); err == nil {
-			localSessions = sessions
-			for _, s := range sessions {
-				liveLocal[s.Name] = true
-			}
+	// Pick the servers to reconcile against.
+	targets := map[string]Server{}
+	if cfg.syncAllServers() {
+		for n, s := range cfg.Servers {
+			targets[n] = s
 		}
+	} else if hasLocal {
+		targets[localName] = cfg.Servers[localName]
 	}
 
-	// Snapshot cmux: every workspace and its tabs.
+	// Per-server tmux liveness (sanitized full names) + raw sessions for adopt.
+	liveByServer := map[string]map[string]bool{}
+	sessionsByServer := map[string][]SessionInfo{}
+	for name, s := range targets {
+		sessions, err := listSessions(name, s)
+		if err != nil {
+			continue
+		}
+		set := make(map[string]bool, len(sessions))
+		for _, ss := range sessions {
+			set[ss.Name] = true
+		}
+		liveByServer[name] = set
+		sessionsByServer[name] = sessions
+	}
+
+	// Snapshot cmux, and map each workspace to its server via the sidebar
+	// groups cctl creates ("server/repo" remote, bare "repo" local).
 	var views []cmuxWsView
 	for _, w := range listCmuxWorkspaces(cli) {
 		views = append(views, cmuxWsView{id: w.id, name: w.name, surfaces: listCmuxSurfaces(cli, w.id)})
 	}
+	wsMetaByID := mapWorkspaceMeta(cli, cfg, localName)
 
-	// Adopt only LIVE local sessions into the manifest. We deliberately do
-	// NOT adopt dead cmux tabs: a tab with no running session is exactly
-	// what the user wants closed, and adopting it would protect it from the
-	// close pass forever. (Sessions spawned through cctl are already in the
-	// manifest; reboot-revival relies on that persisted record, not on
-	// re-adopting dead tabs.)
-	if hasLocal {
-		res.adopted += adoptFromTmux(localName, localSrv, localSessions)
+	// Adopt only LIVE sessions into the manifest (never dead cmux tabs —
+	// those are what Close removes; adopting them would protect junk
+	// forever). Reboot-revival relies on the persisted manifest, not on
+	// re-adopting dead tabs.
+	for name, s := range targets {
+		res.adopted += adoptFromTmux(name, s, sessionsByServer[name])
 	}
 
 	// Re-read after adoption so heal/restore see the full desired set.
 	entries := loadManifestEntries()
-	healRestore(cfg, cli, views, liveLocal, &res, entries)
+	healRestore(cfg, cli, views, liveByServer, &res, entries)
 
-	// Close cctl tabs that are no longer backed by a session: not in the
-	// manifest (after adopt+restore) and not currently alive. Runs every
-	// sync — the safety rails live in closeOrphans (cctl-owned + never-
-	// close-alive), so it's safe even on the first, manifest-less run.
-	closeOrphans(cli, views, liveLocal, &res)
+	// Close cctl tabs no longer backed by a session. Safety rails live in
+	// closeOrphans (cctl-owned + never-close-alive), so it's safe even on
+	// the first, manifest-less run.
+	closeOrphans(cli, views, wsMetaByID, liveByServer, localName, &res)
 	return res
 }
 
-// adoptFromTmux records live local tmux sessions missing from the manifest
-// (e.g. ones whose cmux tab cctl couldn't fingerprint). Repo names are
-// de-sanitized via the local repo list so "rxtx_dev" → "rxtx.dev".
-func adoptFromTmux(localName string, localSrv Server, sessions []SessionInfo) int {
+// adoptFromTmux records live tmux sessions on one server that are missing
+// from the manifest. Repo names are de-sanitized via the server's repo list
+// so "rxtx_dev" → "rxtx.dev". Remote entries are flagged so heal/close treat
+// them as cmux-ssh-managed.
+func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 	if len(sessions) == 0 {
 		return 0
 	}
-	repos := mergeRepos(localSrv)
-	if discovered, err := discoverRepos(localSrv); err == nil {
-		for k, v := range discovered {
-			repos[k] = v
+	repos := mergeRepos(srv)
+	// discoverRepos shells out; only worth it locally (fast). Remote dot-repos
+	// fall back to the sanitized name, which is harmless for adoption.
+	if srv.Local {
+		if discovered, err := discoverRepos(srv); err == nil {
+			for k, v := range discovered {
+				repos[k] = v
+			}
 		}
 	}
 	bySafe := map[string]string{}
@@ -165,14 +189,14 @@ func adoptFromTmux(localName string, localSrv Server, sessions []SessionInfo) in
 		if real, ok := bySafe[s.Repo]; ok {
 			repo = real
 		}
-		key := manifestKey(localName, repo, s.Worktree, s.Session)
+		key := manifestKey(serverName, repo, s.Worktree, s.Session)
 		if have[key] {
 			continue
 		}
 		manifestUpsertEntry(wsEntry{
-			Server: localName, Repo: repo, Worktree: s.Worktree, Session: s.Session,
+			Server: serverName, Repo: repo, Worktree: s.Worktree, Session: s.Session,
 			TmuxName: s.Name,
-			WsTitle:  fmt.Sprintf("%s/%s", repo, s.Worktree), TabTitle: s.Session, Remote: false,
+			WsTitle:  fmt.Sprintf("%s/%s", repo, s.Worktree), TabTitle: s.Session, Remote: !srv.Local,
 		})
 		have[key] = true
 		n++
@@ -181,8 +205,9 @@ func adoptFromTmux(localName string, localSrv Server, sessions []SessionInfo) in
 }
 
 // healRestore pins resume bindings on existing tabs (reviving dead local
-// ones), and (re)opens tabs that are missing entirely.
-func healRestore(cfg *Config, cli string, views []cmuxWsView, liveLocal map[string]bool, res *syncResult, entries []wsEntry) {
+// ones), and (re)opens tabs that are missing entirely. `liveByServer` maps a
+// server name to the set of its live tmux session names.
+func healRestore(cfg *Config, cli string, views []cmuxWsView, liveByServer map[string]map[string]bool, res *syncResult, entries []wsEntry) {
 	byName := map[string]cmuxWsView{}
 	for _, w := range views {
 		byName[w.name] = w
@@ -205,11 +230,13 @@ func healRestore(cfg *Config, cli string, views []cmuxWsView, liveLocal map[stri
 			res.restored++
 			continue
 		}
-		// Tab exists: rebind it to the durable wrapper (the core fix), and
-		// if it's a local session whose tmux has died, revive the pane now.
+		// Remote tabs have no local resume binding (cmux-ssh manages their
+		// restore); a present one needs nothing here.
 		if e.Remote {
 			continue
 		}
+		// Tab exists: rebind it to the durable wrapper (the core fix), and if
+		// the session's tmux has died, revive the pane now.
 		script, updated, err := ensureDurableScript(cfg, e)
 		if err != nil || script == "" {
 			if err != nil {
@@ -219,7 +246,8 @@ func healRestore(cfg *Config, cli string, views []cmuxWsView, liveLocal map[stri
 		}
 		setCmuxResumeBinding(cli, w.id, sid, updated.Cwd, e.TabTitle, script)
 		res.healed++
-		if !liveLocal[e.TmuxName] {
+		alive := liveByServer[e.Server] != nil && liveByServer[e.Server][e.TmuxName]
+		if !alive {
 			if out, err := exec.Command(cli, "respawn-pane", "--workspace", w.id, "--surface", sid, "--command", script).CombinedOutput(); err != nil {
 				log().Debug("sync-revive-fail", "ws", e.WsTitle, "tab", e.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 			} else {
@@ -229,16 +257,21 @@ func healRestore(cfg *Config, cli string, views []cmuxWsView, liveLocal map[stri
 	}
 }
 
-// closeOrphans closes cctl-local tabs that should no longer exist: not in
-// the manifest and not currently alive in tmux. Workspaces emptied as a
-// result are closed too.
-func closeOrphans(cli string, views []cmuxWsView, liveLocal map[string]bool, res *syncResult) {
+// closeOrphans closes cctl tabs that should no longer exist: not in the
+// manifest and not currently alive in tmux, on any server. Workspaces
+// emptied as a result are closed too.
+func closeOrphans(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByServer map[string]map[string]bool, localName string, res *syncResult) {
 	desired := manifestTitleSet()
 	for _, w := range views {
 		repo, wt, ok := splitWsTitle(w.name)
 		if !ok {
 			continue
 		}
+		server := localName
+		if m, ok := wsMeta[w.id]; ok && m.server != "" {
+			server = m.server
+		}
+		live := liveByServer[server]
 		closedHere := 0
 		for _, sf := range w.surfaces {
 			if sf.title == "" {
@@ -247,17 +280,26 @@ func closeOrphans(cli string, views []cmuxWsView, liveLocal map[string]bool, res
 			if desired[w.name+"\x00"+sf.title] {
 				continue
 			}
-			if liveLocal[tmuxName(repo, wt, sf.title)] {
+			if live != nil && live[tmuxName(repo, wt, sf.title)] {
 				continue // never close a live session's tab
 			}
-			if !isCctlLocalSurface(cli, w.id, sf.id) {
-				continue // only close tabs we own
+			// Only close tabs we can positively identify as cctl's: local
+			// ones via their resume binding, remote ones via membership of a
+			// verified cctl "server/repo" group.
+			owned := false
+			if server == localName {
+				owned = isCctlLocalSurface(cli, w.id, sf.id)
+			} else {
+				owned = wsMeta[w.id].cctlRemote
+			}
+			if !owned {
+				continue
 			}
 			if out, err := exec.Command(cli, "close-surface", "--workspace", w.id, "--surface", sf.id).CombinedOutput(); err != nil {
 				log().Debug("sync-close-surface-fail", "ws", w.name, "tab", sf.title, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 				continue
 			}
-			log().Info("sync-close-orphan-tab", "ws", w.name, "tab", sf.title)
+			log().Info("sync-close-orphan-tab", "ws", w.name, "tab", sf.title, "server", server)
 			res.closed++
 			closedHere++
 		}
@@ -268,6 +310,68 @@ func closeOrphans(cli string, views []cmuxWsView, liveLocal map[string]bool, res
 			}
 		}
 	}
+}
+
+// wsMeta is what sync infers about a cmux workspace from the sidebar groups.
+type wsMeta struct {
+	server     string // server the workspace belongs to (localName if ungrouped)
+	cctlRemote bool   // member of a verified cctl "<remoteServer>/<repo>" group
+}
+
+// mapWorkspaceMeta derives, per cmux workspace UUID, which server it belongs
+// to. cctl files each workspace under a sidebar group named "server/repo"
+// for remotes and bare "repo" locally; a group whose prefix matches a
+// configured remote server marks its members as that server's (and as
+// cctl-owned remote workspaces, safe to close when dead).
+func mapWorkspaceMeta(cli string, cfg *Config, localName string) map[string]wsMeta {
+	out := map[string]wsMeta{}
+	for _, g := range listCmuxGroups(cli) {
+		meta := wsMeta{server: localName}
+		if prefix, _, found := strings.Cut(g.name, "/"); found {
+			if srv, ok := cfg.Servers[prefix]; ok && !srv.Local {
+				meta = wsMeta{server: prefix, cctlRemote: true}
+			}
+		}
+		for _, wsID := range g.members {
+			out[wsID] = meta
+		}
+	}
+	return out
+}
+
+// cmuxGroup is a sidebar group's name + member workspace UUIDs.
+type cmuxGroup struct {
+	name    string
+	members []string
+}
+
+// listCmuxGroups parses `workspace-group list --json` (uuid id-format) into
+// name + member ids. Empty on any failure.
+func listCmuxGroups(cli string) []cmuxGroup {
+	out, err := cmuxCmd(cli, "--id-format", "uuids", "workspace-group", "list", "--json").Output()
+	if err != nil {
+		return nil
+	}
+	return parseCmuxGroups(out)
+}
+
+// parseCmuxGroups extracts (name, member ids) from `workspace-group list
+// --json`. Split out for unit testing without a live cmux.
+func parseCmuxGroups(raw []byte) []cmuxGroup {
+	var payload struct {
+		Groups []struct {
+			Name    string   `json:"name"`
+			Members []string `json:"member_workspace_ids"`
+		} `json:"groups"`
+	}
+	if json.Unmarshal(raw, &payload) != nil {
+		return nil
+	}
+	var res []cmuxGroup
+	for _, g := range payload.Groups {
+		res = append(res, cmuxGroup{name: g.Name, members: g.Members})
+	}
+	return res
 }
 
 // ensureDurableScript returns the durable wrapper path for an entry,
