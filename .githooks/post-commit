@@ -20,6 +20,11 @@ root=$(git rev-parse --show-toplevel) || exit 0
 cd "$root" || exit 0
 [ -f VERSION ] || exit 0
 
+# Don't double-bump: if the commit already changed VERSION (e.g. this is
+# firing on a manual `git commit --amend` of an already-bumped commit, or the
+# author bumped by hand), leave it alone.
+git show --name-only --format= HEAD 2>/dev/null | grep -qx VERSION && exit 0
+
 subject=$(git log -1 --format=%s)
 body=$(git log -1 --format=%b)
 
