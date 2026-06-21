@@ -18,8 +18,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Version is overwritten at build time via -ldflags so `cctl --version`
-// shows the tagged release (or a commit hash) instead of "dev".
+// Version is the semver from the repo's VERSION file, injected at build time
+// via -ldflags (see the cctl:install mise task). The post-commit hook bumps
+// VERSION per Conventional Commit. Defaults to "dev" for plain `go build`.
 var Version = "dev"
 
 var configPath string
@@ -27,7 +28,6 @@ var configPath string
 var rootCmd = &cobra.Command{
 	Use:           "cctl",
 	Short:         "Manage mosh+tmux+claude sessions across remote servers",
-	Version:       Version,
 	SilenceUsage:  true,
 	SilenceErrors: true,
 	Args:          cobra.NoArgs,
@@ -51,6 +51,7 @@ Examples:
 }
 
 func init() {
+	rootCmd.Version = versionString()
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "path to cctl config (default: $CCTL_CONFIG or ~/.cctl.yaml)")
 
 	rootCmd.AddCommand(newClaudeCmd())
@@ -63,6 +64,7 @@ func init() {
 	rootCmd.AddCommand(newConfigCmd())
 	rootCmd.AddCommand(newInitCmd())
 	rootCmd.AddCommand(newDoctorCmd())
+	rootCmd.AddCommand(newVersionCmd())
 }
 
 // Run is the package's CLI entry point. It wires up logging, executes the

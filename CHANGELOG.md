@@ -1,0 +1,55 @@
+# Changelog
+
+All notable changes to cctl are documented here. The format is based on
+[Keep a Changelog](https://keepachangelog.com/), and the project follows
+[Semantic Versioning](https://semver.org/).
+
+Versions and the entries below are bumped automatically from
+[Conventional Commit](https://www.conventionalcommits.org/) subjects by the
+`post-commit` hook (`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING
+CHANGE` → major). Run `mise run hooks:setup` once to enable it. New version
+sections are inserted just below this line:
+
+<!-- BUMP -->
+
+## [0.1.0] - 2026-06-21
+
+Baseline release — summarizes everything prior to automated versioning.
+
+### Added
+- Interactive Bubble Tea TUI plus a cobra CLI (`claude`, `ls`, `rm`, `rma`,
+  `servers`, `repos`, `ssh`, `config`, `init`, `doctor`) for managing
+  mosh + tmux + Claude Code sessions across local and remote git checkouts.
+- Git-worktree-per-session model with auto branch naming and configurable
+  `worktree_post_create` hooks.
+- Repo auto-discovery from `repo_sources`, with collision-resolved names.
+- cmux integration: one sidebar group per repo, one workspace per worktree,
+  one tab per session; `cctl init cmux` curates `cmux.json` + agent hooks.
+- `t` opens a plain-shell terminal tab on a worktree.
+- Remote claude → cmux notification bridge over an ssh-tailed
+  `~/.cctl/notify.jsonl`.
+- Per-server `cmux-ssh` transport: remote-SSH workspaces with a remote Files
+  panel, falling back to the mosh wrapper.
+- Reboot-resilient restore: durable wrapper scripts under `~/.cctl/spawn`,
+  explicit cmux resume bindings, a `~/.cctl/workspaces.json` manifest, and a
+  single cmux↔cctl reconcile bound to `R`, `S`, and an automatic startup
+  pass (adopt → heal → restore → close).
+- Persistent `cctl` control workspace (`cctl init cmux`) so the TUI survives
+  cmux restarts and relaunches + reconciles after a reboot.
+- `defaults.sync_all_servers` (default true): reconcile liveness + close
+  stale tabs across every server, not just local.
+- Background-task tracking in the TUI (the footer queue) so concurrent
+  actions don't race.
+
+### Changed
+- Session attach resurrects a dead tmux session (`new-session -A`) instead of
+  failing with "can't find session".
+- tmux session names are sanitized exactly as tmux does, with the TUI mapping
+  parsed names back to real repo/worktree names.
+
+### Fixed
+- One repo now maps to exactly one cmux sidebar group — nested `.git` dirs
+  (submodules, vendored clones) are no longer surfaced as separate repos.
+- Startup sync waits for every server to settle before reconciling (no longer
+  races ahead of remote fetches), and prunes tabs with no live session.
+- Worktree removal handles git-registered worktrees outside `worktree_base`.

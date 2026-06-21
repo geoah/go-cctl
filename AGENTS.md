@@ -125,3 +125,26 @@ mise run cctl:install            # MANDATORY — every change, not just "final" 
 version upgrades and stays on `$PATH` even when mise's go shim isn't
 active. If you made several edits across a turn, install at the end of
 the turn so the running binary always reflects the latest code.
+
+## Versioning + changelog (automated)
+
+The repo is [semver](https://semver.org/)'d via the `VERSION` file, surfaced
+by `cctl version` (injected at build time from `VERSION` + the short SHA).
+
+A `post-commit` git hook auto-bumps `VERSION` and prepends a `CHANGELOG.md`
+entry from the [Conventional Commit](https://www.conventionalcommits.org/)
+subject, **folding both into the commit you just made** (via a guarded
+`--amend`). Mapping: `feat:` → minor, `fix:`/`perf:` → patch, `<type>!:` or a
+`BREAKING CHANGE` body → major; other types (`docs`/`chore`/`refactor`/
+`test`/`ci`/`build`/`style`) don't bump. `chore(release)` / `[skip bump]`
+subjects are skipped.
+
+Enable it once per clone:
+
+```bash
+mise run hooks:setup    # sets core.hooksPath=.githooks
+```
+
+So: **write Conventional Commit subjects.** The hook does the rest — no manual
+version edits, no manual changelog. To bypass for a one-off, commit with
+`CCTL_NO_BUMP=1 git commit …` or include `[skip bump]` in the subject.

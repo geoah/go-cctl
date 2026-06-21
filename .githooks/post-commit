@@ -1,0 +1,61 @@
+#!/bin/sh
+# cctl auto-versioning. Bumps VERSION (semver) and prepends a CHANGELOG entry
+# based on the Conventional Commit subject, folding the result into the commit
+# just made. Install with `mise run hooks:setup` (sets core.hooksPath).
+#
+#   feat: …            -> minor
+#   fix: / perf: …     -> patch
+#   <type>!: … / body "BREAKING CHANGE" -> major
+#   anything else (docs/chore/refactor/test/ci/build/style) -> no bump
+#
+# Guards: skip when CCTL_NO_BUMP is set (so the amend below doesn't recurse),
+# during rebase/merge/cherry-pick, and for release/[skip bump] commits.
+[ -n "${CCTL_NO_BUMP:-}" ] && exit 0
+
+git_dir=$(git rev-parse --git-dir 2>/dev/null) || exit 0
+for m in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD; do
+	[ -e "$git_dir/$m" ] && exit 0
+done
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+[ -f VERSION ] || exit 0
+
+subject=$(git log -1 --format=%s)
+body=$(git log -1 --format=%b)
+
+case "$subject" in
+	chore\(release\)*|*"[skip bump]"*) exit 0 ;;
+esac
+
+bump=
+case "$subject" in
+	*!:*) bump=major ;;
+	feat*) bump=minor ;;
+	fix*|perf*) bump=patch ;;
+esac
+printf '%s' "$body" | grep -q "BREAKING CHANGE" && bump=major
+[ -z "$bump" ] && exit 0
+
+ver=$(cat VERSION 2>/dev/null || echo 0.0.0)
+major=${ver%%.*}; rest=${ver#*.}; minor=${rest%%.*}; patch=${rest##*.}
+case "$major.$minor.$patch" in *[!0-9.]*) major=0; minor=0; patch=0 ;; esac
+case "$bump" in
+	major) major=$((major + 1)); minor=0; patch=0 ;;
+	minor) minor=$((minor + 1)); patch=0 ;;
+	patch) patch=$((patch + 1)) ;;
+esac
+new="$major.$minor.$patch"
+printf '%s\n' "$new" > VERSION
+
+if [ -f CHANGELOG.md ] && grep -q '<!-- BUMP -->' CHANGELOG.md; then
+	ef=$(mktemp); tmp=$(mktemp)
+	printf '\n## [%s] - %s\n- %s\n' "$new" "$(date +%Y-%m-%d)" "$subject" > "$ef"
+	awk -v ef="$ef" '{print} /<!-- BUMP -->/ && !d {while ((getline l < ef) > 0) print l; d=1}' CHANGELOG.md > "$tmp" && mv "$tmp" CHANGELOG.md
+	rm -f "$ef"
+	add_changelog=CHANGELOG.md
+fi
+
+# Fold VERSION (+ CHANGELOG) into the commit. --no-verify avoids re-running
+# pre-commit/commit-msg; CCTL_NO_BUMP stops the re-fired post-commit recursing.
+CCTL_NO_BUMP=1 git commit --amend --no-edit --no-verify -- VERSION $add_changelog >/dev/null 2>&1 \
+	|| echo "cctl: version bump amend failed — VERSION/CHANGELOG left modified" >&2
