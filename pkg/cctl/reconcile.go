@@ -209,13 +209,10 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		srvByWs[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e.Server
 	}
 	for _, w := range views {
-		repo, wt, sess, ok := parseWsTitle(w.name)
-		if !ok {
-			continue // not a cctl repo/worktree/session workspace
-		}
-		server := localName
-		if m, ok := wsMeta[w.id]; ok && m.server != "" {
-			server = m.server
+		meta := wsMeta[w.id]
+		server := meta.server
+		if server == "" {
+			server = localName
 		}
 		if s, ok := srvByWs[w.name]; ok {
 			server = s
@@ -224,17 +221,33 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		if live == nil {
 			continue // server unreachable — can't tell; leave it
 		}
-		if live[tmuxName(repo, wt, sess)] {
-			continue // alive — keep
-		}
-		// Dead. Close only workspaces we own: tracked in the manifest, or in a
-		// verified cctl remote group.
-		owned := desired[w.name]
-		if !owned && server != localName {
-			owned = wsMeta[w.id].cctlRemote
-		}
-		if !owned {
-			continue
+		// inCctlRemoteGroup: cmux would never name a group "<remoteServer>/repo"
+		// itself, so a member whose name sits under that repo is unambiguously
+		// a cctl workspace — safe to close even legacy two-part ones.
+		inCctlRemoteGroup := meta.remote && meta.repoRoot != "" && strings.HasPrefix(w.name, meta.repoRoot+"/")
+
+		parts := strings.Split(w.name, "/")
+		switch len(parts) {
+		case 3:
+			repo, wt, sess := parts[0], parts[1], parts[2]
+			if live[tmuxName(repo, wt, sess)] {
+				continue // alive — keep
+			}
+			if !desired[w.name] && !inCctlRemoteGroup {
+				continue // dead but not provably ours
+			}
+		case 2:
+			// Legacy name (no session). Only act inside a verified cctl remote
+			// group; close when no session on that worktree is alive. Local
+			// two-part groups can be cmux's own project grouping — leave them.
+			if !inCctlRemoteGroup {
+				continue
+			}
+			if anyLiveForWorktree(live, parts[0], parts[1]) {
+				continue // a session there is alive — migration will rename it
+			}
+		default:
+			continue // "cctl" control workspace, user workspaces, etc.
 		}
 		if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
 			log().Debug("sync-close-workspace-fail", "ws", w.name, "err", err.Error(), "out", strings.TrimSpace(string(out)))
@@ -374,29 +387,48 @@ func restoreFromManifest(cfg *Config) syncResult {
 
 // wsMeta is what sync infers about a cmux workspace from the sidebar groups.
 type wsMeta struct {
-	server     string // server the workspace belongs to (localName if ungrouped)
-	cctlRemote bool   // member of a verified cctl "<remoteServer>/<repo>" group
+	server   string // server the workspace belongs to (localName if ungrouped)
+	remote   bool   // member of a verified cctl "<remoteServer>/<repo>" group
+	repoRoot string // the repo component of that group, e.g. "olympus"
 }
 
 // mapWorkspaceMeta derives, per cmux workspace UUID, which server it belongs
-// to. cctl files each workspace under a sidebar group named "server/repo"
-// for remotes and bare "repo" locally; a group whose prefix matches a
-// configured remote server marks its members as that server's (and as
-// cctl-owned remote workspaces, safe to close when dead).
+// to and the repo of its cctl sidebar group. cctl files each workspace under a
+// group named "server/repo" for remotes and bare "repo" locally; a group
+// whose prefix matches a configured remote server marks its members as that
+// server's (and, since cmux would never name a group "<remoteServer>/<repo>"
+// on its own, as unambiguously cctl-owned).
 func mapWorkspaceMeta(cli string, cfg *Config, localName string) map[string]wsMeta {
 	out := map[string]wsMeta{}
 	for _, g := range listCmuxGroups(cli) {
-		meta := wsMeta{server: localName}
-		if prefix, _, found := strings.Cut(g.name, "/"); found {
-			if srv, ok := cfg.Servers[prefix]; ok && !srv.Local {
-				meta = wsMeta{server: prefix, cctlRemote: true}
-			}
-		}
+		meta := deriveWsMeta(g.name, cfg, localName)
 		for _, wsID := range g.members {
 			out[wsID] = meta
 		}
 	}
 	return out
+}
+
+// deriveWsMeta classifies a cctl sidebar group name. Split out for testing.
+func deriveWsMeta(groupName string, cfg *Config, localName string) wsMeta {
+	if prefix, rest, found := strings.Cut(groupName, "/"); found {
+		if srv, ok := cfg.Servers[prefix]; ok && !srv.Local {
+			return wsMeta{server: prefix, remote: true, repoRoot: rest}
+		}
+	}
+	return wsMeta{server: localName, repoRoot: groupName}
+}
+
+// anyLiveForWorktree reports whether any cctl session on a worktree is alive,
+// used to decide a legacy two-part workspace (no session in its name) is dead.
+func anyLiveForWorktree(live map[string]bool, repo, worktree string) bool {
+	prefix := sessionPrefix + tmuxSafeName(repo) + "/" + tmuxSafeName(worktree) + "/"
+	for k := range live {
+		if strings.HasPrefix(k, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // cmuxGroup is a sidebar group's name + member workspace UUIDs.

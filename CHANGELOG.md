@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.2.3] - 2026-06-21
+- fix(sync): close dead legacy 2-part workspaces in remote cctl groups
+
 ## [0.2.2] - 2026-06-21
 - fix(cmux): one workspace per session (name includes session); de-dup
 

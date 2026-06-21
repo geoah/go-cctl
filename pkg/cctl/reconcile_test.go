@@ -260,34 +260,22 @@ func TestParseCmuxGroups(t *testing.T) {
 
 // TestMapWorkspaceMeta_ServerDerivation: a "<remoteServer>/repo" group marks
 // members as that remote server's (and cctl-owned); a bare-repo group → local.
-func TestMapWorkspaceMeta_ServerDerivation(t *testing.T) {
+func TestDeriveWsMeta(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"mac":       {Local: true},
 		"workspace": {Host: "h"},
 	}}
-	// Stand in for listCmuxGroups by exercising the mapping logic via the
-	// same derivation mapWorkspaceMeta uses: build it manually.
-	groups := []cmuxGroup{
-		{name: "workspace/olympus", members: []string{"WS1"}},
-		{name: "rxtx.dev", members: []string{"WS2"}},
+	// A "<remoteServer>/<repo>" group → that server, marked remote+owned.
+	if m := deriveWsMeta("workspace/olympus", cfg, "mac"); m.server != "workspace" || !m.remote || m.repoRoot != "olympus" {
+		t.Errorf("remote group: got %+v", m)
 	}
-	out := map[string]wsMeta{}
-	for _, g := range groups {
-		meta := wsMeta{server: "mac"}
-		if prefix, _, found := strings.Cut(g.name, "/"); found {
-			if srv, ok := cfg.Servers[prefix]; ok && !srv.Local {
-				meta = wsMeta{server: prefix, cctlRemote: true}
-			}
-		}
-		for _, id := range g.members {
-			out[id] = meta
-		}
+	// A bare local repo group → local, not remote.
+	if m := deriveWsMeta("rxtx.dev", cfg, "mac"); m.server != "mac" || m.remote || m.repoRoot != "rxtx.dev" {
+		t.Errorf("local group: got %+v", m)
 	}
-	if out["WS1"].server != "workspace" || !out["WS1"].cctlRemote {
-		t.Errorf("WS1 should map to remote server workspace; got %+v", out["WS1"])
-	}
-	if out["WS2"].server != "mac" || out["WS2"].cctlRemote {
-		t.Errorf("WS2 (bare repo group) should map local, non-remote; got %+v", out["WS2"])
+	// A "/"-containing name whose prefix isn't a known remote server → local.
+	if m := deriveWsMeta("a/b", cfg, "mac"); m.server != "mac" || m.remote {
+		t.Errorf("unknown-prefix group should be local: got %+v", m)
 	}
 }
 
