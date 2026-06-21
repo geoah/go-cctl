@@ -254,35 +254,37 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 //
 // Note: `workspace-group create` defaults --from to the user's current
 // sidebar selection, so we always pass the workspace id explicitly.
-func ensureCmuxGroupMembership(cli, group, groupCwd, wsID string) {
+func ensureCmuxGroupMembership(cli, group, groupCwd, wsID string) error {
 	if group == "" || wsID == "" {
-		return
+		return nil
 	}
 	if gid, ok := findCmuxGroupByName(cli, group); ok {
-		out, err := exec.Command(cli, "workspace-group", "add", "--group", gid, "--workspace", wsID).CombinedOutput()
+		out, err := cmuxCmd(cli, "workspace-group", "add", "--group", gid, "--workspace", wsID).CombinedOutput()
 		if err != nil {
-			log().Debug("cmux-group-add-fail", "group", group, "gid", gid, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
-			return
+			// Visible (Warn): a failed add is why a workspace stays ungrouped.
+			log().Warn("cmux-group-add-fail", "group", group, "gid", gid, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			return fmt.Errorf("group-add %q: %w", group, err)
 		}
 		log().Debug("cmux-group-add", "group", group, "gid", gid, "ws", wsID)
-		return
+		return nil
 	}
 	args := []string{"workspace-group", "create", "--name", group, "--from", wsID}
 	if groupCwd != "" {
 		args = append(args, "--cwd", groupCwd)
 	}
-	if out, err := exec.Command(cli, args...).CombinedOutput(); err != nil {
-		log().Debug("cmux-group-create-fail", "group", group, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
-		return
+	if out, err := cmuxCmd(cli, args...).CombinedOutput(); err != nil {
+		log().Warn("cmux-group-create-fail", "group", group, "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		return fmt.Errorf("group-create %q: %w", group, err)
 	}
 	log().Info("cmux-group-create", "group", group, "ws", wsID)
+	return nil
 }
 
 // findCmuxGroupByName looks a sidebar group up by exact name via
 // `workspace-group list --json` and returns its id. The JSON payload is
 // {"groups":[{"id":…,"name":…,…}]} (see cmux's v2WorkspaceGroupPayload).
 func findCmuxGroupByName(cli, name string) (string, bool) {
-	out, err := exec.Command(cli, "workspace-group", "list", "--json").Output()
+	out, err := cmuxCmd(cli, "workspace-group", "list", "--json").Output()
 	if err != nil {
 		return "", false
 	}

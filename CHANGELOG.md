@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.5.1] - 2026-06-21
+- fix(cmux): harden + surface workspace grouping on sync
+
 ## [0.5.0] - 2026-06-21
 - feat(tui): full-width tree + bottom key hints; pin & redden cctl's workspace
 

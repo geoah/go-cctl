@@ -1846,7 +1846,8 @@ func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
 func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 	return func() tea.Msg {
 		res := syncCmuxState(m.cfg)
-		log().Info("tui-sync", "closed", res.closed, "adopted", res.adopted,
+		log().Info("tui-sync", "closed", res.closed, "renamed", res.migrated,
+			"grouped", res.grouped, "adopted", res.adopted,
 			"restored", res.restored, "errs", res.errs)
 		msg := res.summary()
 		if !res.touched() {

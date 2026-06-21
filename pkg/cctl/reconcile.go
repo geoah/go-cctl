@@ -329,9 +329,13 @@ func ensureRepoGrouping(cli string, cfg *Config, localName string, views []cmuxW
 		} else if r, ok := localRepos[repo]; ok {
 			group, groupCwd = repo, expandPath(r.Path)
 		} else {
+			log().Debug("sync-group-skip", "ws", w.name, "reason", "repo not a known local repo and not tracked/remote")
 			continue // can't place it safely
 		}
-		ensureCmuxGroupMembership(cli, group, groupCwd, w.id)
+		if err := ensureCmuxGroupMembership(cli, group, groupCwd, w.id); err != nil {
+			continue // ensureCmuxGroupMembership already logged the failure
+		}
+		log().Info("sync-group", "ws", w.name, "group", group)
 		grouped++
 	}
 	return grouped
