@@ -1,6 +1,7 @@
 package cctl
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -294,6 +295,64 @@ func TestMapWorkspaceMeta_ServerDerivation(t *testing.T) {
 	}
 	if out["WS2"].server != "mac" || out["WS2"].cctlRemote {
 		t.Errorf("WS2 (bare repo group) should map local, non-remote; got %+v", out["WS2"])
+	}
+}
+
+// TestStripCctlResumeCommands pins the cmux.json cleanup that kills the
+// "auto restore?" prompt spam: drop source=cctl resume bindings, keep
+// everything else, idempotent, and never corrupt the file.
+func TestStripCctlResumeCommands(t *testing.T) {
+	in := []byte(`{
+		"app": {"x": 1},
+		"terminal": {
+			"autoResumeAgentSessions": true,
+			"resumeCommands": [
+				{"name": "a", "source": "cctl"},
+				{"name": "b", "source": "claude"},
+				{"name": "c", "source": "cctl"}
+			]
+		}
+	}`)
+	out, removed := stripCctlResumeCommands(in)
+	if removed != 2 {
+		t.Fatalf("removed=%d, want 2", removed)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatalf("output is not valid JSON: %v", err)
+	}
+	term := doc["terminal"].(map[string]any)
+	if rc := term["resumeCommands"].([]any); len(rc) != 1 {
+		t.Fatalf("want 1 non-cctl entry kept, got %d", len(rc))
+	}
+	if term["autoResumeAgentSessions"] != true {
+		t.Error("unrelated terminal keys must be preserved")
+	}
+	if doc["app"] == nil {
+		t.Error("unrelated top-level keys must be preserved")
+	}
+
+	// Idempotent: a second pass changes nothing.
+	if _, r := stripCctlResumeCommands(out); r != 0 {
+		t.Errorf("second pass removed=%d, want 0", r)
+	}
+
+	// All-cctl → the empty resumeCommands key is dropped entirely.
+	o2, r := stripCctlResumeCommands([]byte(`{"terminal":{"resumeCommands":[{"source":"cctl"}]}}`))
+	if r != 1 {
+		t.Fatalf("all-cctl removed=%d, want 1", r)
+	}
+	var d2 map[string]any
+	_ = json.Unmarshal(o2, &d2)
+	if _, has := d2["terminal"].(map[string]any)["resumeCommands"]; has {
+		t.Error("emptied resumeCommands should be removed")
+	}
+
+	// No terminal / no resumeCommands / garbage → no change, no panic.
+	for _, raw := range []string{`{"app":{}}`, `{"terminal":{}}`, `not json`} {
+		if _, r := stripCctlResumeCommands([]byte(raw)); r != 0 {
+			t.Errorf("input %q: removed=%d, want 0", raw, r)
+		}
 	}
 }
 

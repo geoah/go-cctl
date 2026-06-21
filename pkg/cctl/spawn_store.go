@@ -195,33 +195,88 @@ func cmuxSupports(cli, method string) bool {
 	return cmuxCapsCache[method]
 }
 
-// setCmuxResumeBinding tells cmux to replay `script` (our durable wrapper)
-// when it restores this surface, so a reboot resurrects+resumes the session
-// instead of replaying a stale command. Best-effort and capability-gated;
-// metadata-only (it never disturbs a live pane), so it's always safe to set.
-func setCmuxResumeBinding(cli, wsID, surfaceID, cwd, name, script string) {
-	if cli == "" || wsID == "" || surfaceID == "" || script == "" {
-		return
+// pruneCctlResumeCommands removes cmux "resume command" bindings cctl created
+// in earlier versions (source=cctl). Those accumulate in cmux.json and make
+// cmux pop up "auto restore?" prompts on launch; cctl no longer creates them
+// (it relies on cmux replaying a surface's own durable-wrapper command), so
+// this cleans up the legacy cruft. Best-effort; writes cmux.json + reloads.
+func pruneCctlResumeCommands(cli string) int {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return 0
 	}
-	if !cmuxSupports(cli, "surface.resume.set") {
-		return
+	path := filepath.Join(home, ".config", "cmux", "cmux.json")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0
 	}
-	args := []string{"surface", "resume", "set",
-		"--workspace", wsID, "--surface", surfaceID,
-		"--kind", "tmux", "--source", "cctl"}
-	if name != "" {
-		args = append(args, "--name", name)
+	out, removed := stripCctlResumeCommands(raw)
+	if removed == 0 {
+		return 0
 	}
-	if cwd != "" {
-		args = append(args, "--cwd", cwd)
+	tmp := path + ".cctl-tmp"
+	if os.WriteFile(tmp, out, 0o644) != nil {
+		return 0
 	}
-	args = append(args, "--shell", script)
-	if out, err := cmuxCmd(cli, args...).CombinedOutput(); err != nil {
-		log().Debug("cmux-resume-set-fail", "ws", wsID, "surface", surfaceID,
-			"err", err.Error(), "out", strings.TrimSpace(string(out)))
-		return
+	if os.Rename(tmp, path) != nil {
+		os.Remove(tmp)
+		return 0
 	}
-	log().Debug("cmux-resume-set", "ws", wsID, "surface", surfaceID, "script", script)
+	_ = cmuxCmd(cli, "reload-config").Run()
+	log().Info("cmux-prune-resume-commands", "removed", removed)
+	return removed
+}
+
+// stripCctlResumeCommands removes terminal.resumeCommands entries with
+// source=="cctl" from a cmux.json document, returning the rewritten JSON
+// (indented, trailing newline) and how many were removed. Returns (nil, 0)
+// when nothing changed or the document can't be parsed as strict JSON (so a
+// JSONC file with comments is left untouched). Pure — unit-testable.
+func stripCctlResumeCommands(raw []byte) ([]byte, int) {
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(raw, &doc) != nil {
+		return nil, 0
+	}
+	termRaw, ok := doc["terminal"]
+	if !ok {
+		return nil, 0
+	}
+	var term map[string]json.RawMessage
+	if json.Unmarshal(termRaw, &term) != nil {
+		return nil, 0
+	}
+	rcRaw, ok := term["resumeCommands"]
+	if !ok {
+		return nil, 0
+	}
+	var rc []map[string]any
+	if json.Unmarshal(rcRaw, &rc) != nil {
+		return nil, 0
+	}
+	kept := make([]map[string]any, 0, len(rc))
+	for _, c := range rc {
+		if s, _ := c["source"].(string); s == "cctl" {
+			continue
+		}
+		kept = append(kept, c)
+	}
+	removed := len(rc) - len(kept)
+	if removed == 0 {
+		return nil, 0
+	}
+	if len(kept) == 0 {
+		delete(term, "resumeCommands")
+	} else {
+		b, _ := json.Marshal(kept)
+		term["resumeCommands"] = b
+	}
+	tb, _ := json.Marshal(term)
+	doc["terminal"] = tb
+	out, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, 0
+	}
+	return append(out, '\n'), removed
 }
 
 // cmuxResumeBinding returns the command currently bound to a surface's
@@ -360,49 +415,31 @@ func writeControlScript() (string, error) {
 	return path, nil
 }
 
-// ensureCctlControlWorkspace makes the cctl TUI a persistent cmux workspace:
-// it pins the "cctl" workspace's surface resume binding to the durable
-// control wrapper (creating that workspace if absent). Idempotent. Needs to
-// run from inside cmux (socket auth); returns an error otherwise so the
-// caller can hint at that.
+// ensureCctlControlWorkspace makes the cctl TUI a persistent cmux workspace
+// so it reopens with cmux: a "cctl" workspace whose surface command is the
+// durable control wrapper, which cmux replays on restart/reboot. No resume
+// binding (those spam cmux's restore prompts) — just the surface command.
+//
+// If a "cctl" workspace already exists it's left alone (it already runs cctl,
+// which cmux replays); we never respawn it, so this won't restart a running
+// TUI. Needs to run from inside cmux (socket auth).
 func ensureCctlControlWorkspace(cli string) error {
 	if cli == "" {
 		return fmt.Errorf("cmux CLI not found")
+	}
+	if _, ok := findCmuxWorkspaceByName(cli, "cctl"); ok {
+		log().Info("cctl-control-workspace-exists")
+		return nil
 	}
 	script, err := writeControlScript()
 	if err != nil {
 		return fmt.Errorf("write control wrapper: %w", err)
 	}
 	home, _ := os.UserHomeDir()
-	id, ok := findCmuxWorkspaceByName(cli, "cctl")
-	if !ok {
-		out, err := cmuxCmd(cli, "new-workspace", "--name", "cctl", "--cwd", home,
-			"--command", script, "--focus", "true").CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("create cctl workspace: %w: %s", err, strings.TrimSpace(string(out)))
-		}
-		if id, ok = findCmuxWorkspaceByName(cli, "cctl"); !ok {
-			return fmt.Errorf("created cctl workspace but couldn't find it afterwards")
-		}
+	if out, err := cmuxCmd(cli, "new-workspace", "--name", "cctl", "--cwd", home,
+		"--command", script, "--focus", "false").CombinedOutput(); err != nil {
+		return fmt.Errorf("create cctl workspace: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	surfaces := listCmuxSurfaces(cli, id)
-	sid := ""
-	for _, s := range surfaces {
-		if s.title == "cctl" {
-			sid = s.id
-			break
-		}
-	}
-	if sid == "" && len(surfaces) > 0 {
-		sid = surfaces[0].id
-	}
-	if sid == "" {
-		return fmt.Errorf("cctl workspace has no surface to bind")
-	}
-	if !cmuxSupports(cli, "surface.resume.set") {
-		return fmt.Errorf("this cmux build lacks surface resume bindings; control pane not persisted")
-	}
-	setCmuxResumeBinding(cli, id, sid, home, "cctl", script)
-	log().Info("cctl-control-workspace", "ws", id, "surface", sid, "script", script)
+	log().Info("cctl-control-workspace-created", "script", script)
 	return nil
 }

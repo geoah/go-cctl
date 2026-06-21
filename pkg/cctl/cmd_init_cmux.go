@@ -207,6 +207,12 @@ func runInitCmux(force, skipHooks, skipReload, skipControl bool) error {
 		}
 	}
 
+	// Clear any legacy cctl resume-command bindings that made cmux pop up
+	// "auto restore?" prompts — cctl no longer creates them.
+	if n := pruneCctlResumeCommands(cli); n > 0 {
+		fmt.Fprintf(os.Stderr, "cmux: removed %d stale cctl resume binding(s) (restore-prompt spam)\n", n)
+	}
+
 	if !skipControl {
 		// Make the cctl TUI a durable cmux workspace so it survives cmux
 		// restarts and relaunches (and reconciles) after a reboot. Requires

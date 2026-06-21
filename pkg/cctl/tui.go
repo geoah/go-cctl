@@ -1213,11 +1213,15 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = "" // hide any earlier error so the red prompt below stands alone
 		m.statusMsg = ""
 		return m, nil
-	case "R", "S":
-		// R and S are aliases: both run the full cmux↔cctl sync (restore
-		// missing tabs, heal resume bindings, close tabs for gone sessions).
+	case "S":
+		// Sync: make cmux match what's running — close tabs for dead
+		// sessions (also the automatic startup pass). Never revives.
 		m.clearPending()
 		return m.syncCmux()
+	case "R":
+		// Restore: bring back tracked sessions that aren't up (resumed).
+		m.clearPending()
+		return m.restoreCmux()
 	case "U":
 		// UU, same arming flow as dd: upgrading claude restarts every
 		// claude session on the target server (killing whatever they
@@ -1253,7 +1257,7 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · R/S sync · UU upgrade · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · S sync · R restore · UU upgrade · / filter · r refresh · q quit"
 	default:
 		// any other key cancels a pending dd/UU so the next press starts fresh
 		m.clearPending()
@@ -1751,12 +1755,12 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 	}
 }
 
-// syncCmux handles R and S (and the startup pass) — they're all the same
-// operation: one reconcile that makes cmux match cctl. It adopts live
-// sessions into the durable manifest, heals every cctl tab's resume binding
-// to its reboot-proof wrapper, restores tabs that went missing (reviving and
-// resuming dead sessions), and closes tabs for sessions that are gone. See
-// syncCmuxState for the full algorithm and its safety rails.
+// syncCmux is the S key and the automatic startup pass: one reconcile that
+// makes cmux match what's actually running — adopt live sessions into the
+// durable manifest and CLOSE tabs whose tmux session is dead. It never revives
+// sessions or sets cmux resume bindings (that churn is what triggered cmux's
+// "auto restore?" prompts); bringing sessions back is the R key. See
+// syncCmuxState for the algorithm and safety rails.
 func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
 	id, tick := m.startTask("", "syncing cmux ↔ cctl…")
 	return m, tea.Batch(tick, m.syncCmd(id, false))
@@ -1768,8 +1772,8 @@ func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
 func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 	return func() tea.Msg {
 		res := syncCmuxState(m.cfg)
-		log().Info("tui-sync", "restored", res.restored, "healed", res.healed,
-			"closed", res.closed, "adopted", res.adopted, "errs", res.errs)
+		log().Info("tui-sync", "closed", res.closed, "adopted", res.adopted,
+			"restored", res.restored, "errs", res.errs)
 		msg := res.summary()
 		if !res.touched() {
 			if quiet {
@@ -1778,10 +1782,30 @@ func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 				msg = "cmux already in sync with cctl"
 			}
 		}
-		// Reload the tree so revived/closed sessions show up — but only
-		// when something actually changed, to avoid a needless refresh
-		// storm on every quiet startup pass.
+		// Reload the tree so closed sessions disappear — but only when
+		// something actually changed, to avoid a needless refresh storm on
+		// every quiet startup pass.
 		return actionDoneMsg{msg: msg, refreshAll: res.touched(), taskID: taskID}
+	}
+}
+
+// restoreCmux is the R key: bring back tracked sessions that aren't currently
+// up (resumed via the durable wrapper). Explicit and separate from the
+// automatic sync, so reopening tabs never surprises the user.
+func (m *tuiModel) restoreCmux() (tea.Model, tea.Cmd) {
+	id, tick := m.startTask("", "restoring sessions from manifest…")
+	return m, tea.Batch(tick, m.restoreCmd(id))
+}
+
+func (m *tuiModel) restoreCmd(taskID int) tea.Cmd {
+	return func() tea.Msg {
+		res := restoreFromManifest(m.cfg)
+		log().Info("tui-restore", "restored", res.restored, "errs", res.errs)
+		msg := fmt.Sprintf("restored %d session(s)", res.restored)
+		if res.restored == 0 && res.errs == 0 {
+			msg = "nothing to restore — every tracked session is already up"
+		}
+		return actionDoneMsg{msg: msg, refreshAll: res.restored > 0, taskID: taskID}
 	}
 }
 
@@ -2660,7 +2684,8 @@ var sidebarKeys = []string{
 	"n   new session",
 	"t   terminal",
 	"dd  delete",
-	"R/S sync cmux",
+	"S   sync (close dead)",
+	"R   restore sessions",
 	"UU  upgrade claude",
 	"/   filter",
 	"r   refresh",
@@ -3046,7 +3071,8 @@ var legendLines = []string{
 	"n         new session on selected row",
 	"t         plain terminal on selected worktree (no claude)",
 	"dd        delete (worktree or session — never the repo) + close its tab",
-	"R / S     sync cmux ↔ cctl: restore missing tabs, heal, close gone ones",
+	"S         sync cmux: close tabs whose tmux session is gone (also on launch)",
+	"R         restore: reopen tracked sessions that aren't running (resumed)",
 	"UU        upgrade claude on selected server + restart its sessions",
 	"/         filter (k9s-style)",
 	"r         refresh",

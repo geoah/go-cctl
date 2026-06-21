@@ -243,12 +243,6 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 		if err != nil {
 			log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
-		// Pin the freshly created tab's resume binding to the durable
-		// wrapper (new local workspaces only; bindCmuxResume no-ops for
-		// remote/identity-less specs).
-		if sid, ok := findCmuxSurfaceByTitle(cli, id, spec.TabTitle); ok {
-			bindCmuxResume(cli, id, sid, spec)
-		}
 	}
 	ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
 }
@@ -327,22 +321,23 @@ func parseCmuxGroupList(raw, name string) (string, bool) {
 
 // addCmuxTab makes the session's tab exist in an existing workspace and run
 // `tabCommand`. If a same-titled tab is already there — the common case on
-// restore, where cmux re-created a now-dead tab — it heals that tab in place
-// (respawn + rebind) instead of stacking a duplicate; otherwise it opens a
-// fresh surface. Either way it pins the surface's cmux resume binding to the
-// durable wrapper so a reboot resurrects+resumes the session. Returns an
-// error if the surface can't be created or its id can't be determined — the
-// caller falls back to a separate workspace in that case.
+// restore, where cmux re-created a now-dead tab — it respawns that tab in
+// place instead of stacking a duplicate; otherwise it opens a fresh surface.
+// Returns an error if the surface can't be created or its id can't be
+// determined — the caller falls back to a separate workspace in that case.
+//
+// No cmux "resume binding" is set: those accumulate in cmux.json and trigger
+// cmux's restore prompts. cmux replays a surface's own command on restore,
+// and the command here is cctl's durable ~/.cctl/spawn wrapper, so a reboot
+// re-runs `tmux new-session -A` (→ claude --continue) without a binding.
 func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 	// Reuse an existing same-titled tab when present: this is what makes
-	// restore idempotent (no duplicate tabs) and heals the stale-command
-	// tabs that motivated all this.
+	// restore idempotent (no duplicate tabs).
 	if spec.TabTitle != "" {
 		if sid, ok := findCmuxSurfaceByTitle(cli, wsID, spec.TabTitle); ok {
 			if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
 				return fmt.Errorf("respawn-pane (heal existing tab): %w: %s", err, strings.TrimSpace(string(out)))
 			}
-			bindCmuxResume(cli, wsID, sid, spec)
 			if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
 				log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 			}
@@ -377,25 +372,12 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 			log().Debug("cmux-rename-tab-fail", "surface", sid, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
-	bindCmuxResume(cli, wsID, sid, spec)
 	// Land the user on the workspace; the new surface was created with
 	// --focus true so the right tab is already selected within it.
 	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
 		log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 	}
 	return nil
-}
-
-// bindCmuxResume pins a surface's cmux resume binding to cctl's durable
-// wrapper so a reboot replays it (tmux new-session -A → claude --continue)
-// rather than a vanished $TMPDIR path or a bare `tmux attach`. Skipped for
-// remote cmux-ssh workspaces (cmux manages their restore over ssh) and when
-// there's no durable script / identity to point at.
-func bindCmuxResume(cli, wsID, surfaceID string, spec SpawnSpec) {
-	if spec.Remote != nil || spec.Script == "" || !spec.hasIdentity() {
-		return
-	}
-	setCmuxResumeBinding(cli, wsID, surfaceID, spec.Cwd, spec.TabTitle, spec.Script)
 }
 
 // cmuxUUIDRe / cmuxSurfaceRefRe match the two id shapes the cmux CLI

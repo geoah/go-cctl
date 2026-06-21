@@ -12,6 +12,9 @@ sections are inserted just below this line:
 
 <!-- BUMP -->
 
+## [0.2.1] - 2026-06-21
+- fix(sync): stop cmux restore-prompt spam; actually close dead sessions
+
 ## [0.2.0] - 2026-06-21
 - feat(tui): scrollable k9s-style layout with panels
 
