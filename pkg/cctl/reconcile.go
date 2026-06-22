@@ -124,7 +124,6 @@ func syncCmuxState(cfg *Config) syncResult {
 		res.migrated = n
 		views = snapshotCmuxViews(cli)
 	}
-	wsMetaByID := mapWorkspaceMeta(cli, cfg, localName)
 
 	// Adopt only LIVE sessions into the manifest (never dead cmux tabs —
 	// those are what Close removes; adopting them would protect junk
@@ -134,17 +133,15 @@ func syncCmuxState(cfg *Config) syncResult {
 		res.adopted += adoptFromTmux(name, s, sessionsByServer[name])
 	}
 
-	// Re-read after adoption so grouping/close see the full tracked set.
+	// Re-read after adoption so open/group/close see the full tracked set.
 	entries := loadManifestEntries()
 
-	// File every cctl workspace (local and remote) under one sidebar group per
-	// repo, so a repo's worktrees don't splinter into per-worktree folders.
-	res.grouped = ensureRepoGrouping(cli, cfg, localName, views, wsMetaByID, entries)
-
 	// Open a cmux workspace for every LIVE session that doesn't have one, so
-	// cmux mirrors what's actually running (this is what surfaces remote
-	// worktrees that aren't open yet). Only live sessions — reviving a DEAD
-	// session is the explicit R key, not the automatic sync.
+	// cmux mirrors what's actually running (this surfaces remote worktrees
+	// that aren't open yet). Only live sessions — reviving a DEAD session is
+	// the explicit R key. Do this BEFORE grouping so the grouping pass below
+	// files the freshly-opened workspaces too (spawn-time grouping races the
+	// just-created workspace and can't be relied on).
 	for _, e := range liveMissingEntries(views, liveByServer, entries) {
 		if err := restoreSpawn(cfg, e); err != nil {
 			log().Warn("sync-open-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
@@ -154,6 +151,15 @@ func syncCmuxState(cfg *Config) syncResult {
 		log().Info("sync-open-live", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "server", e.Server)
 		res.opened++
 	}
+
+	// Re-snapshot so grouping + close see the workspaces just opened, then
+	// file every cctl workspace (local and remote) under one sidebar group
+	// per repo. Grouping here (with the workspace id straight from the
+	// snapshot) is the reliable path — no dependence on a freshly-created
+	// workspace being listed yet.
+	views = snapshotCmuxViews(cli)
+	wsMetaByID := mapWorkspaceMeta(cli, cfg, localName)
+	res.grouped = ensureRepoGrouping(cli, cfg, localName, views, wsMetaByID, entries)
 
 	// Close cctl workspaces whose tmux session is dead. Sync NEVER revives and
 	// sets NO resume bindings: that churn is what triggered cmux's "auto
