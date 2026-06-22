@@ -9,6 +9,17 @@ from [Conventional Commit](https://www.conventionalcommits.org/) subjects
 (`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major) and
 inserted above older releases.
 
+## [0.7.0] - 2026-06-22
+
+### Features
+
+- ungroup + describe the cctl control workspace
+
+### Bug Fixes
+
+- group workspaces after opening them, over a fresh snapshot
+- open cmux workspaces for live sessions missing one
+
 ## [0.6.1] - 2026-06-21
 - fix(tui): run cmux sync when a server (re)connects after refresh
 
