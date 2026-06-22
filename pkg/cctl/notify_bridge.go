@@ -153,10 +153,12 @@ func startNotifyWatcher(serverName string, srv Server, replayStatus bool) *notif
 			_ = c.Process.Kill()
 		}
 	}
-	log().Info("notify-watcher-start", "server", serverName)
+	log().Info("notify-watcher-start", "server", serverName, "replay", replayStatus)
 	go func() {
 		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 0, 64*1024), 64*1024)
+		// 1MB max line: claude Stop payloads (last_assistant_message) can be
+		// large; the default 64KB would error and kill the watcher.
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			w.handleLine(scanner.Text())
 		}
@@ -233,16 +235,21 @@ func replayClaudeStatus(line string) bool {
 		return false
 	}
 	sub := claudeHookSubcommand(ev.Event)
+	// Beta diagnostics at INFO so the chain is traceable without debug logging:
+	// this line firing means the watcher delivered the event and it parsed.
+	log().Info("cmux-hook-replay-recv", "event", ev.Event, "sub", sub, "session", ev.Session)
 	if sub == "" {
 		return false
 	}
 	cli := cmuxCLIPath()
 	if cli == "" {
+		log().Warn("cmux-hook-replay-no-cli")
 		return false
 	}
-	wsID, surfaceID, found := cmuxSurfaceForSafeSession(cli, repo+"/"+wt+"/"+sess)
+	safe := repo + "/" + wt + "/" + sess
+	wsID, surfaceID, found := cmuxSurfaceForSafeSession(cli, safe)
 	if !found || surfaceID == "" {
-		log().Debug("cmux-hook-replay-no-surface", "session", ev.Session)
+		log().Warn("cmux-hook-replay-no-surface", "session", ev.Session, "want-ws", safe, "found", found)
 		return false // let the caller fall back to a notification
 	}
 	c := cmuxCmd(cli, "hooks", "claude", sub)
@@ -251,11 +258,11 @@ func replayClaudeStatus(line string) bool {
 		c.Stdin = bytes.NewReader(ev.Payload)
 	}
 	if out, err := c.CombinedOutput(); err != nil {
-		log().Debug("cmux-hook-replay-fail", "event", ev.Event, "sub", sub,
+		log().Warn("cmux-hook-replay-fail", "event", ev.Event, "sub", sub,
 			"ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		return false
 	}
-	log().Info("cmux-hook-replay", "event", ev.Event, "sub", sub, "ws", wsID, "surface", surfaceID)
+	log().Info("cmux-hook-replay-ok", "event", ev.Event, "sub", sub, "ws", wsID, "surface", surfaceID)
 	return true
 }
 
