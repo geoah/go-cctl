@@ -33,7 +33,6 @@ import (
 type syncResult struct {
 	adopted  int
 	restored int
-	opened   int
 	closed   int
 	migrated int
 	grouped  int
@@ -41,12 +40,12 @@ type syncResult struct {
 }
 
 func (r syncResult) touched() bool {
-	return r.adopted+r.restored+r.opened+r.closed+r.migrated+r.grouped+r.errs > 0
+	return r.adopted+r.restored+r.closed+r.migrated+r.grouped+r.errs > 0
 }
 
 func (r syncResult) summary() string {
-	return fmt.Sprintf("synced cmux — opened %d, closed %d, renamed %d, grouped %d, adopted %d",
-		r.opened, r.closed, r.migrated, r.grouped, r.adopted)
+	return fmt.Sprintf("reconciled cmux — restored %d, closed %d, renamed %d, grouped %d, adopted %d",
+		r.restored, r.closed, r.migrated, r.grouped, r.adopted)
 }
 
 // findLocalServer returns the (first) server marked local, the only one
@@ -142,19 +141,20 @@ func syncCmuxState(cfg *Config) syncResult {
 	// the explicit R key. Do this BEFORE grouping so the grouping pass below
 	// files the freshly-opened workspaces too (spawn-time grouping races the
 	// just-created workspace and can't be relied on).
-	for _, e := range liveMissingEntries(views, liveByServer, entries) {
-		// Open for local AND remote. The earlier duplicate-tab bug (which made
-		// this remote-only) was actually listCmuxWorkspaces going blind to the
-		// SELECTED workspace — fixed upstream by stripping the "*"/"[selected]"
-		// markers, so `existing` now includes a session's own freshly-focused
-		// workspace and we no longer re-open a mirror of it.
+	// Converge to the manifest (desired state): (re)spawn every tracked
+	// session that isn't fully up. This revives dead-but-tracked sessions
+	// (reboot/kill → `claude --continue`) and opens tabs for live ones that
+	// lost theirs — local and remote alike. dd is the only way to drop a
+	// session from the manifest, so nothing here resurrects something you
+	// deleted.
+	for _, e := range entriesToSpawn(views, liveByServer, entries) {
 		if err := restoreSpawn(cfg, e); err != nil {
-			log().Warn("sync-open-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
+			log().Warn("sync-spawn-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
 			res.errs++
 			continue
 		}
-		log().Info("sync-open-live", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "server", e.Server)
-		res.opened++
+		log().Info("sync-spawn", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "server", e.Server)
+		res.restored++
 	}
 
 	// Re-snapshot so grouping + close see the workspaces just opened, then
@@ -173,23 +173,27 @@ func syncCmuxState(cfg *Config) syncResult {
 	return res
 }
 
-// liveMissingEntries returns the tracked sessions that are LIVE on their
-// server but have no cmux workspace yet — the ones sync should open. Pure, so
-// the selection logic is unit-testable.
-func liveMissingEntries(views []cmuxWsView, liveByServer map[string]map[string]bool, entries []wsEntry) []wsEntry {
+// entriesToSpawn returns the tracked sessions that aren't fully up and should
+// be (re)spawned to converge cmux+tmux to the manifest: a session is "up" only
+// when its tmux session is live AND it has a cmux workspace. Anything else —
+// dead (reboot/kill), or live-but-no-tab — is spawned via the durable wrapper
+// (`tmux new-session -A` revives a dead one with `claude --continue`; opens a
+// tab for a live one). Servers we couldn't reach are skipped (can't tell, and
+// the spawn would fail). Pure, so it's unit-testable.
+func entriesToSpawn(views []cmuxWsView, liveByServer map[string]map[string]bool, entries []wsEntry) []wsEntry {
 	existing := map[string]bool{}
 	for _, w := range views {
 		existing[w.name] = true
 	}
 	var out []wsEntry
 	for _, e := range entries {
-		live := liveByServer[e.Server] != nil && liveByServer[e.Server][e.TmuxName]
-		if !live {
-			continue
+		srvLive, reachable := liveByServer[e.Server]
+		if !reachable {
+			continue // server unreachable — leave it alone
 		}
 		name := cmuxWsTitle(e.Repo, e.Worktree, e.Session)
-		if existing[name] {
-			continue
+		if srvLive[e.TmuxName] && existing[name] {
+			continue // already up (live + has a tab)
 		}
 		existing[name] = true // de-dup if two entries map to the same name
 		out = append(out, e)
@@ -308,10 +312,16 @@ func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired map[string
 	parts := strings.Split(name, "/")
 	switch len(parts) {
 	case 3:
-		if live[tmuxName(parts[0], parts[1], parts[2])] {
-			return false // alive — keep
+		if desired[name] {
+			return false // tracked — the reconcile revives/keeps it, never closes
 		}
-		return desired[name] || inCctlRemoteGroup || closeUnmatched
+		if live[tmuxName(parts[0], parts[1], parts[2])] {
+			return false // live (and would've been adopted) — keep
+		}
+		// Orphan: a cctl-shaped tab not in the manifest (dd'd or junk). Close
+		// when we can confirm it's ours (remote group) or the user opted into
+		// pruning unmatched tabs.
+		return inCctlRemoteGroup || closeUnmatched
 	case 2:
 		if !inCctlRemoteGroup {
 			return false
@@ -466,56 +476,6 @@ func anyLive(liveByServer map[string]map[string]bool, tmux string) bool {
 		}
 	}
 	return false
-}
-
-// restoreFromManifest is the R key: bring back every tracked session that
-// isn't currently up — (re)open its per-session workspace running the durable
-// wrapper, which resurrects+resumes it (tmux new-session -A → claude
-// --continue). Explicit and separate from the automatic sync, so it never
-// surprises the user; it sets no resume bindings, so it doesn't trip cmux's
-// restore prompts.
-func restoreFromManifest(cfg *Config) syncResult {
-	var res syncResult
-	cli := cmuxCLIPath()
-	if cli == "" {
-		return res
-	}
-	liveByServer := map[string]map[string]bool{}
-	addLive := func(name string, srv Server) {
-		if sessions, err := listSessions(name, srv); err == nil {
-			set := make(map[string]bool, len(sessions))
-			for _, ss := range sessions {
-				set[ss.Name] = true
-			}
-			liveByServer[name] = set
-		}
-	}
-	if cfg.syncAllServers() {
-		for n, s := range cfg.Servers {
-			addLive(n, s)
-		}
-	} else if name, srv, ok := findLocalServer(cfg); ok {
-		addLive(name, srv)
-	}
-
-	open := map[string]bool{}
-	for _, w := range listCmuxWorkspaces(cli) {
-		open[w.name] = true
-	}
-	for _, e := range loadManifestEntries() {
-		live := liveByServer[e.Server] != nil && liveByServer[e.Server][e.TmuxName]
-		hasWs := open[cmuxWsTitle(e.Repo, e.Worktree, e.Session)]
-		if live && hasWs {
-			continue // already up
-		}
-		if err := restoreSpawn(cfg, e); err != nil {
-			log().Warn("restore-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
-			res.errs++
-			continue
-		}
-		res.restored++
-	}
-	return res
 }
 
 // wsMeta is what sync infers about a cmux workspace from the sidebar groups.

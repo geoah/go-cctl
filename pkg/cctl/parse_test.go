@@ -1360,8 +1360,8 @@ func TestSyncCmux_RegistersRunningTask(t *testing.T) {
 	if last == nil || last.done {
 		t.Fatalf("syncCmux should register a running task, got %+v", last)
 	}
-	if !strings.Contains(last.label, "sync") {
-		t.Errorf("task label should mention sync; got %q", last.label)
+	if !strings.Contains(last.label, "reconcil") {
+		t.Errorf("task label should mention reconcile; got %q", last.label)
 	}
 }
 

@@ -281,9 +281,10 @@ func TestShouldCloseDeadWorkspace(t *testing.T) {
 	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, live, desired, false) {
 		t.Error("alive session must never be closed")
 	}
-	// dead + tracked → close even with the flag off
-	if !shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, map[string]bool{}, desired, false) {
-		t.Error("dead tracked workspace should close")
+	// dead + tracked → keep (the reconcile REVIVES tracked sessions; only dd,
+	// which removes the manifest entry, makes a session closeable)
+	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, map[string]bool{}, desired, false) {
+		t.Error("dead tracked workspace must be kept (it gets revived, not closed)")
 	}
 	// dead + untracked + flag OFF → keep (protects manual tabs)
 	if shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, false) {
@@ -311,30 +312,35 @@ func TestShouldCloseDeadWorkspace(t *testing.T) {
 	}
 }
 
-// TestLiveMissingEntries pins which sessions sync opens: live ones without a
-// cmux workspace. Dead sessions and ones already open are skipped.
-func TestLiveMissingEntries(t *testing.T) {
+// TestEntriesToSpawn pins what the reconcile (re)spawns to converge to the
+// manifest: open a tab for a live session missing one, AND revive a dead
+// tracked session (reboot/kill). Skip ones already up and unreachable servers.
+func TestEntriesToSpawn(t *testing.T) {
 	entries := []wsEntry{
-		{Server: "ws", Repo: "olympus", Worktree: "main", Session: "random", TmuxName: tmuxName("olympus", "main", "random")},       // live, no ws -> open
-		{Server: "ws", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs", TmuxName: tmuxName("olympus", "gb300-k8s", "docs")}, // live, already open -> skip
-		{Server: "ws", Repo: "olympus", Worktree: "old", Session: "poc", TmuxName: tmuxName("olympus", "old", "poc")},               // dead -> skip
-		{Server: "local", Repo: "r", Worktree: "main", Session: "x", TmuxName: tmuxName("r", "main", "x")},                          // server has no live map -> skip
+		{Server: "ws", Repo: "olympus", Worktree: "main", Session: "random", TmuxName: tmuxName("olympus", "main", "random")},       // live, no tab -> open
+		{Server: "ws", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs", TmuxName: tmuxName("olympus", "gb300-k8s", "docs")}, // live + tab -> skip (up)
+		{Server: "ws", Repo: "olympus", Worktree: "old", Session: "poc", TmuxName: tmuxName("olympus", "old", "poc")},               // dead -> revive
+		{Server: "down", Repo: "r", Worktree: "main", Session: "x", TmuxName: tmuxName("r", "main", "x")},                           // unreachable -> skip
 	}
 	live := map[string]map[string]bool{
 		"ws": {
 			tmuxName("olympus", "main", "random"):    true,
 			tmuxName("olympus", "gb300-k8s", "docs"): true,
-			// "old/poc" intentionally absent => dead
+			// "old/poc" intentionally absent => dead (reboot/kill) -> revive
 		},
+		// "down" intentionally absent => unreachable
 	}
-	views := []cmuxWsView{{name: "olympus/gb300-k8s/docs"}} // docs already open
+	views := []cmuxWsView{{name: "olympus/gb300-k8s/docs"}} // docs already has a tab
 
-	got := liveMissingEntries(views, live, entries)
-	if len(got) != 1 {
-		t.Fatalf("want 1 entry to open, got %d: %+v", len(got), got)
+	got := entriesToSpawn(views, live, entries)
+	want := map[string]bool{"olympus/main/random": true, "olympus/old/poc": true}
+	if len(got) != len(want) {
+		t.Fatalf("want %d (re)spawn targets, got %d: %+v", len(want), len(got), got)
 	}
-	if cmuxWsTitle(got[0].Repo, got[0].Worktree, got[0].Session) != "olympus/main/random" {
-		t.Errorf("expected olympus/main/random, got %+v", got[0])
+	for _, e := range got {
+		if name := cmuxWsTitle(e.Repo, e.Worktree, e.Session); !want[name] {
+			t.Errorf("unexpected spawn target %q (up + unreachable must be skipped)", name)
+		}
 	}
 }
 
