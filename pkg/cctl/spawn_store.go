@@ -368,23 +368,29 @@ func ensureCctlControlWorkspace(cli string) error {
 	return nil
 }
 
-// markCctlWorkspace pins a cmux workspace and colors it red, so the cctl
-// control pane stands out and stays put in the sidebar. wsID may be "" to
-// target the current workspace ($CMUX_WORKSPACE_ID). Best-effort.
+// markCctlWorkspace makes the cctl control pane unmistakable in the sidebar:
+// pull it out of any repo group (it's the controller, not a session), pin it,
+// color it red, and label it "Claude Control Center". wsID may be "" to target
+// the current workspace ($CMUX_WORKSPACE_ID). Best-effort.
+const cctlControlDescription = "Claude Control Center"
+
 func markCctlWorkspace(cli, wsID string) {
 	if cli == "" {
 		return
 	}
-	for _, action := range [][]string{
+	cmds := [][]string{
+		{"workspace-group", "remove"},
 		{"workspace-action", "--action", "pin"},
 		{"workspace-action", "--action", "set-color", "--color", "Red"},
-	} {
-		args := action
+		{"workspace-action", "--action", "set-description", "--description", cctlControlDescription},
+	}
+	for _, c := range cmds {
+		args := c
 		if wsID != "" {
-			args = append([]string{action[0], "--workspace", wsID}, action[1:]...)
+			args = append(append([]string{}, c...), "--workspace", wsID)
 		}
 		if out, err := cmuxCmd(cli, args...).CombinedOutput(); err != nil {
-			log().Debug("cmux-mark-workspace-fail", "action", action, "ws", wsID,
+			log().Debug("cmux-mark-workspace-fail", "cmd", c, "ws", wsID,
 				"err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
