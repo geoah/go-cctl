@@ -1,7 +1,7 @@
 #!/bin/sh
-# cctl: validate the commit subject is a Conventional Commit so release-please
-# (CI) can derive the version bump + CHANGELOG from history. Lint only — it
-# never edits the commit. Bypass with CCTL_NO_LINT=1. Enable via
+# cctl: validate the commit subject is a Conventional Commit so `mise run
+# release` can derive the version bump + CHANGELOG from history. Lint only —
+# it never edits the commit. Bypass with CCTL_NO_LINT=1. Enable via
 # `mise run hooks:setup` (sets core.hooksPath=.githooks).
 [ -n "${CCTL_NO_LINT:-}" ] && exit 0
 

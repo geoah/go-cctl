@@ -126,38 +126,36 @@ version upgrades and stays on `$PATH` even when mise's go shim isn't
 active. If you made several edits across a turn, install at the end of
 the turn so the running binary always reflects the latest code.
 
-## Versioning, changelog & releases ([release-please](https://github.com/googleapis/release-please))
+## Versioning, changelog & releases (local, `mise run release`)
 
 [Semantic versioning](https://semver.org/) + [Keep a Changelog](https://keepachangelog.com/)
-+ GitHub Releases are driven by **release-please** from
-[Conventional Commit](https://www.conventionalcommits.org/) subjects. You never
-edit the version or changelog by hand.
+from [Conventional Commit](https://www.conventionalcommits.org/) subjects —
+done locally, no CI. You never edit the version or changelog by hand.
 
 The flow:
 
 ```
-Conventional Commits on main
-  → release-please opens/updates a "release PR" (bumps version.txt,
-    regenerates CHANGELOG.md from the commits since the last release)
-  → you merge the release PR
-  → release-please tags v<x.y.z> + publishes the GitHub Release
+write Conventional Commits  →  mise run release
+  → computes the next version from commits since the last tag
+    (feat → minor, fix/perf → patch, <type>! or "BREAKING CHANGE" → major)
+  → bumps version.txt, prepends a grouped CHANGELOG.md section
+  → commits "chore(release): vX.Y.Z" and tags vX.Y.Z
+  → prints the push command (it does NOT push or build artifacts)
 ```
 
-`feat` → minor, `fix`/`perf` → patch, `!` or `BREAKING CHANGE` → major; other
-types (`docs`/`chore`/`refactor`/`test`/`ci`/`build`/`style`) don't trigger a
-release on their own. Config lives in `release-please-config.json` +
-`.release-please-manifest.json`; the workflow is
-`.github/workflows/release.yml`.
+`mise run release:dry` previews the bump + changelog without writing anything.
+Other commit types (`docs`/`chore`/`refactor`/`test`/`ci`/`build`/`style`)
+don't trigger a release on their own; if there are none releasable the script
+says so and stops. The logic lives in `scripts/release.sh`.
 
-`version.txt` (release-please-managed) is embedded into the binary at build
-time via the mise tasks and shown by `cctl version`; a bare
-`go install …@vX` recovers the version from the module build info instead.
+After it runs, push with: `git push origin HEAD --follow-tags`.
 
-So: **just write Conventional Commit subjects.** A local `commit-msg` hook
-lints that format (enable once with `mise run hooks:setup`; bypass a one-off
-with `CCTL_NO_LINT=1 git commit …`). `.github/workflows/ci.yml` runs
-gofmt/vet/build/unit-tests on every push & PR.
+`version.txt` is embedded into the binary at build time via the mise tasks and
+shown by `cctl version`; a bare `go install …@vX` recovers the version from the
+module build info instead.
 
-One-time GitHub setting: **Settings → Actions → General → "Allow GitHub Actions
-to create and approve pull requests"** must be on so release-please can open
-its release PR.
+A local `commit-msg` hook lints Conventional Commit format so the release
+script can parse history (enable once with `mise run hooks:setup`; bypass a
+one-off with `CCTL_NO_LINT=1 git commit …`). There is no CI — run
+`mise run cctl:test` (and `…:test:integration` for lifecycle changes)
+yourself.
