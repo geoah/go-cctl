@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // Spawner launches a wrapper script in a new tab/window of a terminal
@@ -234,7 +235,11 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 	if spec.WsTitle == "" {
 		return
 	}
-	id, ok := findCmuxWorkspaceByName(cli, spec.WsTitle)
+	// Retry the lookup — `cmux new-workspace` can return before the new
+	// workspace is queryable via list-workspaces over the automation socket.
+	// A single lookup here races: on a miss the whole post-create block
+	// (tab-rename + grouping) is silently skipped.
+	id, ok := findCmuxWorkspaceByNameRetry(cli, spec.WsTitle)
 	if !ok {
 		return
 	}
@@ -425,6 +430,20 @@ func lastCmuxListedID(out string) string {
 // the workspace name and any extra metadata cmux chooses to include.
 // We accept "uuid<sep>name" with whitespace separation and trim the
 // match candidate before comparison.
+// findCmuxWorkspaceByNameRetry is findCmuxWorkspaceByName with a short retry
+// loop (~3s total). Used right after `cmux new-workspace`, which can return
+// before the new workspace shows up in `list-workspaces` over the automation
+// socket — a single lookup there races and skips tab-rename/grouping.
+func findCmuxWorkspaceByNameRetry(cli, name string) (string, bool) {
+	for i := 0; i < 20; i++ {
+		if id, ok := findCmuxWorkspaceByName(cli, name); ok {
+			return id, true
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return "", false
+}
+
 func findCmuxWorkspaceByName(cli, name string) (string, bool) {
 	target := strings.TrimSpace(name)
 	for _, ws := range listCmuxWorkspaces(cli) {
