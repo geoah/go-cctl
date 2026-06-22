@@ -143,6 +143,14 @@ func syncCmuxState(cfg *Config) syncResult {
 	// files the freshly-opened workspaces too (spawn-time grouping races the
 	// just-created workspace and can't be relied on).
 	for _, e := range liveMissingEntries(views, liveByServer, entries) {
+		// Only auto-open REMOTE worktrees (the feature's purpose). A local
+		// session is usually already open in cmux under a name we don't
+		// control; opening our own workspace for it just runs a second
+		// `tmux new-session -A` that attaches the SAME session → a duplicate
+		// mirrored tab. Local sessions are managed directly in cmux.
+		if srv, ok := cfg.Servers[e.Server]; ok && srv.Local {
+			continue
+		}
 		if err := restoreSpawn(cfg, e); err != nil {
 			log().Warn("sync-open-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
 			res.errs++
