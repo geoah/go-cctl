@@ -40,6 +40,14 @@ type Defaults struct {
 	// closed. Set true to aggressively prune them. Tabs whose name isn't
 	// cctl-shaped (plain shells, custom names) are never auto-closed either way.
 	SyncCloseUnmatched *bool `yaml:"sync_close_unmatched"`
+	// BetaRemoteClaudeStatus (beta) makes cmux show live Claude status for
+	// REMOTE sessions. cmux's native integration can't reach a remote claude
+	// (it runs on another host, behind mosh+tmux); with this on, cctl relays
+	// the remote claude hook events it already captures and re-fires them
+	// locally as `cmux hooks claude <event>` against the session's surface, so
+	// cmux's own status machinery ("needs input", reorder, …) lights up.
+	// Default false. Experimental — verify it behaves before relying on it.
+	BetaRemoteClaudeStatus *bool `yaml:"beta_remote_claude_status"`
 	// Spawn chooses the terminal-spawn provider when launching sessions
 	// from the TUI: "auto" (default — detect from $TERM_PROGRAM), or one
 	// of "ghostty", "cmux", "wezterm", "kitty", "iterm2", "inline".
@@ -74,6 +82,15 @@ func (c *Config) syncAllServers() bool {
 func (c *Config) syncCloseUnmatched() bool {
 	if c.Defaults.SyncCloseUnmatched != nil {
 		return *c.Defaults.SyncCloseUnmatched
+	}
+	return false
+}
+
+// betaRemoteClaudeStatus reports whether to relay remote claude hook events
+// into cmux's native status (beta). Default false.
+func (c *Config) betaRemoteClaudeStatus() bool {
+	if c.Defaults.BetaRemoteClaudeStatus != nil {
+		return *c.Defaults.BetaRemoteClaudeStatus
 	}
 	return false
 }

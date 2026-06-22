@@ -116,7 +116,7 @@ func (m *tuiModel) ensureNotifyWatcher(serverName string) {
 	if w := m.notifyWatchers[serverName]; w != nil && !w.isDead() {
 		return
 	}
-	m.notifyWatchers[serverName] = newNotifyWatcher(serverName, srv)
+	m.notifyWatchers[serverName] = newNotifyWatcher(serverName, srv, m.cfg.betaRemoteClaudeStatus())
 }
 
 // stopNotifyWatchers kills every bridge transport; called when the TUI

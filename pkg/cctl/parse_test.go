@@ -13,7 +13,7 @@ import (
 // Unit tests drive probedMsg against fake hosts; never let that spawn a
 // real ssh tail. Integration tests don't exercise the bridge.
 func init() {
-	newNotifyWatcher = func(serverName string, srv Server) *notifyWatcher {
+	newNotifyWatcher = func(serverName string, srv Server, replayStatus bool) *notifyWatcher {
 		return &notifyWatcher{server: serverName, dead: true}
 	}
 }

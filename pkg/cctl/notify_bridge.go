@@ -2,6 +2,7 @@ package cctl
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -106,6 +107,11 @@ type notifyPayload struct {
 type notifyWatcher struct {
 	server string
 	stop   func()
+	// replayStatus (beta) re-fires each remote claude hook event locally as
+	// `cmux hooks claude <event>` against the session's surface, so cmux shows
+	// native live status for remote sessions. When false, the watcher just
+	// posts a cmux notification per event (the original behavior).
+	replayStatus bool
 
 	mu   sync.Mutex
 	dead bool
@@ -127,8 +133,8 @@ var newNotifyWatcher = startNotifyWatcher
 
 // startNotifyWatcher launches the ssh tail + scanner goroutine. Returns
 // immediately; the watcher marks itself dead when the transport drops.
-func startNotifyWatcher(serverName string, srv Server) *notifyWatcher {
-	w := &notifyWatcher{server: serverName, lastPosted: map[string]time.Time{}}
+func startNotifyWatcher(serverName string, srv Server, replayStatus bool) *notifyWatcher {
+	w := &notifyWatcher{server: serverName, replayStatus: replayStatus, lastPosted: map[string]time.Time{}}
 	remote := `mkdir -p "$HOME/.cctl"; touch "$HOME/.cctl/notify.jsonl"; exec tail -n 0 -F "$HOME/.cctl/notify.jsonl"`
 	c := remoteCmd(srv, remote)
 	stdout, err := c.StdoutPipe()
@@ -163,9 +169,13 @@ func startNotifyWatcher(serverName string, srv Server) *notifyWatcher {
 	return w
 }
 
-// handleLine parses one notify.jsonl line and posts the matching cmux
-// notification (throttled per session).
+// handleLine processes one notify.jsonl line. In beta replay mode it re-fires
+// the event into cmux's native status for the session's surface; otherwise it
+// posts a throttled cmux notification (the original behavior).
 func (w *notifyWatcher) handleLine(line string) {
+	if w.replayStatus && replayClaudeStatus(line) {
+		return
+	}
 	title, body, wsTitle, sessKey, ok := parseNotifyLine(line)
 	if !ok {
 		return
@@ -180,6 +190,104 @@ func (w *notifyWatcher) handleLine(line string) {
 	w.mu.Unlock()
 	log().Debug("notify-bridge-event", "server", w.server, "session", sessKey, "title", title)
 	notifyCmuxSafeTitle(title, body, wsTitle)
+}
+
+// claudeHookSubcommand maps a captured claude hook event name to the
+// `cmux hooks claude <subcommand>` cmux uses internally. Empty = no mapping
+// (skip). Mirrors the events in cmux's own claude wrapper HOOKS_JSON.
+func claudeHookSubcommand(event string) string {
+	switch event {
+	case "Notification":
+		return "notification"
+	case "Stop":
+		return "stop"
+	case "SessionStart":
+		return "session-start"
+	case "SessionEnd":
+		return "session-end"
+	case "UserPromptSubmit":
+		return "prompt-submit"
+	case "PreToolUse":
+		return "pre-tool-use"
+	}
+	return ""
+}
+
+// replayClaudeStatus re-fires a remote claude hook event into cmux's native
+// status: it finds the session's cmux surface and runs `cmux hooks claude
+// <event>` locally with the claude payload on stdin and CMUX_SURFACE_ID /
+// CMUX_WORKSPACE_ID pointed at that surface — exactly what cmux's own wrapper
+// would do, but for a session whose claude runs on a remote host. Returns true
+// when it handled the line (so the caller skips the plain notification).
+func replayClaudeStatus(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	var ev notifyEvent
+	if json.Unmarshal([]byte(line), &ev) != nil {
+		return false
+	}
+	repo, wt, sess, ok := parseTmuxName(ev.Session)
+	if !ok {
+		return false
+	}
+	sub := claudeHookSubcommand(ev.Event)
+	if sub == "" {
+		return false
+	}
+	cli := cmuxCLIPath()
+	if cli == "" {
+		return false
+	}
+	wsID, surfaceID, found := cmuxSurfaceForSafeSession(cli, repo+"/"+wt+"/"+sess)
+	if !found || surfaceID == "" {
+		log().Debug("cmux-hook-replay-no-surface", "session", ev.Session)
+		return false // let the caller fall back to a notification
+	}
+	c := cmuxCmd(cli, "hooks", "claude", sub)
+	c.Env = cmuxHookEnv(c.Env, wsID, surfaceID)
+	if len(ev.Payload) > 0 {
+		c.Stdin = bytes.NewReader(ev.Payload)
+	}
+	if out, err := c.CombinedOutput(); err != nil {
+		log().Debug("cmux-hook-replay-fail", "event", ev.Event, "sub", sub,
+			"ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		return false
+	}
+	log().Info("cmux-hook-replay", "event", ev.Event, "sub", sub, "ws", wsID, "surface", surfaceID)
+	return true
+}
+
+// cmuxSurfaceForSafeSession finds the cmux workspace + first surface whose
+// (sanitized) name matches a "repo/worktree/session" key. cctl names one
+// workspace per session, so the first surface is the session's tab.
+func cmuxSurfaceForSafeSession(cli, safeName string) (wsID, surfaceID string, ok bool) {
+	for _, w := range listCmuxWorkspaces(cli) {
+		if tmuxSafeName(w.name) != safeName {
+			continue
+		}
+		surfaces := listCmuxSurfaces(cli, w.id)
+		if len(surfaces) == 0 {
+			return w.id, "", true
+		}
+		return w.id, surfaces[0].id, true
+	}
+	return "", "", false
+}
+
+// cmuxHookEnv returns env with CMUX_WORKSPACE_ID / CMUX_SURFACE_ID set to the
+// target surface (replacing cctl's own values so the replayed hook updates the
+// right session, not the control pane). The local CMUX_SOCKET_PATH is kept.
+func cmuxHookEnv(base []string, wsID, surfaceID string) []string {
+	out := make([]string, 0, len(base)+2)
+	for _, kv := range base {
+		if strings.HasPrefix(kv, "CMUX_WORKSPACE_ID=") || strings.HasPrefix(kv, "CMUX_SURFACE_ID=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return append(out, "CMUX_WORKSPACE_ID="+wsID, "CMUX_SURFACE_ID="+surfaceID)
 }
 
 // parseNotifyLine turns a notify.jsonl line into notification content.
