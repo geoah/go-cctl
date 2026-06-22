@@ -33,6 +33,7 @@ import (
 type syncResult struct {
 	adopted  int
 	restored int
+	opened   int
 	closed   int
 	migrated int
 	grouped  int
@@ -40,12 +41,12 @@ type syncResult struct {
 }
 
 func (r syncResult) touched() bool {
-	return r.adopted+r.restored+r.closed+r.migrated+r.grouped+r.errs > 0
+	return r.adopted+r.restored+r.opened+r.closed+r.migrated+r.grouped+r.errs > 0
 }
 
 func (r syncResult) summary() string {
-	return fmt.Sprintf("synced cmux — closed %d, renamed %d, grouped %d, adopted %d, restored %d",
-		r.closed, r.migrated, r.grouped, r.adopted, r.restored)
+	return fmt.Sprintf("synced cmux — opened %d, closed %d, renamed %d, grouped %d, adopted %d",
+		r.opened, r.closed, r.migrated, r.grouped, r.adopted)
 }
 
 // findLocalServer returns the (first) server marked local, the only one
@@ -140,11 +141,49 @@ func syncCmuxState(cfg *Config) syncResult {
 	// repo, so a repo's worktrees don't splinter into per-worktree folders.
 	res.grouped = ensureRepoGrouping(cli, cfg, localName, views, wsMetaByID, entries)
 
+	// Open a cmux workspace for every LIVE session that doesn't have one, so
+	// cmux mirrors what's actually running (this is what surfaces remote
+	// worktrees that aren't open yet). Only live sessions — reviving a DEAD
+	// session is the explicit R key, not the automatic sync.
+	for _, e := range liveMissingEntries(views, liveByServer, entries) {
+		if err := restoreSpawn(cfg, e); err != nil {
+			log().Warn("sync-open-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
+			res.errs++
+			continue
+		}
+		log().Info("sync-open-live", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "server", e.Server)
+		res.opened++
+	}
+
 	// Close cctl workspaces whose tmux session is dead. Sync NEVER revives and
 	// sets NO resume bindings: that churn is what triggered cmux's "auto
-	// restore?" prompts. Bringing sessions back is the explicit R key.
+	// restore?" prompts. Bringing dead sessions back is the explicit R key.
 	closeDead(cli, views, wsMetaByID, liveByServer, localName, entries, cfg.syncCloseUnmatched(), &res)
 	return res
+}
+
+// liveMissingEntries returns the tracked sessions that are LIVE on their
+// server but have no cmux workspace yet — the ones sync should open. Pure, so
+// the selection logic is unit-testable.
+func liveMissingEntries(views []cmuxWsView, liveByServer map[string]map[string]bool, entries []wsEntry) []wsEntry {
+	existing := map[string]bool{}
+	for _, w := range views {
+		existing[w.name] = true
+	}
+	var out []wsEntry
+	for _, e := range entries {
+		live := liveByServer[e.Server] != nil && liveByServer[e.Server][e.TmuxName]
+		if !live {
+			continue
+		}
+		name := cmuxWsTitle(e.Repo, e.Worktree, e.Session)
+		if existing[name] {
+			continue
+		}
+		existing[name] = true // de-dup if two entries map to the same name
+		out = append(out, e)
+	}
+	return out
 }
 
 // snapshotCmuxViews lists every cmux workspace with its surfaces.

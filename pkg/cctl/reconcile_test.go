@@ -311,6 +311,33 @@ func TestShouldCloseDeadWorkspace(t *testing.T) {
 	}
 }
 
+// TestLiveMissingEntries pins which sessions sync opens: live ones without a
+// cmux workspace. Dead sessions and ones already open are skipped.
+func TestLiveMissingEntries(t *testing.T) {
+	entries := []wsEntry{
+		{Server: "ws", Repo: "olympus", Worktree: "main", Session: "random", TmuxName: tmuxName("olympus", "main", "random")},       // live, no ws -> open
+		{Server: "ws", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs", TmuxName: tmuxName("olympus", "gb300-k8s", "docs")}, // live, already open -> skip
+		{Server: "ws", Repo: "olympus", Worktree: "old", Session: "poc", TmuxName: tmuxName("olympus", "old", "poc")},               // dead -> skip
+		{Server: "local", Repo: "r", Worktree: "main", Session: "x", TmuxName: tmuxName("r", "main", "x")},                          // server has no live map -> skip
+	}
+	live := map[string]map[string]bool{
+		"ws": {
+			tmuxName("olympus", "main", "random"):    true,
+			tmuxName("olympus", "gb300-k8s", "docs"): true,
+			// "old/poc" intentionally absent => dead
+		},
+	}
+	views := []cmuxWsView{{name: "olympus/gb300-k8s/docs"}} // docs already open
+
+	got := liveMissingEntries(views, live, entries)
+	if len(got) != 1 {
+		t.Fatalf("want 1 entry to open, got %d: %+v", len(got), got)
+	}
+	if cmuxWsTitle(got[0].Repo, got[0].Worktree, got[0].Session) != "olympus/main/random" {
+		t.Errorf("expected olympus/main/random, got %+v", got[0])
+	}
+}
+
 func TestDeriveWsMeta(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"mac":       {Local: true},
