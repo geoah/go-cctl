@@ -222,6 +222,12 @@ func claudeLaunchScript(cwd string, claudeFlags []string, prompt string, bridge 
   read _ || true
   exit 1
 }
+# Ensure claude is found. A respawn (UU) or any non-login shell starts with a
+# minimal PATH that omits the usual install dirs (native installer, mise,
+# npm, …); a fresh mosh/ssh login shell happens to include them, so the first
+# launch worked but a respawn hit "claude: command not found". Prepend the
+# standard locations so every launch path resolves claude.
+export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.claude/local:$HOME/.npm-global/bin:$HOME/bin:$PATH"
 %s# Route claude through cmux's wrapper when running inside cmux so the
 # notification + session-tracking hooks attach. Harmless on remote
 # (the path simply doesn't exist).
