@@ -244,9 +244,17 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 		return
 	}
 	if spec.TabTitle != "" {
-		out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", "tab:1", spec.TabTitle).CombinedOutput()
+		// Rename by the surface's real id — the "tab:1" ref doesn't reliably
+		// resolve right after new-workspace, which left first tabs showing the
+		// raw wrapper-script path while later tabs (added via addCmuxTab,
+		// renamed by surface UUID) showed correctly.
+		tabRef := "tab:1"
+		if sid := firstCmuxSurfaceID(cli, id); sid != "" {
+			tabRef = sid
+		}
+		out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", tabRef, spec.TabTitle).CombinedOutput()
 		if err != nil {
-			log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			log().Debug("cmux-rename-tab-fail", "id", id, "tab", spec.TabTitle, "ref", tabRef, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
 	ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
@@ -442,6 +450,26 @@ func findCmuxWorkspaceByNameRetry(cli, name string) (string, bool) {
 		time.Sleep(150 * time.Millisecond)
 	}
 	return "", false
+}
+
+// firstCmuxSurfaceID returns the id of a freshly created workspace's first
+// (only) surface, retrying briefly because new-workspace can return before its
+// surface is queryable over the automation socket. Returns "" if none shows
+// up, leaving the caller to fall back to a tab ref.
+func firstCmuxSurfaceID(cli, wsID string) string {
+	for i := 0; i < 20; i++ {
+		out, err := exec.Command(cli, "--id-format", "uuids", "list-pane-surfaces", "--workspace", wsID).Output()
+		if err == nil {
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "*"))
+				if id := cmuxUUIDRe.FindString(line); id != "" {
+					return id
+				}
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	return ""
 }
 
 func findCmuxWorkspaceByName(cli, name string) (string, bool) {
