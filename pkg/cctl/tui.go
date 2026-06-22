@@ -1974,16 +1974,44 @@ func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd str
 				taskID: taskID,
 			}
 		}
+		// Map sanitized tmux repo names back to real ones so resolve() finds
+		// the worktree (e.g. "rxtx_dev" → "rxtx.dev").
+		bySafe := map[string]string{}
+		if allRepos, rerr := m.cfg.repos(serverName); rerr == nil {
+			for n := range allRepos {
+				bySafe[tmuxSafeName(n)] = n
+			}
+		}
 		restarted, failed := 0, 0
 		for _, name := range sessions {
-			if _, err := runRemote(srv, fmt.Sprintf("tmux respawn-window -k -t %s", shellQuote(name))); err != nil {
+			// Respawn with the CURRENT launch script (not the window's stale
+			// original), so the restart picks up the new claude binary AND the
+			// current flags/hooks — notably cctl's --settings notification
+			// bridge. claude --continue resumes the conversation, so the
+			// session survives. Falls back to re-running the original command
+			// when we can't resolve the session's worktree.
+			cmd := fmt.Sprintf("tmux respawn-window -k -t %s", shellQuote(name))
+			if repo, wt, _, ok := parseTmuxName(name); ok {
+				if real, found := bySafe[repo]; found {
+					repo = real
+				}
+				if r, rerr := m.cfg.resolve(serverName, repo); rerr == nil {
+					cwd := r.Repo.Path
+					if wt != "" && wt != "main" {
+						cwd = worktreePath(r.WorktreeBase, r.RepoName, wt)
+					}
+					launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local)
+					cmd = fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(name), shellQuote(launch))
+				}
+			}
+			if _, err := runRemote(srv, cmd); err != nil {
 				log().Warn("tui-respawn-fail", "server", serverName, "session", name, "err", err.Error())
 				failed++
 				continue
 			}
 			restarted++
 		}
-		msg := fmt.Sprintf("claude upgraded on %s; restarted %d session(s)", serverName, restarted)
+		msg := fmt.Sprintf("claude upgraded on %s; relaunched %d session(s)", serverName, restarted)
 		if failed > 0 {
 			return actionDoneMsg{
 				msg:     msg,
