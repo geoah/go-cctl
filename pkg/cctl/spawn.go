@@ -455,21 +455,39 @@ type cmuxWorkspace struct {
 	name string
 }
 
-// listCmuxWorkspaces parses `--id-format uuids list-workspaces`: one
-// workspace per line, UUID first, then the name (which may contain
-// spaces) and any extra metadata cmux includes.
 func listCmuxWorkspaces(cli string) []cmuxWorkspace {
 	out, err := exec.Command(cli, "--id-format", "uuids", "list-workspaces").Output()
 	if err != nil {
 		return nil
 	}
+	return parseCmuxWorkspaceList(string(out))
+}
+
+// parseCmuxWorkspaceList parses `--id-format uuids list-workspaces`: one
+// workspace per line, UUID first, then the name (which may contain spaces).
+// Split from the exec call so the parsing is unit-testable.
+//
+// cmux marks the SELECTED row with a leading "*" and a trailing "[selected]"
+// status marker. Neither is part of the id or the name, so they must be
+// stripped: otherwise the selected workspace parses with id "*" and a name
+// that includes the UUID and "[selected]", which never matches a real name.
+// findCmuxWorkspaceByName is then blind to it, so spawn's "does it already
+// exist?" check (and reconcile's existing-set) miss it and create a DUPLICATE
+// workspace for the same session. A freshly created workspace is auto-focused
+// (`new-workspace --focus true`), i.e. exactly the selected row — so the very
+// next lookup for it would otherwise always miss.
+func parseCmuxWorkspaceList(raw string) []cmuxWorkspace {
 	var result []cmuxWorkspace
-	for _, line := range strings.Split(string(out), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		// Drop the leading "*" selected-row marker.
+		if len(fields) > 0 && fields[0] == "*" {
+			fields = fields[1:]
 		}
-		fields := strings.Fields(line)
+		// Drop a trailing bracketed status marker (e.g. "[selected]").
+		if n := len(fields); n > 0 && strings.HasPrefix(fields[n-1], "[") && strings.HasSuffix(fields[n-1], "]") {
+			fields = fields[:n-1]
+		}
 		if len(fields) < 2 {
 			continue
 		}

@@ -549,6 +549,52 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 	})
 }
 
+// ---- list-workspaces parser -----------------------------------------------
+
+// TestParseCmuxWorkspaceList_SelectedRowMarkers is the regression test for the
+// duplicate-workspace bug: cmux prefixes the SELECTED row with "*" and suffixes
+// it with "[selected]". If those markers aren't stripped, the selected
+// workspace parses with id "*" and a name that never matches, so
+// findCmuxWorkspaceByName can't see it and callers create a duplicate.
+func TestParseCmuxWorkspaceList_SelectedRowMarkers(t *testing.T) {
+	raw := strings.Join([]string{
+		"  AA3721EF-C46A-4B08-AB99-902EE24E8872  dev/olympus",
+		"* 668D35A2-4CF0-4D97-89F1-30186AF75AB4  olympus/main/lethe-docs-review  [selected]",
+		"  06E02301-CB9C-434F-82DB-7E253AC2A8A0  olympus/wt/test1",
+		"", // trailing blank line
+	}, "\n")
+
+	got := parseCmuxWorkspaceList(raw)
+	if len(got) != 3 {
+		t.Fatalf("want 3 workspaces, got %d: %+v", len(got), got)
+	}
+
+	// The selected row must parse with its real UUID and clean name.
+	sel := got[1]
+	if sel.id != "668D35A2-4CF0-4D97-89F1-30186AF75AB4" {
+		t.Errorf("selected workspace id = %q, want the UUID (not the \"*\" marker)", sel.id)
+	}
+	if sel.name != "olympus/main/lethe-docs-review" {
+		t.Errorf("selected workspace name = %q, want %q (no UUID/[selected] leakage)", sel.name, "olympus/main/lethe-docs-review")
+	}
+
+	// And it must be findable by name via the same path spawn/reconcile use.
+	want := map[string]string{
+		"dev/olympus":                    "AA3721EF-C46A-4B08-AB99-902EE24E8872",
+		"olympus/main/lethe-docs-review": "668D35A2-4CF0-4D97-89F1-30186AF75AB4",
+		"olympus/wt/test1":               "06E02301-CB9C-434F-82DB-7E253AC2A8A0",
+	}
+	byName := map[string]string{}
+	for _, w := range got {
+		byName[w.name] = w.id
+	}
+	for name, id := range want {
+		if byName[name] != id {
+			t.Errorf("workspace %q: id = %q, want %q", name, byName[name], id)
+		}
+	}
+}
+
 // ---- connection state machine ---------------------------------------------
 
 // TestProbeRetryPolicy pins the single-retry policy: the auto-retry delay is
