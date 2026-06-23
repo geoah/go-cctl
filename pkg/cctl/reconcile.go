@@ -96,9 +96,13 @@ func syncCmuxState(cfg *Config) syncResult {
 		targets[localName] = cfg.Servers[localName]
 	}
 
-	// Per-server tmux liveness (sanitized full names) + raw sessions for adopt.
+	// Per-server tmux liveness (sanitized full names) + raw sessions for adopt,
+	// plus which sessions actually have claude running (vs. sitting at a shell
+	// — claude exited, or the session came back as a plain shell after a
+	// reboot). The tmux session existing isn't enough: we want claude up.
 	liveByServer := map[string]map[string]bool{}
 	sessionsByServer := map[string][]SessionInfo{}
+	claudeUpByServer := map[string]map[string]bool{}
 	for name, s := range targets {
 		sessions, err := listSessions(name, s)
 		if err != nil {
@@ -110,6 +114,7 @@ func syncCmuxState(cfg *Config) syncResult {
 		}
 		liveByServer[name] = set
 		sessionsByServer[name] = sessions
+		claudeUpByServer[name] = claudeRunningSessions(s)
 	}
 
 	// Snapshot cmux.
@@ -135,18 +140,13 @@ func syncCmuxState(cfg *Config) syncResult {
 	// Re-read after adoption so open/group/close see the full tracked set.
 	entries := loadManifestEntries()
 
-	// Open a cmux workspace for every LIVE session that doesn't have one, so
-	// cmux mirrors what's actually running (this surfaces remote worktrees
-	// that aren't open yet). Only live sessions — reviving a DEAD session is
-	// the explicit R key. Do this BEFORE grouping so the grouping pass below
-	// files the freshly-opened workspaces too (spawn-time grouping races the
-	// just-created workspace and can't be relied on).
 	// Converge to the manifest (desired state): (re)spawn every tracked
-	// session that isn't fully up. This revives dead-but-tracked sessions
-	// (reboot/kill → `claude --continue`) and opens tabs for live ones that
-	// lost theirs — local and remote alike. dd is the only way to drop a
-	// session from the manifest, so nothing here resurrects something you
-	// deleted.
+	// session that has no workspace OR no live tmux session. This revives
+	// dead-but-tracked sessions (reboot/kill → `claude --continue`) and opens
+	// tabs for live ones that lost theirs — local and remote alike. dd is the
+	// only way to drop a session from the manifest, so nothing here resurrects
+	// something you deleted. Do this BEFORE grouping so the grouping pass
+	// files the freshly-opened workspaces too.
 	for _, e := range entriesToSpawn(views, liveByServer, entries) {
 		if err := restoreSpawn(cfg, e); err != nil {
 			log().Warn("sync-spawn-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
@@ -154,6 +154,32 @@ func syncCmuxState(cfg *Config) syncResult {
 			continue
 		}
 		log().Info("sync-spawn", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "server", e.Server)
+		res.restored++
+	}
+
+	// Restart claude in tracked sessions whose tmux is alive but sitting at a
+	// shell — claude exited, or (common after a reboot) the session came back
+	// as a plain shell so cctl's `new-session -A` just attached it without
+	// launching claude. respawn-window re-runs the launch in place (claude
+	// --continue resumes). Terminal sessions (the `t` key) are meant to be
+	// shells, so they're skipped.
+	for _, e := range entries {
+		srvLive := liveByServer[e.Server]
+		if srvLive == nil || !srvLive[e.TmuxName] {
+			continue // dead/unreachable — handled by the spawn pass above
+		}
+		if claudeUpByServer[e.Server][e.TmuxName] {
+			continue // claude already running
+		}
+		if isTerminalSession(e.Session) {
+			continue // a plain terminal tab — leave it
+		}
+		if err := respawnClaude(cfg, e); err != nil {
+			log().Warn("sync-respawn-fail", "session", e.TmuxName, "err", err.Error())
+			res.errs++
+			continue
+		}
+		log().Info("sync-respawn-claude", "session", e.TmuxName, "server", e.Server)
 		res.restored++
 	}
 
@@ -199,6 +225,67 @@ func entriesToSpawn(views []cmuxWsView, liveByServer map[string]map[string]bool,
 		out = append(out, e)
 	}
 	return out
+}
+
+// claudeRunningSessions returns the set of tmux sessions on a server whose
+// active pane is running something other than a bare shell — i.e. claude (or a
+// tool) is up. A running claude renames its pane title to its version (e.g.
+// "2.1.186"), never a shell name, so checking for a shell is a safe negative:
+// it only flags sessions sitting at a prompt, never a live claude. Returns nil
+// on error (treat as "unknown" → don't respawn).
+func claudeRunningSessions(srv Server) map[string]bool {
+	out, err := runRemote(srv, `tmux list-panes -a -F '#{session_name} #{pane_current_command}' 2>/dev/null || true`)
+	if err != nil {
+		return nil
+	}
+	return parseClaudeRunning(out)
+}
+
+// parseClaudeRunning parses `tmux list-panes -a -F '#{session_name}
+// #{pane_current_command}'`: a session is "claude running" if any of its panes
+// runs a non-shell command. Split out so it's unit-testable.
+func parseClaudeRunning(out string) map[string]bool {
+	up := map[string]bool{}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) < 2 {
+			continue
+		}
+		sess, cmd := fields[0], fields[len(fields)-1]
+		if !isShellCommand(cmd) {
+			up[sess] = true // a non-shell foreground → claude/tool running
+		}
+	}
+	return up
+}
+
+// isShellCommand reports whether a tmux pane_current_command is a bare login/
+// interactive shell (so claude is NOT running there). Leading "-" marks a
+// login shell.
+func isShellCommand(cmd string) bool {
+	switch strings.TrimPrefix(cmd, "-") {
+	case "sh", "bash", "zsh", "fish", "dash", "ksh", "tcsh", "csh":
+		return true
+	}
+	return false
+}
+
+// respawnClaude restarts claude in an existing tmux session that's sitting at a
+// shell, by re-running the current launch script in place (respawn-window -k →
+// claude --continue resumes). The session survives; only the idle shell pane
+// is replaced.
+func respawnClaude(cfg *Config, e wsEntry) error {
+	r, err := cfg.resolve(e.Server, e.Repo)
+	if err != nil {
+		return err
+	}
+	cwd := r.Repo.Path
+	if e.Worktree != "" && e.Worktree != "main" {
+		cwd = worktreePath(r.WorktreeBase, r.RepoName, e.Worktree)
+	}
+	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local)
+	_, err = runRemote(r.Server, fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(e.TmuxName), shellQuote(launch)))
+	return err
 }
 
 // snapshotCmuxViews lists every cmux workspace with its surfaces.

@@ -344,6 +344,39 @@ func TestEntriesToSpawn(t *testing.T) {
 	}
 }
 
+// TestParseClaudeRunning pins the claude-vs-shell detection: a running claude
+// renames its pane to its version (e.g. "2.1.186"), a dead/never-started one
+// sits at a shell. Only shells count as "not running" (so we never respawn
+// over a live claude).
+func TestParseClaudeRunning(t *testing.T) {
+	out := strings.Join([]string{
+		"cctl/rxtx_dev/main/x 2.1.186",    // claude running (version title)
+		"cctl/rxtx_dev/ergogen/y zsh",     // shell → not running
+		"cctl/go-cctl/main/default -bash", // login shell → not running
+		"cctl/olympus/main/z node",        // node (claude) → running
+		"cctl/foo/bar/w nvim",             // a tool → leave (running)
+		"garbage",                         // ignored
+		"",                                // ignored
+	}, "\n")
+	up := parseClaudeRunning(out)
+	if !up["cctl/rxtx_dev/main/x"] || !up["cctl/olympus/main/z"] || !up["cctl/foo/bar/w"] {
+		t.Errorf("non-shell panes should count as running: %+v", up)
+	}
+	if up["cctl/rxtx_dev/ergogen/y"] || up["cctl/go-cctl/main/default"] {
+		t.Errorf("shell panes must NOT count as running (they get respawned): %+v", up)
+	}
+	for _, sh := range []string{"zsh", "bash", "-zsh", "sh", "fish", "dash"} {
+		if !isShellCommand(sh) {
+			t.Errorf("isShellCommand(%q) should be true", sh)
+		}
+	}
+	for _, x := range []string{"node", "claude", "2.1.186", "nvim"} {
+		if isShellCommand(x) {
+			t.Errorf("isShellCommand(%q) should be false", x)
+		}
+	}
+}
+
 func TestDeriveWsMeta(t *testing.T) {
 	cfg := &Config{Servers: map[string]Server{
 		"mac":       {Local: true},
