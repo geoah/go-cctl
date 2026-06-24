@@ -169,7 +169,7 @@ func TestServerUseCmuxSSH(t *testing.T) {
 // gets shellQuoted into a tmux new-session command — both layers must
 // stay valid shell.
 func TestClaudeLaunchScript_BridgeSurvivesQuoting(t *testing.T) {
-	launch := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "", true)
+	launch := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "", true, "sid-test")
 	inner := filepath.Join(t.TempDir(), "inner.sh")
 	if err := os.WriteFile(inner, []byte(launch), 0o644); err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestClaudeLaunchScript_BridgeSurvivesQuoting(t *testing.T) {
 // bridge=true installs the hook + settings overlay and adds --settings
 // to the claude invocation; bridge=false (local) leaves everything out.
 func TestClaudeLaunchScript_NotifyBridge(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "", true)
+	got := claudeLaunchScript("/wt", nil, "", true, "sid-test")
 	for _, want := range []string{
 		"cmux-claude-hook.sh",
 		"claude-cmux-hooks.json",
@@ -202,7 +202,7 @@ func TestClaudeLaunchScript_NotifyBridge(t *testing.T) {
 			t.Errorf("bridge launch script missing %q", want)
 		}
 	}
-	local := claudeLaunchScript("/wt", nil, "", false)
+	local := claudeLaunchScript("/wt", nil, "", false, "sid-test")
 	if strings.Contains(local, "cmux-claude-hook") || strings.Contains(local, "--settings") {
 		t.Errorf("local launch script must not carry the bridge:\n%s", local)
 	}

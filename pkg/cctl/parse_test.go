@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -405,28 +406,51 @@ func TestRemoveWorktreeScript_HasFallbackRm(t *testing.T) {
 
 // ---- claudeLaunchScript ----------------------------------------------------
 
-func TestClaudeLaunchScript_UsesContinueWhenProjectsDirExists(t *testing.T) {
-	got := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "", false)
-	if !strings.Contains(got, "claude --continue") {
-		t.Error("launch script should include claude --continue branch")
+func TestClaudeLaunchScript_PerSessionResumeOrFresh(t *testing.T) {
+	got := claudeLaunchScript("/wt", []string{"--dangerously-skip-permissions"}, "", false, "sid-test")
+	// Per-session id, not the worktree's most-recent conversation: resume this
+	// session's own transcript if it exists, else start fresh pinned to the id.
+	if !strings.Contains(got, "claude --resume sid-test") {
+		t.Errorf("should resume by session id; got:\n%s", got)
 	}
-	if !strings.Contains(got, "~/.claude/projects/") && !strings.Contains(got, "$HOME/.claude/projects") {
-		t.Errorf("launch script should reference claude projects dir; got:\n%s", got)
+	if !strings.Contains(got, "claude --session-id sid-test") {
+		t.Errorf("fresh launch should pin the session id; got:\n%s", got)
+	}
+	if strings.Contains(got, "claude --continue") {
+		t.Errorf("must NOT use --continue (resumes the worktree's latest, not this session); got:\n%s", got)
+	}
+	if !strings.Contains(got, "$proj/$sid.jsonl") {
+		t.Errorf("should branch on this session's transcript file; got:\n%s", got)
 	}
 	if !strings.Contains(got, "tr '/.' '--'") {
 		t.Error("launch script should encode cwd via tr '/.' '--' (claude's project path scheme)")
 	}
 }
 
+func TestClaudeSessionID_DeterministicAndDistinct(t *testing.T) {
+	a := claudeSessionID("local", tmuxName("rxtx.dev", "mneme", "android"))
+	if a != claudeSessionID("local", tmuxName("rxtx.dev", "mneme", "android")) {
+		t.Error("session id must be deterministic for the same identity")
+	}
+	// Same worktree, different session → different id (the whole point).
+	if a == claudeSessionID("local", tmuxName("rxtx.dev", "mneme", "default")) {
+		t.Error("different sessions on one worktree must get different ids")
+	}
+	// Looks like a v5 UUID: 8-4-4-4-12, version nibble 5.
+	if !regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$`).MatchString(a) {
+		t.Errorf("not a valid v5 UUID: %q", a)
+	}
+}
+
 func TestClaudeLaunchScript_AppendsPromptWhenProvided(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "say hi", false)
+	got := claudeLaunchScript("/wt", nil, "say hi", false, "sid-test")
 	if !strings.Contains(got, "say hi") {
 		t.Errorf("prompt should be shell-included in the launch script; got:\n%s", got)
 	}
 }
 
 func TestClaudeLaunchScript_GuardsAgainstMissingCwd(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "", false)
+	got := claudeLaunchScript("/wt", nil, "", false, "sid-test")
 	// If the worktree was deleted, the cd must abort the script (after a
 	// readable pause) instead of letting claude launch in whatever
 	// directory the shell happened to start in.
@@ -458,7 +482,7 @@ func TestAttachOrRespawn_SurvivesDeadSession(t *testing.T) {
 }
 
 func TestClaudeLaunchScript_PrependsCmuxBinWhenInsideCmux(t *testing.T) {
-	got := claudeLaunchScript("/wt", nil, "", false)
+	got := claudeLaunchScript("/wt", nil, "", false, "sid-test")
 	// The script must guard with CMUX_WORKSPACE_ID so it's a no-op when
 	// not running inside cmux (e.g., remote target via mosh).
 	if !strings.Contains(got, `CMUX_WORKSPACE_ID`) {

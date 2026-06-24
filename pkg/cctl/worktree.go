@@ -1,6 +1,7 @@
 package cctl
 
 import (
+	"crypto/sha1"
 	"fmt"
 	"strings"
 )
@@ -200,9 +201,9 @@ func removeWorktreeScript(repoPath, wtPath, worktreeBase string) string {
 // host, so Notification/Stop events land in ~/.cctl/notify.jsonl where
 // the TUI's notifyWatcher picks them up. Local sessions get the same
 // effect natively from cmux's claude wrapper via the PATH injection.
-func claudeLaunchScript(cwd string, claudeFlags []string, prompt string, bridge bool) string {
-	fresh := append([]string{"claude"}, claudeFlags...)
-	resume := append([]string{"claude", "--continue"}, claudeFlags...)
+func claudeLaunchScript(cwd string, claudeFlags []string, prompt string, bridge bool, sessionID string) string {
+	fresh := append([]string{"claude", "--session-id", sessionID}, claudeFlags...)
+	resume := append([]string{"claude", "--resume", sessionID}, claudeFlags...)
 	if prompt != "" {
 		fresh = append(fresh, prompt)
 		resume = append(resume, prompt)
@@ -234,8 +235,13 @@ export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$HOME/.claude/local:
 if [ -n "${CMUX_WORKSPACE_ID:-}" ] && [ -x /Applications/cmux.app/Contents/Resources/bin/claude ]; then
   export PATH="/Applications/cmux.app/Contents/Resources/bin:$PATH"
 fi
+# Per-session claude conversation: resume THIS session's own transcript if it
+# exists, else start a fresh one pinned to this id. Keyed on the session id,
+# not the cwd — so two sessions sharing a worktree don't resume each other
+# (resuming by cwd picked the worktree's most recent chat regardless).
+sid=%s
 proj="$HOME/.claude/projects/$(pwd -P | tr '/.' '--')"
-if [ -d "$proj" ]; then
+if [ -f "$proj/$sid.jsonl" ]; then
   %s
 else
   %s
@@ -246,7 +252,21 @@ echo "(claude exited with status $status — press Enter to close, Ctrl-b d to k
 read _ || true`,
 		shellPath(cwd),
 		ensure,
+		shellQuote(sessionID),
 		resumeCmd,
 		freshCmd,
 	)
+}
+
+// claudeSessionID derives a stable claude --session-id (a v5-style UUID) for a
+// cctl session from its server + tmux name. Deterministic so create and any
+// later revive resolve to the SAME conversation, and distinct per session so
+// two sessions on one worktree stay isolated.
+func claudeSessionID(server, tmuxName string) string {
+	h := sha1.Sum([]byte("cctl-claude-session\x00" + server + "\x00" + tmuxName))
+	var u [16]byte
+	copy(u[:], h[:16])
+	u[6] = (u[6] & 0x0f) | 0x50 // version 5
+	u[8] = (u[8] & 0x3f) | 0x80 // RFC 4122 variant
+	return fmt.Sprintf("%x-%x-%x-%x-%x", u[0:4], u[4:6], u[6:8], u[8:10], u[10:16])
 }

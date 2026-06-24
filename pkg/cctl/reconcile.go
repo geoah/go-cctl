@@ -283,7 +283,7 @@ func respawnClaude(cfg *Config, e wsEntry) error {
 	if e.Worktree != "" && e.Worktree != "main" {
 		cwd = worktreePath(r.WorktreeBase, r.RepoName, e.Worktree)
 	}
-	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local)
+	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local, claudeSessionID(e.Server, e.TmuxName))
 	_, err = runRemote(r.Server, fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(e.TmuxName), shellQuote(launch)))
 	return err
 }

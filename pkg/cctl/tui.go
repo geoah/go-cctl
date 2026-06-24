@@ -1979,7 +1979,7 @@ func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd str
 					if wt != "" && wt != "main" {
 						cwd = worktreePath(r.WorktreeBase, r.RepoName, wt)
 					}
-					launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local)
+					launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local, claudeSessionID(serverName, name))
 					cmd = fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(name), shellQuote(launch))
 				}
 			}
