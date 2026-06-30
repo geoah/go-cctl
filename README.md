@@ -57,9 +57,12 @@ defaults:
   worktree_base: ~/worktrees     # cctl puts every worktree here
   mosh: true                     # use mosh for remotes when available
   claude_flags: ["--dangerously-skip-permissions"]
+  # agent: claude               # which CLI the TUI drives (claude|codex)
+  # codex_flags: []             # flags passed to `codex` when agent: codex
   worktree_post_create:          # run inside each fresh worktree
     - mise trust
   # claude_update: claude update # what UU runs before restarting sessions
+  # codex_update: codex update   # UU command when the resolved agent is codex
 
 servers:
   local:
@@ -110,6 +113,12 @@ The knobs:
 - **`defaults.mosh: true`** uses [mosh](https://mosh.org) instead of
   ssh for remote sessions (better roaming + latency). Falls back
   to ssh per-server with `mosh: false`.
+- **`agent`** — which CLI the TUI's session shortcuts launch: `claude`
+  (default) or `codex`. Resolved most-specific-wins (repo → server →
+  `defaults`), so you can run codex on one repo and claude everywhere
+  else. `claude_flags` / `codex_flags` are passed through to the
+  respective CLI; `claude_update` / `codex_update` are what the `UU`
+  key runs before restarting sessions.
 
 Re-run `cctl init` later for a refreshed example; it never overwrites
 an existing `~/.cctl.yaml`. Run `cctl doctor` if a host or repo looks
@@ -121,6 +130,33 @@ Then launch the TUI:
 ```bash
 cctl
 ```
+
+## Using the TUI
+
+The TUI is a tree of servers → repos → worktrees → sessions. Keys:
+
+| Key | Action |
+| --- | --- |
+| `↑`/`↓`, `j`/`k` | move the cursor |
+| `←`/`→`, `h`/`l` | fold / unfold a server or repo |
+| `PgUp`/`PgDn`, `⌃f`/`⌃b`, `⌃d`/`⌃u` | scroll by page / half-page |
+| `g`/`G`, `Home`/`End` | jump to top / bottom |
+| `⏎` | open or attach the selected row in a cmux tab |
+| `n` | new session — opens the form (worktree, name, **agent**, prompt) |
+| `t` | open a plain terminal tab on the worktree (no agent) |
+| `dd` | delete (press `d` twice): on a session keeps the worktree; on a worktree removes it |
+| `S` / `R` | reconcile — converge cmux + tmux to the manifest (revive, open, group, prune) |
+| `UU` | upgrade the agent on the server (`claude_update`/`codex_update`) and restart its sessions |
+| `/` | filter the tree; `r` refresh; `?` help; `q` quit |
+
+In the **new-session form** (`n`), `Tab`/`↑↓` move between fields,
+`←`/`→`/`Space` on the agent slot toggle **claude ↔ codex**, `⏎`
+creates the session, and `Esc` cancels. The selected agent decides
+which CLI launches; it defaults to the resolved `agent` for that
+server/repo.
+
+The same shortcuts can be scripted directly — see the CLI subcommands
+below (`cctl claude`, `cctl codex`, `cctl ls`, `cctl rm`, …).
 
 ## What it does
 
