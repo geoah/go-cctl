@@ -31,6 +31,9 @@ import (
 //     all four are how cmux says "agent is asking for input / done";
 //     defaulting them on means claude prompts don't get lost when you've
 //     switched away to read PRs or browse code.
+//   - terminal.scrollSpeed: cmux's own terminals default to a 1.0 wheel
+//     multiplier, but `cctl init ghostty` sets mouse-scroll-multiplier = 3 for
+//     standalone ghostty — match it so scrolling feels the same in both.
 var cmuxConfigDefaults = map[string]map[string]any{
 	"app": {
 		"reorderOnNotification":             true,
@@ -46,6 +49,9 @@ var cmuxConfigDefaults = map[string]map[string]any{
 		"unreadPaneRing": true,
 		"paneFlash":      true,
 		"showInMenuBar":  true,
+	},
+	"terminal": {
+		"scrollSpeed": 3,
 	},
 }
 
@@ -66,7 +72,7 @@ cmux plays nicely with cctl's session orchestration:
   app.commandPaletteSearchesAllSurfaces, sidebar.showNotificationMessage,
   sidebar.showBranchDirectory, notifications.dockBadge,
   notifications.unreadPaneRing, notifications.paneFlash,
-  notifications.showInMenuBar.
+  notifications.showInMenuBar, terminal.scrollSpeed.
 
 By default we only set a key if it's absent (so your customizations are
 preserved); pass --force to overwrite.
