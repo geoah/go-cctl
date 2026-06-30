@@ -344,33 +344,50 @@ func TestEntriesToSpawn(t *testing.T) {
 	}
 }
 
-// TestParseClaudeRunning pins the claude-vs-shell detection: a running claude
-// renames its pane to its version (e.g. "2.1.186"), a dead/never-started one
-// sits at a shell. Only shells count as "not running" (so we never respawn
-// over a live claude).
-func TestParseClaudeRunning(t *testing.T) {
-	out := strings.Join([]string{
-		"cctl/rxtx_dev/main/x 2.1.186",    // claude running (version title)
-		"cctl/rxtx_dev/ergogen/y zsh",     // shell → not running
-		"cctl/go-cctl/main/default -bash", // login shell → not running
-		"cctl/olympus/main/z node",        // node (claude) → running
-		"cctl/foo/bar/w nvim",             // a tool → leave (running)
-		"garbage",                         // ignored
-		"",                                // ignored
+// TestParseClaudeRunningTree pins the claude-vs-shell detection by process
+// subtree: a pane's own pid is its shell, so the session counts as "running"
+// only when a non-shell descendant (claude/node, or a tool) exists. This is the
+// fix for tmux reporting pane_current_command=zsh while claude (its own process
+// group) runs underneath — the old pane-command check saw only the shell and
+// got every live session killed+respawned.
+func TestParseClaudeRunningTree(t *testing.T) {
+	// session "x": pane shell 100 has a claude (node) child 101 -> running.
+	// session "y": pane shell 200 is idle (no children)          -> not running.
+	// session "z": pane shell 300 -> zsh 301 (subshell) -> claude 302 (nested) -> running.
+	// session "w": pane shell 400 -> claude 401 -> a bash tool 402: still
+	//              running, because node(claude) sits above the bash child.
+	panes := strings.Join([]string{
+		"cctl/olympus/main/x 100",
+		"cctl/olympus/main/y 200",
+		"cctl/olympus/main/z 300",
+		"cctl/olympus/main/w 400",
+		"garbage", "",
 	}, "\n")
-	up := parseClaudeRunning(out)
-	if !up["cctl/rxtx_dev/main/x"] || !up["cctl/olympus/main/z"] || !up["cctl/foo/bar/w"] {
-		t.Errorf("non-shell panes should count as running: %+v", up)
+	procs := strings.Join([]string{
+		"100 1 zsh",
+		"101 100 claude",
+		"200 1 zsh",
+		"300 1 zsh",
+		"301 300 zsh",
+		"302 301 node",
+		"400 1 -bash",
+		"401 400 node",
+		"402 401 bash",
+		"garbage line", "",
+	}, "\n")
+	up := parseClaudeRunningTree(panes, procs)
+	if !up["cctl/olympus/main/x"] || !up["cctl/olympus/main/z"] || !up["cctl/olympus/main/w"] {
+		t.Errorf("sessions with a non-shell in the subtree should be running: %+v", up)
 	}
-	if up["cctl/rxtx_dev/ergogen/y"] || up["cctl/go-cctl/main/default"] {
-		t.Errorf("shell panes must NOT count as running (they get respawned): %+v", up)
+	if up["cctl/olympus/main/y"] {
+		t.Errorf("an idle-shell session must NOT count as running: %+v", up)
 	}
 	for _, sh := range []string{"zsh", "bash", "-zsh", "sh", "fish", "dash"} {
 		if !isShellCommand(sh) {
 			t.Errorf("isShellCommand(%q) should be true", sh)
 		}
 	}
-	for _, x := range []string{"node", "claude", "2.1.186", "nvim"} {
+	for _, x := range []string{"node", "claude", "nvim"} {
 		if isShellCommand(x) {
 			t.Errorf("isShellCommand(%q) should be false", x)
 		}

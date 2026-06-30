@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -173,6 +174,9 @@ func syncCmuxState(cfg *Config) syncResult {
 		if liveByServer[e.Server] == nil {
 			continue // server unreachable — handled by the spawn pass above
 		}
+		if claudeUpByServer[e.Server] == nil {
+			continue // agent state unknown (probe failed) — never risk killing a live session
+		}
 		live := liveByServer[e.Server][e.TmuxName]
 		agentUp := claudeUpByServer[e.Server][e.TmuxName]
 		attached := attachedByServer[e.Server][e.TmuxName]
@@ -232,36 +236,89 @@ func entriesToSpawn(views []cmuxWsView, liveByServer map[string]map[string]bool,
 	return out
 }
 
-// claudeRunningSessions returns the set of tmux sessions on a server whose
-// active pane is running something other than a bare shell — i.e. claude (or a
-// tool) is up. A running claude renames its pane title to its version (e.g.
-// "2.1.186"), never a shell name, so checking for a shell is a safe negative:
-// it only flags sessions sitting at a prompt, never a live claude. Returns nil
-// on error (treat as "unknown" → don't respawn).
+// psSplitMarker separates the two payloads claudeRunningSessions fetches in a
+// single ssh round-trip: tmux's pane list and a process snapshot.
+const psSplitMarker = "---PSSPLIT---"
+
+// claudeRunningSessions returns the set of tmux sessions on a server that have
+// claude (or any non-shell program) running in one of their panes. It does NOT
+// trust tmux's pane_current_command: claude (node) spawns its own process
+// group, so on Linux tmux reports the pane's *shell* (zsh/bash) as the current
+// command even while claude runs underneath — which made every live session
+// look idle and got it killed+relaunched. Instead it walks each pane's process
+// subtree (ppid links survive the process-group split). Returns nil on error
+// (treated as "unknown" by the caller → never respawn, so a probe blip can't
+// kill a live session).
 func claudeRunningSessions(srv Server) map[string]bool {
-	out, err := runRemote(srv, `tmux list-panes -a -F '#{session_name} #{pane_current_command}' 2>/dev/null || true`)
+	out, err := runRemote(srv, `tmux list-panes -a -F '#{session_name} #{pane_pid}' 2>/dev/null; echo `+psSplitMarker+`; ps -eo pid=,ppid=,comm= 2>/dev/null`)
 	if err != nil {
 		return nil
 	}
-	return parseClaudeRunning(out)
+	panes, procs, ok := strings.Cut(out, psSplitMarker)
+	if !ok {
+		return nil
+	}
+	return parseClaudeRunningTree(panes, procs)
 }
 
-// parseClaudeRunning parses `tmux list-panes -a -F '#{session_name}
-// #{pane_current_command}'`: a session is "claude running" if any of its panes
-// runs a non-shell command. Split out so it's unit-testable.
-func parseClaudeRunning(out string) map[string]bool {
-	up := map[string]bool{}
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(strings.TrimSpace(line))
-		if len(fields) < 2 {
+// parseClaudeRunningTree decides, per tmux session, whether a non-shell program
+// (claude) runs in any of its panes by walking the process subtree rooted at
+// each pane's pid. `panes` is `session_name pane_pid` lines; `procs` is
+// `pid ppid comm` lines (a full `ps` snapshot). A pane's root pid is its shell,
+// so the session counts as running only when a non-shell descendant exists.
+// Split out so it's unit-testable without a live box.
+func parseClaudeRunningTree(panes, procs string) map[string]bool {
+	children := map[int][]int{}
+	comm := map[int]string{}
+	for _, line := range strings.Split(procs, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 3 {
 			continue
 		}
-		sess, cmd := fields[0], fields[len(fields)-1]
-		if !isShellCommand(cmd) {
-			up[sess] = true // a non-shell foreground → claude/tool running
+		pid, err1 := strconv.Atoi(f[0])
+		ppid, err2 := strconv.Atoi(f[1])
+		if err1 != nil || err2 != nil {
+			continue
+		}
+		comm[pid] = strings.Join(f[2:], " ")
+		children[ppid] = append(children[ppid], pid)
+	}
+	up := map[string]bool{}
+	for _, line := range strings.Split(panes, "\n") {
+		f := strings.Fields(strings.TrimSpace(line))
+		if len(f) < 2 {
+			continue
+		}
+		pid, err := strconv.Atoi(f[len(f)-1])
+		if err != nil {
+			continue
+		}
+		if subtreeHasNonShell(pid, children, comm) {
+			up[f[0]] = true
 		}
 	}
 	return up
+}
+
+// subtreeHasNonShell reports whether the process tree rooted at pid contains a
+// process whose command is not a bare shell — i.e. claude (or a tool it ran).
+// The root is the pane's own shell, so only a non-shell descendant trips it.
+func subtreeHasNonShell(root int, children map[int][]int, comm map[int]string) bool {
+	seen := map[int]bool{}
+	stack := []int{root}
+	for len(stack) > 0 {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[pid] {
+			continue // guard against a malformed (cyclic) snapshot
+		}
+		seen[pid] = true
+		if c, ok := comm[pid]; ok && c != "" && !isShellCommand(c) {
+			return true
+		}
+		stack = append(stack, children[pid]...)
+	}
+	return false
 }
 
 // isShellCommand reports whether a tmux pane_current_command is a bare login/
