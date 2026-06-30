@@ -25,7 +25,7 @@ run = '''
     global_bin="$HOME/.local/bin"
     mkdir -p "$global_bin"
 
-    # Version comes from version.txt (managed by `mise run release`); Commit is
+    # Version comes from version.txt (bumped by release-please); Commit is
     # the short SHA for build provenance. So `cctl version` shows e.g.
     # "0.3.1 (a1b2c3d)".
     version="$(cat version.txt 2>/dev/null || echo dev)"
@@ -72,20 +72,7 @@ run = '''
     git config core.hooksPath .githooks
     chmod +x .githooks/* 2>/dev/null || true
     echo "Git hooks enabled (core.hooksPath=.githooks)."
-    echo "Commit subjects are linted as Conventional Commits; cut a release"
-    echo "locally with: mise run release"
-    '''
-
-[tasks.release]
-description = "Cut a release locally: bump semver + CHANGELOG from commits, commit + tag (no push)"
-run = '''
-    set -euo pipefail
-    ./scripts/release.sh "$@"
-    '''
-
-[tasks."release:dry"]
-description = "Preview the next release (version bump + changelog) without writing anything"
-run = '''
-    set -euo pipefail
-    ./scripts/release.sh --dry-run
+    echo "Commit subjects are linted as Conventional Commits so release-please"
+    echo "can derive the version bump + CHANGELOG. Releases are cut in CI:"
+    echo "merge the 'chore(main): release …' PR that release-please maintains."
     '''

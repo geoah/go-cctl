@@ -92,6 +92,12 @@ If a regression is "obvious in hindsight," the test is too.
 - **`pkg/cctl/spawn.go`** — terminal-emulator dispatch (cmux only).
   `detectSpawner` is the entry point; new providers plug in via
   `allSpawners()`.
+- **`pkg/cctl/agent.go`, `cmd_claude.go`, `cmd_codex.go`** — the
+  claude/codex agent abstraction. `config.go`'s `resolve()` picks the
+  agent for a target (repo → server → `defaults`, via `firstNonEmpty`);
+  `agent.go` turns that into launch/attach/update scripts; the two
+  `cmd_*` files are the CLI entry points. New agents plug in here, not
+  in the TUI.
 - **`pkg/cctl/session.go`, `worktree_list.go`, `discover.go`,
   `worktree.go`** — pure-ish data layer (parsers, name assignment,
   shell-script builders). This is where most tests live and should live.
@@ -126,36 +132,42 @@ version upgrades and stays on `$PATH` even when mise's go shim isn't
 active. If you made several edits across a turn, install at the end of
 the turn so the running binary always reflects the latest code.
 
-## Versioning, changelog & releases (local, `mise run release`)
+## Versioning, changelog & releases (release-please, in CI)
 
 [Semantic versioning](https://semver.org/) + [Keep a Changelog](https://keepachangelog.com/)
-from [Conventional Commit](https://www.conventionalcommits.org/) subjects —
-done locally, no CI. You never edit the version or changelog by hand.
+from [Conventional Commit](https://www.conventionalcommits.org/) subjects, driven
+by [release-please](https://github.com/googleapis/release-please) in GitHub
+Actions. You never edit the version or changelog by hand, and you never tag
+manually.
 
 The flow:
 
 ```
-write Conventional Commits  →  mise run release
-  → computes the next version from commits since the last tag
-    (feat → minor, fix/perf → patch, <type>! or "BREAKING CHANGE" → major)
-  → bumps version.txt, prepends a grouped CHANGELOG.md section
-  → commits "chore(release): vX.Y.Z" and tags vX.Y.Z
-  → prints the push command (it does NOT push or build artifacts)
+merge Conventional Commits to main
+  → release-please opens/updates a "chore(main): release X.Y.Z" PR
+    (feat → minor, fix/perf → patch, <type>! or "BREAKING CHANGE" → major;
+     pre-1.0 a breaking change bumps minor — see bump-minor-pre-major)
+  → the PR bumps version.txt and regenerates the CHANGELOG.md section
+  → merging that PR tags vX.Y.Z and publishes the GitHub Release
 ```
 
-`mise run release:dry` previews the bump + changelog without writing anything.
-Other commit types (`docs`/`chore`/`refactor`/`test`/`ci`/`build`/`style`)
-don't trigger a release on their own; if there are none releasable the script
-says so and stops. The logic lives in `scripts/release.sh`.
-
-After it runs, push with: `git push origin HEAD --follow-tags`.
+Config lives in `release-please-config.json` (release-type `simple`, which
+tracks the version in `version.txt`) + `.release-please-manifest.json` (the
+last released version). The workflow is `.github/workflows/release-please.yml`;
+it needs the one-time repo setting **Settings → Actions → General → "Allow
+GitHub Actions to create and approve pull requests."** Other commit types
+(`docs`/`chore`/`refactor`/`test`/`ci`/`build`/`style`) don't trigger a release
+on their own — release-please just rolls them into the next feat/fix release.
 
 `version.txt` is embedded into the binary at build time via the mise tasks and
 shown by `cctl version`; a bare `go install …@vX` recovers the version from the
 module build info instead.
 
-A local `commit-msg` hook lints Conventional Commit format so the release
-script can parse history (enable once with `mise run hooks:setup`; bypass a
-one-off with `CCTL_NO_LINT=1 git commit …`). There is no CI — run
-`mise run cctl:test` (and `…:test:integration` for lifecycle changes)
-yourself.
+CI runs on every push + PR (`.github/workflows/ci.yml`: gofmt, `go vet`,
+`go build`, `go test -race`). The unit suite runs there; the integration suite
+(`//go:build integration`) needs real ssh/tmux/workspace and only runs locally
+(`mise run cctl:test:integration`) — run it yourself for lifecycle changes.
+PR titles are linted as Conventional Commits (`.github/workflows/pr-title.yml`)
+because we squash-merge, so the title becomes the commit release-please parses;
+the local `commit-msg` hook mirrors this for your own commits (enable once with
+`mise run hooks:setup`; bypass a one-off with `CCTL_NO_LINT=1 git commit …`).

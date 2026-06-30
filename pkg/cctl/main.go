@@ -18,7 +18,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Version is the semver from version.txt (managed by `mise run release`),
+// Version is the semver from version.txt (bumped by release-please),
 // injected at build time via -ldflags (see the cctl:install mise task).
 // Defaults to "dev" for a plain `go build`; versionString() then falls back
 // to the module build info.

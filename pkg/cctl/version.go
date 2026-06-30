@@ -9,9 +9,9 @@ import (
 
 // Commit is the short git SHA the binary was built from, set at build time
 // via -ldflags (see the cctl:install / cctl:build mise tasks). Empty on a
-// plain `go build`. Version comes from version.txt (managed by
-// `mise run release`) injected the same way; `go install …@vX` falls back to
-// the module version embedded in the build info.
+// plain `go build`. Version comes from version.txt (bumped by release-please)
+// injected the same way; `go install …@vX` falls back to the module version
+// embedded in the build info.
 var Commit = ""
 
 // versionString renders the semver plus the build commit when known, e.g.
