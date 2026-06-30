@@ -12,6 +12,24 @@ session on it opens as a tab inside that workspace (`t` adds a plain
 terminal tab, no claude); re-attaching focuses the existing workspace
 instead of duplicating it.
 
+## cmux compatibility
+
+cctl drives cmux through its CLI (`new-workspace`, `list-workspaces`,
+`workspace-group`, `rename-tab`, `notify`, `ssh`). Those interfaces move,
+so we pin a known-good baseline here and review cmux's changelog against
+it before bumping:
+
+| | Version |
+| --- | --- |
+| **Tested with** | cmux **0.64.16** |
+| **Changelog reviewed through** | cmux **v0.64.17** |
+| **Minimum** | 0.64.x with `workspace-group` support (older releases untested) |
+
+Check your local cmux with `cmux --version`. When bumping the tested
+version, diff cmux's
+[releases](https://github.com/manaflow-ai/cmux/releases) since the row
+above and update it in the same change.
+
 ## Install
 
 The recommended path is via [mise](https://mise.jdx.dev), which manages
