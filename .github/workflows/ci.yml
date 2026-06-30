@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: gofmt
+        run: |
+          # Fail if any tracked .go file isn't gofmt-clean.
+          unformatted="$(gofmt -l $(git ls-files '*.go'))"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+      - run: go vet ./...
+      - run: go build ./...
+      # Unit tests only (with the race detector — the TUI is goroutine-heavy).
+      # The integration suite (//go:build integration) drives real ssh/tmux and
+      # a reachable workspace, so it can't run here; exercise it locally with
+      # `mise run cctl:test:integration`.
+      - run: go test -race ./...
