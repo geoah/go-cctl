@@ -103,17 +103,23 @@ func syncCmuxState(cfg *Config) syncResult {
 	liveByServer := map[string]map[string]bool{}
 	sessionsByServer := map[string][]SessionInfo{}
 	claudeUpByServer := map[string]map[string]bool{}
+	attachedByServer := map[string]map[string]bool{}
 	for name, s := range targets {
 		sessions, err := listSessions(name, s)
 		if err != nil {
 			continue
 		}
 		set := make(map[string]bool, len(sessions))
+		attached := make(map[string]bool, len(sessions))
 		for _, ss := range sessions {
 			set[ss.Name] = true
+			if ss.Attached {
+				attached[ss.Name] = true
+			}
 		}
 		liveByServer[name] = set
 		sessionsByServer[name] = sessions
+		attachedByServer[name] = attached
 		claudeUpByServer[name] = claudeRunningSessions(s)
 	}
 
@@ -157,29 +163,28 @@ func syncCmuxState(cfg *Config) syncResult {
 		res.restored++
 	}
 
-	// Restart claude in tracked sessions whose tmux is alive but sitting at a
-	// shell — claude exited, or (common after a reboot) the session came back
-	// as a plain shell so cctl's `new-session -A` just attached it without
-	// launching claude. respawn-window re-runs the launch in place (claude
-	// --continue resumes). Terminal sessions (the `t` key) are meant to be
-	// shells, so they're skipped.
+	// Restart the agent in tracked sessions whose tmux is alive but sitting at
+	// a shell — the agent exited, or (common after a reboot) the session came
+	// back as a plain shell so cctl's `new-session -A` just attached it without
+	// launching the agent. respawn-window re-runs the launch in place (claude
+	// --continue / codex resume --last resumes). See shouldRespawnSession for
+	// the exact gating (notably: never respawn an attached session).
 	for _, e := range entries {
-		srvLive := liveByServer[e.Server]
-		if srvLive == nil || !srvLive[e.TmuxName] {
-			continue // dead/unreachable — handled by the spawn pass above
+		if liveByServer[e.Server] == nil {
+			continue // server unreachable — handled by the spawn pass above
 		}
-		if claudeUpByServer[e.Server][e.TmuxName] {
-			continue // claude already running
-		}
-		if isTerminalSession(e.Session) {
-			continue // a plain terminal tab — leave it
+		live := liveByServer[e.Server][e.TmuxName]
+		agentUp := claudeUpByServer[e.Server][e.TmuxName]
+		attached := attachedByServer[e.Server][e.TmuxName]
+		if !shouldRespawnSession(live, agentUp, attached, isTerminalSession(e.Session)) {
+			continue
 		}
 		if err := respawnClaude(cfg, e); err != nil {
 			log().Warn("sync-respawn-fail", "session", e.TmuxName, "err", err.Error())
 			res.errs++
 			continue
 		}
-		log().Info("sync-respawn-claude", "session", e.TmuxName, "server", e.Server)
+		log().Info("sync-respawn-agent", "session", e.TmuxName, "server", e.Server)
 		res.restored++
 	}
 
@@ -274,6 +279,22 @@ func isShellCommand(cmd string) bool {
 // shell, by re-running the current launch script in place (respawn-window -k →
 // claude --continue resumes). The session survives; only the idle shell pane
 // is replaced.
+// shouldRespawnSession decides whether the reconcile revive pass relaunches the
+// agent in a tracked session. It revives a session only when it is:
+//   - live in tmux (exists; a wiped/dead one is handled by the spawn pass), and
+//   - not already running the agent (a non-shell foreground = agent up), and
+//   - NOT attached, and
+//   - not a plain terminal tab (the `t` key).
+//
+// The attached guard is the important one: reconcile runs after every action
+// (e.g. a `dd` on another row), and respawn-window -k on a session the user is
+// sitting in would kill their work mid-look — which reads as "deleting one
+// session interrupted my other session". An attached shell is left alone; the
+// user can relaunch the agent themselves. Only detached shells get revived.
+func shouldRespawnSession(live, agentUp, attached, terminal bool) bool {
+	return live && !agentUp && !attached && !terminal
+}
+
 func respawnClaude(cfg *Config, e wsEntry) error {
 	r, err := cfg.resolve(e.Server, e.Repo)
 	if err != nil {
@@ -283,7 +304,13 @@ func respawnClaude(cfg *Config, e wsEntry) error {
 	if e.Worktree != "" && e.Worktree != "main" {
 		cwd = worktreePath(r.WorktreeBase, r.RepoName, e.Worktree)
 	}
-	launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local, claudeSessionID(e.Server, e.TmuxName))
+	// Relaunch the agent this session was created with (persisted in the
+	// manifest); fall back to the config-resolved agent for older/adopted
+	// entries that predate per-session tracking.
+	if e.Agent != "" {
+		r.Agent = e.Agent
+	}
+	launch := agentLaunchScript(r, cwd, "", e.TmuxName)
 	_, err = runRemote(r.Server, fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(e.TmuxName), shellQuote(launch)))
 	return err
 }
@@ -658,14 +685,19 @@ func restoreSpawn(cfg *Config, e wsEntry) error {
 	if e.Worktree != "" && e.Worktree != "main" {
 		cwd = worktreePath(r.WorktreeBase, r.RepoName, e.Worktree)
 	}
+	// Honor the session's recorded agent (fallback: config-resolved).
+	if e.Agent != "" {
+		r.Agent = e.Agent
+	}
 	group, groupCwd := repoGroup(r)
 	_, err = spawnInNewWindow(cfg, r.Server, r.UseMosh,
-		attachOrRespawn(r, tmuxName(r.RepoName, e.Worktree, e.Session), cwd),
+		agentAttachOrRespawn(r, tmuxName(r.RepoName, e.Worktree, e.Session), cwd),
 		SpawnSpec{
 			Server:     e.Server,
 			Repo:       e.Repo,
 			Worktree:   e.Worktree,
 			Session:    e.Session,
+			Agent:      r.Agent,
 			Cwd:        workspaceCwd(r, e.Worktree),
 			WsTitle:    cmuxWsTitle(e.Repo, e.Worktree, e.Session),
 			TabTitle:   e.Session,

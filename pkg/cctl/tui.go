@@ -460,7 +460,8 @@ type tuiModel struct {
 	wtInput      textinput.Model
 	nameInput    textinput.Model
 	promptInput  textinput.Model
-	formFocus    int // index into formFields (which depends on formWorktree presence)
+	formAgent    string // chosen agent for the new session ("claude"/"codex"); defaults to the resolved agent
+	formFocus    int    // focus index over formFields()+1 (the trailing slot is the agent toggle)
 
 	// k9s-style filter — when non-empty, only rows matching this substring
 	// (or whose descendants match) are rendered.
@@ -640,6 +641,7 @@ type prepareDoneMsg struct {
 	repo       string
 	worktree   string
 	session    string
+	agent      string // resolved agent for this session ("claude"/"codex"), persisted to the manifest
 	group      string // sidebar group: the repo ("rxtx.dev" local, "server/repo" remote)
 	groupCwd   string // anchor cwd when the group is first created (repo path)
 	label      string
@@ -1177,6 +1179,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			Repo:          msg.repo,
 			Worktree:      msg.worktree,
 			Session:       msg.session,
+			Agent:         msg.agent,
 			Cwd:           msg.cwd,
 			WsTitle:       msg.wsTitle,
 			TabTitle:      msg.tabTitle,
@@ -1390,6 +1393,20 @@ func (m *tuiModel) formFields() []*textinput.Model {
 
 func (m *tuiModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	fields := m.formFields()
+	// Focus cycles over the text fields plus one trailing slot: the agent
+	// toggle (index == len(fields)). focusInputs mirrors m.formFocus onto the
+	// textinputs, blurring all when the agent slot is focused.
+	agentIdx := len(fields)
+	total := len(fields) + 1
+	focusInputs := func() {
+		for i, f := range fields {
+			if i == m.formFocus {
+				f.Focus()
+			} else {
+				f.Blur()
+			}
+		}
+	}
 	switch msg.String() {
 	case "esc", "ctrl+c":
 		m.mode = modeBrowse
@@ -1397,26 +1414,21 @@ func (m *tuiModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			f.Blur()
 		}
 		return m, nil
-	case "tab":
-		m.formFocus = (m.formFocus + 1) % len(fields)
-		for i, f := range fields {
-			if i == m.formFocus {
-				f.Focus()
-			} else {
-				f.Blur()
-			}
-		}
+	case "tab", "down":
+		m.formFocus = (m.formFocus + 1) % total
+		focusInputs()
 		return m, nil
-	case "shift+tab":
-		m.formFocus = (m.formFocus - 1 + len(fields)) % len(fields)
-		for i, f := range fields {
-			if i == m.formFocus {
-				f.Focus()
-			} else {
-				f.Blur()
-			}
-		}
+	case "shift+tab", "up":
+		m.formFocus = (m.formFocus - 1 + total) % total
+		focusInputs()
 		return m, nil
+	case "left", "right", " ":
+		// On the agent slot, these toggle claude/codex. On a text field they
+		// fall through to the textinput (cursor move / typing a space).
+		if m.formFocus == agentIdx {
+			m.formAgent = otherAgent(m.formAgent)
+			return m, nil
+		}
 	case "enter", "shift+enter", "ctrl+enter", "alt+enter":
 		wt := m.formWorktree
 		if wt == "" {
@@ -1435,9 +1447,10 @@ func (m *tuiModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		prompt := strings.TrimSpace(m.promptInput.Value())
 		server, repo := m.formServer, m.formRepo
+		agent := m.formAgent
 		log().Info("tui-form-submit",
 			"server", server, "repo", repo, "wt", wt, "session", name,
-			"prompt_len", len(prompt))
+			"agent", agent, "prompt_len", len(prompt))
 		m.mode = modeBrowse
 		for _, f := range fields {
 			f.Blur()
@@ -1452,11 +1465,16 @@ func (m *tuiModel) handleFormKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				"wait for the running action to finish before creating this session")
 		}
 		id, tick := m.startTask(key, fmt.Sprintf("preparing %s/%s/%s/%s…", server, repo, wt, name))
-		return m, tea.Batch(tick, m.newSessionPrepareCmd(server, repo, wt, name, prompt, id))
+		return m, tea.Batch(tick, m.newSessionPrepareCmd(server, repo, wt, name, prompt, agent, id))
 	}
-	var cmd tea.Cmd
-	*fields[m.formFocus], cmd = fields[m.formFocus].Update(msg)
-	return m, cmd
+	// Text input only receives keys when a text field is focused (not the
+	// agent slot).
+	if m.formFocus < len(fields) {
+		var cmd tea.Cmd
+		*fields[m.formFocus], cmd = fields[m.formFocus].Update(msg)
+		return m, cmd
+	}
+	return m, nil
 }
 
 // handleFilterKey edits m.filter live (each keystroke triggers rebuildRows so
@@ -1696,6 +1714,12 @@ func (m *tuiModel) startNewForm() (tea.Model, tea.Cmd) {
 	m.wtInput.SetValue("")
 	m.nameInput.SetValue("")
 	m.promptInput.SetValue("")
+	// Default the agent toggle to the server/repo's resolved agent so the
+	// common case is one Enter; the user can ←/→ to override per session.
+	m.formAgent = agentClaude
+	if r, err := m.cfg.resolve(server, repo); err == nil {
+		m.formAgent = r.Agent
+	}
 	m.formFocus = 0
 	fields := m.formFields()
 	for i, f := range fields {
@@ -1934,25 +1958,16 @@ func (m *tuiModel) upgradeClaude() (tea.Model, tea.Cmd) {
 			"wait for the running action to finish before upgrading claude")
 	}
 	srv := m.cfg.Servers[server]
-	updateCmd := m.cfg.claudeUpdateCmd()
-	log().Info("tui-upgrade-claude", "server", server, "sessions", len(names), "cmd", updateCmd)
+	log().Info("tui-upgrade-agents", "server", server, "sessions", len(names))
 	// Keyed on the server row so everything underneath it is blocked (and
-	// spins) while claude upgrades and the sessions bounce.
+	// spins) while the agent(s) upgrade and the sessions bounce.
 	id, tick := m.startTask("server:"+server,
-		fmt.Sprintf("upgrading claude on %s (then restarting %d session(s))…", server, len(names)))
-	return m, tea.Batch(tick, m.upgradeClaudeCmd(server, srv, updateCmd, names, id))
+		fmt.Sprintf("upgrading agents on %s (then restarting %d session(s))…", server, len(names)))
+	return m, tea.Batch(tick, m.upgradeClaudeCmd(server, srv, names, id))
 }
 
-func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd string, sessions []string, taskID int) tea.Cmd {
+func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, sessions []string, taskID int) tea.Cmd {
 	return func() tea.Msg {
-		out, err := runRemote(srv, claudeUpdateScript(updateCmd))
-		if err != nil {
-			return actionDoneMsg{
-				msg:    fmt.Sprintf("claude upgrade failed on %s", serverName),
-				err:    fmt.Errorf("%s: %w — %s", updateCmd, err, abbrev(strings.TrimSpace(out), 200)),
-				taskID: taskID,
-			}
-		}
 		// Map sanitized tmux repo names back to real ones so resolve() finds
 		// the worktree (e.g. "rxtx_dev" → "rxtx.dev").
 		bySafe := map[string]string{}
@@ -1961,25 +1976,51 @@ func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd str
 				bySafe[tmuxSafeName(n)] = n
 			}
 		}
+		// Sessions on one server can resolve to different agents (different
+		// repos), so the self-update is keyed on the resolved agent and run at
+		// most once per agent. If an agent's update fails we skip respawning
+		// that agent's sessions — same conservative intent as the original
+		// "update failed → don't bounce sessions", scoped per agent.
+		updated := map[string]bool{}
+		updateErrs := map[string]string{}
+		ensureUpdate := func(agent string) bool {
+			if updated[agent] {
+				return updateErrs[agent] == ""
+			}
+			updated[agent] = true
+			cmd := m.cfg.agentUpdateCmd(agent)
+			if out, err := runRemote(srv, agentUpdateScript(cmd)); err != nil {
+				updateErrs[agent] = fmt.Sprintf("%s: %v — %s", cmd, err, abbrev(strings.TrimSpace(out), 200))
+				log().Warn("tui-agent-update-fail", "server", serverName, "agent", agent, "err", err.Error())
+				return false
+			}
+			return true
+		}
+
 		restarted, failed := 0, 0
 		for _, name := range sessions {
 			// Respawn with the CURRENT launch script (not the window's stale
-			// original), so the restart picks up the new claude binary AND the
-			// current flags/hooks — notably cctl's --settings notification
-			// bridge. claude --continue resumes the conversation, so the
-			// session survives. Falls back to re-running the original command
-			// when we can't resolve the session's worktree.
+			// original), so the restart picks up the new agent binary AND the
+			// current flags/hooks. claude --continue / codex resume --last
+			// resumes the conversation, so the session survives. Falls back to
+			// re-running the original command when we can't resolve the
+			// session's worktree.
 			cmd := fmt.Sprintf("tmux respawn-window -k -t %s", shellQuote(name))
 			if repo, wt, _, ok := parseTmuxName(name); ok {
 				if real, found := bySafe[repo]; found {
 					repo = real
 				}
 				if r, rerr := m.cfg.resolve(serverName, repo); rerr == nil {
+					if !ensureUpdate(r.Agent) {
+						// Update for this agent failed; leave the session as-is.
+						failed++
+						continue
+					}
 					cwd := r.Repo.Path
 					if wt != "" && wt != "main" {
 						cwd = worktreePath(r.WorktreeBase, r.RepoName, wt)
 					}
-					launch := claudeLaunchScript(cwd, r.ClaudeFlags, "", !r.Server.Local, claudeSessionID(serverName, name))
+					launch := agentLaunchScript(r, cwd, "", name)
 					cmd = fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(name), shellQuote(launch))
 				}
 			}
@@ -1990,7 +2031,19 @@ func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, updateCmd str
 			}
 			restarted++
 		}
-		msg := fmt.Sprintf("claude upgraded on %s; relaunched %d session(s)", serverName, restarted)
+		msg := fmt.Sprintf("agents upgraded on %s; relaunched %d session(s)", serverName, restarted)
+		if len(updateErrs) > 0 {
+			parts := make([]string, 0, len(updateErrs))
+			for agent, e := range updateErrs {
+				parts = append(parts, fmt.Sprintf("%s (%s)", agent, e))
+			}
+			return actionDoneMsg{
+				msg:     msg,
+				err:     fmt.Errorf("agent update failed: %s", strings.Join(parts, "; ")),
+				refresh: serverName,
+				taskID:  taskID,
+			}
+		}
 		if failed > 0 {
 			return actionDoneMsg{
 				msg:     msg,
@@ -2016,11 +2069,18 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 		if sess.Worktree != "" && sess.Worktree != "main" {
 			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
 		}
+		// Preserve the session's recorded agent across attach (so re-recording
+		// the manifest doesn't overwrite a per-session override with the config
+		// default); fall back to the resolved agent for untracked sessions.
+		if a := manifestAgent(serverName, repoName, sess.Worktree, sess.Session); a != "" {
+			r.Agent = a
+		}
 		group, groupCwd := repoGroup(r)
 		return prepareDoneMsg{
 			server:     r.Server,
 			useMosh:    r.UseMosh,
-			cmdStr:     attachOrRespawn(r, sess.Name, cwd),
+			cmdStr:     agentAttachOrRespawn(r, sess.Name, cwd),
+			agent:      r.Agent,
 			cwd:        workspaceCwd(r, sess.Worktree),
 			wsTitle:    cmuxWsTitle(repoName, sess.Worktree, sess.Session),
 			tabTitle:   sess.Session,
@@ -2042,18 +2102,23 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 	}
 }
 
-func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionName, prompt string, taskID int) tea.Cmd {
+func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionName, prompt, agent string, taskID int) tea.Cmd {
 	return func() tea.Msg {
 		start := time.Now()
 		log().Info("tui-new-session-prepare-start",
-			"server", serverName, "repo", repoName, "wt", worktree, "session", sessionName)
+			"server", serverName, "repo", repoName, "wt", worktree, "session", sessionName, "agent", agent)
 		r, err := m.cfg.resolve(serverName, repoName)
 		if err != nil {
 			log().Error("tui-new-session-resolve-fail",
 				"server", serverName, "repo", repoName, "err", err.Error())
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
-		cmdStr, err := prepareClaude(r, worktree, sessionName, "", prompt, false, false)
+		// The form's agent choice overrides the config-resolved default for
+		// this session; everything downstream (launch + manifest) uses it.
+		if agent != "" {
+			r.Agent = agent
+		}
+		cmdStr, err := prepareAgent(r, worktree, sessionName, "", prompt, false, false)
 		log().Info("tui-new-session-prepare-done",
 			"server", serverName, "session", sessionName,
 			"dur", time.Since(start).String(), "err", errString(err))
@@ -2072,6 +2137,7 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 			repo:       repoName,
 			worktree:   worktree,
 			session:    sessionName,
+			agent:      r.Agent,
 			group:      group,
 			groupCwd:   groupCwd,
 			label:      fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
@@ -3259,6 +3325,14 @@ func (m *tuiModel) formView() string {
 		}
 		b.WriteString(marker + f.label + " " + f.input.View() + "\n")
 	}
+	// Agent toggle — the trailing focus slot (index == len(fields)).
+	agentMarker := "  "
+	agentHint := ""
+	if m.formFocus == len(fields) {
+		agentMarker = cursorStyle.Render("▸ ")
+		agentHint = dimStyle.Render("  ←/→ switch")
+	}
+	b.WriteString(agentMarker + "agent:    " + cursorStyle.Render("‹ "+m.formAgent+" ›") + agentHint + "\n")
 	b.WriteString("\n")
 	if m.statusErr != "" {
 		b.WriteString(errorStyle.Width(m.errorWidth()).Render("error: "+m.statusErr) + "\n\n")
@@ -3266,7 +3340,7 @@ func (m *tuiModel) formView() string {
 	if m.formWorktree == "" {
 		b.WriteString(dimStyle.Render("worktree = `main` reuses the primary checkout; any other name creates a new worktree on branch <prefix>/<name>.") + "\n")
 	}
-	b.WriteString(dimStyle.Render("⏎ submit · tab switch · esc cancel"))
+	b.WriteString(dimStyle.Render("⏎ submit · tab switch · ←/→ agent · esc cancel"))
 	return b.String()
 }
 
