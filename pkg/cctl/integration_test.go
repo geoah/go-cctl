@@ -20,6 +20,8 @@ package cctl
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -521,5 +523,63 @@ func TestIntegration_LoadConfig_ExpansionOnLocal(t *testing.T) {
 	}
 	if r.Server.Local != true {
 		t.Errorf("resolved local server's Local field is false: %+v", r.Server)
+	}
+}
+
+// TestInitTmux_ConfigParsesInRealTmux feeds the generated tmux managed block to
+// a real tmux server and asserts it both parses cleanly and registers the
+// copy/clipboard directives. The unit test only checks the lines are present as
+// strings; this is the guard that catches tmux *rejecting* them — e.g. the
+// "invalid octal escape" bug where the OSC 52 Ms override needed doubled
+// backslashes (\\E / \\007) to survive tmux's config-string lexer.
+func TestInitTmux_ConfigParsesInRealTmux(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not on PATH")
+	}
+	dir := t.TempDir()
+	conf := filepath.Join(dir, "tmux.conf")
+	merged, _ := mergeManagedBlock("", tmuxManagedBody) // exactly what applyManaged writes
+	if err := os.WriteFile(conf, []byte(merged), 0o644); err != nil {
+		t.Fatalf("write temp tmux.conf: %v", err)
+	}
+
+	sock := fmt.Sprintf("cctl-it-%d", os.Getpid())
+	run := func(args ...string) (string, error) {
+		out, err := exec.Command("tmux", append([]string{"-L", sock}, args...)...).CombinedOutput()
+		return string(out), err
+	}
+	// Start an isolated server (-f /dev/null) so the user's real ~/.tmux.conf
+	// doesn't interfere, then source ours explicitly to surface parse errors.
+	if out, err := exec.Command("tmux", "-L", sock, "-f", "/dev/null", "new-session", "-d", "-s", "probe").CombinedOutput(); err != nil {
+		t.Fatalf("start tmux server: %v\n%s", err, out)
+	}
+	defer run("kill-server")
+
+	if out, err := run("source-file", conf); err != nil ||
+		strings.Contains(strings.ToLower(out), "invalid") ||
+		strings.Contains(strings.ToLower(out), "error") {
+		t.Fatalf("tmux rejected the generated config: err=%v out=%q", err, out)
+	}
+
+	checks := []struct {
+		what  string
+		args  []string
+		needs string
+	}{
+		{"Ms OSC 52 override", []string{"show-options", "-g", "terminal-overrides"}, "Ms="},
+		{"set-clipboard", []string{"show-options", "-s", "set-clipboard"}, "on"},
+		{"allow-passthrough", []string{"show-options", "-g", "allow-passthrough"}, "on"},
+		{"focus-events", []string{"show-options", "-g", "focus-events"}, "on"},
+		{"aggressive-resize", []string{"show-options", "-gw", "aggressive-resize"}, "on"},
+	}
+	for _, c := range checks {
+		out, err := run(c.args...)
+		if err != nil {
+			t.Errorf("%s: query failed: %v", c.what, err)
+			continue
+		}
+		if !strings.Contains(out, c.needs) {
+			t.Errorf("%s: expected %q in tmux output, got %q", c.what, c.needs, strings.TrimSpace(out))
+		}
 	}
 }

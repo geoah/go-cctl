@@ -32,10 +32,22 @@ set -g mouse on
 # vim-style copy mode (Ctrl-b [ then v / y)
 setw -g mode-keys vi
 
-# OSC 52: forward tmux's copy buffer to the terminal's clipboard. Works
-# transparently through mosh/ssh; the terminal emulator must allow OSC 52
-# writes (` + "`cctl init ghostty`" + ` sets this up for ghostty).
+# OSC 52: let tmux push its copy buffer to the terminal's clipboard, so copy
+# works even over ssh/mosh where there's no local pbcopy. Two parts:
+#   1. set-clipboard on -> tmux emits OSC 52 when you copy.
+#   2. the Ms override is REQUIRED, not optional: tmux only emits OSC 52 if the
+#      terminal's terminfo advertises the "Ms" capability, and xterm-256color
+#      (mosh's default $TERM) ships none -- so without this, set-clipboard is a
+#      silent no-op on remotes. It also forces the "c" (CLIPBOARD) selector,
+#      the only one mosh-server forwards. The terminal emulator must still allow
+#      OSC 52 writes (` + "`cctl init ghostty`" + ` sets clipboard-write = allow,
+#      which cmux's terminals also read).
 set -s set-clipboard on
+set -ag terminal-overrides ",*:Ms=\\E]52;c%p1%.0s;%p2%s\\007"
+
+# allow inner TUIs/agents (claude, codex, vim) to emit their own passthrough
+# escape sequences (OSC 52, images, ...) out to the terminal
+set -g allow-passthrough on
 
 # y in copy mode copies the selection to the system clipboard
 bind -T copy-mode-vi y send-keys -X copy-pipe-and-cancel
@@ -49,6 +61,13 @@ set -g history-limit 100000
 
 # zero escape time helps vim, fzf, and the claude TUI feel snappy
 set -sg escape-time 0
+
+# let vim/nvim and agent TUIs react to focus gain/lose
+set -g focus-events on
+
+# when re-attached from a smaller (e.g. roamed mosh) client, resize to the
+# active client instead of locking the whole session to the smallest one
+set -g aggressive-resize on
 
 # broadcast the tmux session name as the terminal window title so ghostty's
 # tab title is consistent whether you're attached locally or via mosh.
@@ -69,13 +88,17 @@ func newInitTmuxCmd() *cobra.Command {
 best-practice defaults for the mosh + tmux + ghostty stack:
 
   - mouse on, vim-style copy mode
-  - OSC 52 set-clipboard (works through mosh/ssh)
+  - OSC 52 set-clipboard with the Ms-capability + "c" selector override that
+    makes copy actually reach the system clipboard over ssh/mosh (without it,
+    set-clipboard is a silent no-op on xterm-256color / mosh)
+  - allow-passthrough so agent TUIs can emit their own escape sequences
   - drag-end copy that keeps your scroll position
+  - focus-events + aggressive-resize for nicer multi-client / roamed sessions
   - tmux session name broadcast as the terminal window title
   - 100k history, zero escape-time, true color
 
 Re-run any time to refresh the block; lines outside the markers are not
-touched.`,
+touched. Use --server <name> to apply the same block on a remote you mosh to.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return applyManaged("tmux", "~/.tmux.conf", tmuxManagedBody, server)
@@ -167,6 +190,9 @@ func reportMosh(serverName string) error {
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Hint: mosh >= 1.4 has working scrollback. If yours is older, attach the")
 	fmt.Fprintln(os.Stderr, "tmux session and scroll inside tmux's copy-mode instead.")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "Hint: copy-to-clipboard over mosh needs the OSC 52 Ms override in tmux")
+	fmt.Fprintf(os.Stderr, "(mosh only forwards the \"c\" selector). Run `cctl init tmux --server %s`.\n", serverName)
 	return nil
 }
 
