@@ -176,6 +176,24 @@ server/repo.
 The same shortcuts can be scripted directly — see the CLI subcommands
 below (`cctl claude`, `cctl codex`, `cctl ls`, `cctl rm`, …).
 
+### Applying tmux/mosh config changes
+
+tmux only reads `~/.tmux.conf` when its server starts, so edits from
+`cctl init tmux` (locally or `--server <name>`) don't affect
+already-running sessions. To roll them out everywhere:
+
+```bash
+cctl --restart-all        # reload tmux config on every server, then
+                          # destroy + restore all tracked sessions
+```
+
+This reloads each server's tmux config, kills every tracked session,
+and lets the startup reconcile revive them — `claude --continue` /
+`codex resume --last` resume the conversations, and the fresh
+attach/mosh reconnect picks up the new clipboard/scroll settings. It
+prompts first (bypass with `-y`), and only touches cctl's own
+sessions, not unrelated tmux sessions on the host.
+
 ## What it does
 
 - Discovers git repos under configured roots (local + remote).
