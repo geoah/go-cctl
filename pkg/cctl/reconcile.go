@@ -842,3 +842,75 @@ func closeCmuxWorkspacesByPrefix(prefix string) {
 		log().Info("cmux-close-workspace", "ws", w.name)
 	}
 }
+
+// ---- restart-all (the `cctl --restart-all` destroy pass) -------------------
+
+// tmuxReloadCmd re-reads ~/.tmux.conf into the running tmux server so
+// `cctl init tmux` edits take effect there. Non-fatal: `|| true` swallows the
+// "no server running" case (no sessions to restart anyway) and a missing file.
+const tmuxReloadCmd = "tmux source-file ~/.tmux.conf 2>/dev/null || true"
+
+// restartResult summarizes a --restart-all destroy pass.
+type restartResult struct {
+	servers  int // servers in the config
+	reloaded int // servers whose tmux config we reloaded
+	killed   int // tracked sessions killed (to be revived by the reconcile)
+}
+
+// restartTargets returns the tracked sessions --restart-all will kill: every
+// manifest entry whose server still exists in the config. An entry for a server
+// that's been removed can't be restored, so it's skipped rather than killed
+// with no way back. Pure, so it's unit-testable.
+func restartTargets(cfg *Config, entries []wsEntry) []wsEntry {
+	var out []wsEntry
+	for _, e := range entries {
+		if _, ok := cfg.Servers[e.Server]; ok {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// restartAllTrackedSessions is the destroy half of `cctl --restart-all`: reload
+// each server's tmux config (so ~/.tmux.conf / mosh edits take effect), then
+// kill every tracked cctl session. The manifest is left intact, so the startup
+// reconcile that runs right after revives each one fresh (`tmux new-session -A`
+// + `claude --continue` / `codex resume`), and the fresh client attach picks up
+// the reloaded Ms/scroll settings. Live sessions are adopted first so nothing is
+// killed without a restore path. Per-server/-session errors are logged, not
+// fatal — one unreachable host shouldn't block the rest.
+func restartAllTrackedSessions(cfg *Config) restartResult {
+	res := restartResult{servers: len(cfg.Servers)}
+
+	// 1. Adopt live sessions so the manifest is the complete tracked set before
+	//    we start killing (otherwise a live-but-unadopted session would be
+	//    killed with nothing in the manifest to restore it).
+	for name, s := range cfg.Servers {
+		sessions, err := listSessions(name, s)
+		if err != nil {
+			log().Warn("restart-all-list-fail", "server", name, "err", err.Error())
+			continue
+		}
+		adoptFromTmux(name, s, sessions)
+	}
+
+	// 2. Reload tmux config per server so the revived sessions get new settings.
+	for name, s := range cfg.Servers {
+		if _, err := runRemote(s, tmuxReloadCmd); err != nil {
+			log().Warn("restart-all-reload-fail", "server", name, "err", err.Error())
+			continue
+		}
+		res.reloaded++
+	}
+
+	// 3. Kill each tracked session. Manifest kept → the reconcile restores it.
+	for _, e := range restartTargets(cfg, loadManifestEntries()) {
+		s := cfg.Servers[e.Server]
+		if _, err := runRemote(s, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null || true", shellQuote(e.TmuxName))); err != nil {
+			log().Warn("restart-all-kill-fail", "session", e.TmuxName, "err", err.Error())
+			continue
+		}
+		res.killed++
+	}
+	return res
+}

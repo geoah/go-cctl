@@ -12,8 +12,10 @@
 package cctl
 
 import (
+	"bufio"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -25,6 +27,14 @@ import (
 var Version = "dev"
 
 var configPath string
+
+// restartAll / restartYes back the `cctl --restart-all [--yes]` startup flow:
+// reload tmux config + destroy every tracked session, then let the TUI's normal
+// startup reconcile revive them so new ~/.tmux.conf / mosh settings take hold.
+var (
+	restartAll bool
+	restartYes bool
+)
 
 var rootCmd = &cobra.Command{
 	Use:           "cctl",
@@ -40,6 +50,7 @@ below are for scripting and direct CLI use.
 
 Examples:
   cctl                                  # open the TUI
+  cctl --restart-all                    # restart every tracked session (new tmux/mosh settings)
   cctl claude workspace audit -- investigate the auth bug
   cctl claude local/my-app hotfix --no-worktree
   cctl ls
@@ -47,13 +58,53 @@ Examples:
   cctl rma workspace --yes
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if restartAll {
+			if err := restartAllOnStartup(restartYes); err != nil {
+				return err
+			}
+		}
 		return runTUI()
 	},
+}
+
+// restartAllOnStartup is the `--restart-all` entry point: reload every server's
+// tmux config and kill all tracked sessions (after a confirmation, unless
+// --yes), then return so the TUI's startup reconcile revives them. The revived
+// sessions attach fresh, so the reloaded tmux Ms/scroll settings and a
+// re-established mosh connection all take effect.
+func restartAllOnStartup(yes bool) error {
+	cfg, _, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	targets := restartTargets(cfg, loadManifestEntries())
+	fmt.Fprintf(os.Stderr, "restart-all: reload tmux config on %d server(s) and restart %d tracked session(s).\n",
+		len(cfg.Servers), len(targets))
+	fmt.Fprintln(os.Stderr, "            running agents will be killed and resumed (claude --continue / codex resume --last).")
+	if len(targets) == 0 {
+		fmt.Fprintln(os.Stderr, "            (no tracked sessions — will just reload config.)")
+	}
+	if !yes {
+		fmt.Fprint(os.Stderr, "Continue? [y/N] ")
+		line, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+		switch strings.ToLower(strings.TrimSpace(line)) {
+		case "y", "yes":
+		default:
+			fmt.Fprintln(os.Stderr, "restart-all: aborted — opening the TUI without restarting.")
+			return nil
+		}
+	}
+	res := restartAllTrackedSessions(cfg)
+	fmt.Fprintf(os.Stderr, "restart-all: reloaded config on %d/%d server(s); restarting %d session(s) — reconciling on startup...\n",
+		res.reloaded, res.servers, res.killed)
+	return nil
 }
 
 func init() {
 	rootCmd.Version = versionString()
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "path to cctl config (default: $CCTL_CONFIG or ~/.cctl.yaml)")
+	rootCmd.Flags().BoolVar(&restartAll, "restart-all", false, "on startup, reload tmux config and destroy+restore all tracked sessions so new ~/.tmux.conf / mosh settings take effect")
+	rootCmd.Flags().BoolVarP(&restartYes, "yes", "y", false, "skip the --restart-all confirmation prompt")
 
 	rootCmd.AddCommand(newClaudeCmd())
 	rootCmd.AddCommand(newCodexCmd())
