@@ -96,15 +96,15 @@ VStack(alignment: .leading, spacing: 4) {
                     // bounds (padding + background), unlike Button which only
                     // registered on the text glyphs.
                     .onTapGesture { cmux("workspace.select", workspace_id: w.id) }
-                // Right-click actions. Note: "close" only closes the cmux
-                // tab — the session stays in cctl's manifest, so the next
-                // reconcile revives it (a true delete is dd in the cctl TUI).
+                // Right-click actions. Close is a REAL delete: the cctl TUI
+                // watches cmux workspace.closed events and removes the session
+                // (manifest + tmux) like dd. Requires a running cctl TUI.
                 .contextMenu {
                     Button(action: { cmux("workspace.select", workspace_id: w.id) }) {
                         Text("Focus")
                     }
                     Button(action: { cmux("workspace.close", workspace_id: w.id) }) {
-                        Text("Close tab (revives on next reconcile)")
+                        Text("Close session")
                     }
                 }
             }
