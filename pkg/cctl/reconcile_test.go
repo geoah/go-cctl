@@ -670,3 +670,82 @@ func TestOrderedCmuxWorkspaceIDs(t *testing.T) {
 		t.Fatalf("single workspace should return nil, got %v", got)
 	}
 }
+
+func TestEntriesToSpawnMatchesByWsID(t *testing.T) {
+	live := map[string]map[string]bool{"local": {"cctl/r/main/a": true}}
+	// Workspace was RENAMED (title no longer matches) but the UUID is
+	// recorded — the entry must still count as present.
+	views := []cmuxWsView{{id: "UUID-1", name: "renamed-by-user"}}
+	entries := []wsEntry{{
+		Server: "local", Repo: "r", Worktree: "main", Session: "a",
+		TmuxName: "cctl/r/main/a", WsID: "UUID-1",
+	}}
+	if out := entriesToSpawn(views, live, entries); len(out) != 0 {
+		t.Fatalf("UUID-matched workspace treated as missing: %+v", out)
+	}
+	// Same entry without the UUID → title mismatch → spawn.
+	entries[0].WsID = ""
+	if out := entriesToSpawn(views, live, entries); len(out) != 1 {
+		t.Fatalf("title-mismatched workspace without UUID should spawn, got %d", len(out))
+	}
+}
+
+func TestBackfillWsIDs(t *testing.T) {
+	views := []cmuxWsView{
+		{id: "UUID-A", name: "r/main/a"},
+		{id: "UUID-B", name: "r/main/b"},
+	}
+	entries := []wsEntry{
+		{Server: "s", Repo: "r", Worktree: "main", Session: "a"},                 // no id → backfill A
+		{Server: "s", Repo: "r", Worktree: "main", Session: "b", WsID: "STALE"},  // dead id → re-backfill B
+		{Server: "s", Repo: "r", Worktree: "main", Session: "c", WsID: "UUID-A"}, // hmm: live id, title absent → keep
+	}
+	got := backfillWsIDs(views, entries)
+	if got[0].WsID != "UUID-A" {
+		t.Errorf("entry a: want UUID-A, got %q", got[0].WsID)
+	}
+	if got[1].WsID != "UUID-B" {
+		t.Errorf("entry b: stale id not re-backfilled, got %q", got[1].WsID)
+	}
+	if got[2].WsID != "UUID-A" {
+		t.Errorf("entry c: live recorded id must never be moved, got %q", got[2].WsID)
+	}
+}
+
+func TestParseCmuxWorkspaceClosed(t *testing.T) {
+	// Captured from cmux 0.64.18 `cmux events`.
+	frame := `{"boot_id":"B","category":"workspace","id":"B-42","name":"workspace.closed","payload":{"custom_title":"r/main/a","cwd":"/x","index":null,"selected":false,"tab_count":12,"title":"r/main/a","workspace_id":"323ADC8F-1311-4CD8-8FD0-2DF66C2E7087"}}`
+	id, title, ok := parseCmuxWorkspaceClosed([]byte(frame))
+	if !ok || id != "323ADC8F-1311-4CD8-8FD0-2DF66C2E7087" || title != "r/main/a" {
+		t.Fatalf("parse = (%q, %q, %v)", id, title, ok)
+	}
+	// Other event names and garbage are rejected.
+	if _, _, ok := parseCmuxWorkspaceClosed([]byte(`{"name":"workspace.created","payload":{"workspace_id":"X"}}`)); ok {
+		t.Fatal("workspace.created must not parse as a close")
+	}
+	if _, _, ok := parseCmuxWorkspaceClosed([]byte(`not json`)); ok {
+		t.Fatal("garbage must not parse")
+	}
+}
+
+func TestHealSanitizedRepoNames(t *testing.T) {
+	cfg := &Config{Servers: map[string]Server{
+		"kv-dev": {Repos: map[string]Repo{"rxtx.dev": {}}},
+		"ambig":  {Repos: map[string]Repo{"a.b": {}, "a:b": {}}}, // both sanitize to a_b
+	}}
+	entries := []wsEntry{
+		{Server: "kv-dev", Repo: "rxtx_dev", Worktree: "phoenix", Session: "poc"},
+		{Server: "kv-dev", Repo: "rxtx.dev", Worktree: "main", Session: "x"}, // already canonical
+		{Server: "ambig", Repo: "a_b", Worktree: "w", Session: "s"},          // ambiguous — untouched
+	}
+	got := healSanitizedRepoNames("", cfg, nil, entries)
+	if got[0].Repo != "rxtx.dev" || got[0].WsTitle != "rxtx.dev/phoenix/poc" {
+		t.Errorf("alias not healed: %+v", got[0])
+	}
+	if got[1].Repo != "rxtx.dev" {
+		t.Errorf("canonical entry disturbed: %+v", got[1])
+	}
+	if got[2].Repo != "a_b" {
+		t.Errorf("ambiguous alias must not be guessed: %+v", got[2])
+	}
+}

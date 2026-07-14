@@ -1,6 +1,7 @@
 package cctl
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,7 +24,13 @@ func runTUI() error {
 	}
 	log().Info("tui-start", "config", path, "servers", len(cfg.Servers))
 	p := tea.NewProgram(newTUIModel(cfg), tea.WithAltScreen())
+	// Mirror cmux-side workspace closes into cctl: the watcher tails
+	// `cmux events` and the Update loop verifies + treats a user-closed
+	// tracked workspace as a dd. Canceled when the TUI exits.
+	evCtx, evCancel := context.WithCancel(context.Background())
+	go watchCmuxWorkspaceCloses(evCtx, func(msg cmuxWorkspaceClosedMsg) { p.Send(msg) })
 	final, err := p.Run()
+	evCancel()
 	// Kill the notification-bridge ssh tails on every exit path so they
 	// can't outlive the TUI.
 	if fm, ok := final.(*tuiModel); ok {
@@ -445,6 +452,9 @@ type tuiModel struct {
 	// syncing is true while a reconcile is in flight; detached session rows
 	// render as amber "syncing" during it, settling to green/red after.
 	syncing bool
+	// recentWsCloses timestamps cmux workspace.closed events for the burst
+	// circuit-breaker (a flood means cmux is shutting down, not user intent).
+	recentWsCloses []time.Time
 
 	// scrollOffset is the index of the first tree row drawn in the main
 	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
@@ -719,6 +729,17 @@ func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr string, spec S
 	// without identity aren't tracked.
 	if spec.hasIdentity() {
 		manifestUpsert(spec)
+		// Record the cmux workspace UUID immediately (reconcile also
+		// backfills, but capturing it here makes the very first dd/match
+		// rename-proof). Retry-lookup: new-workspace can return before the
+		// workspace is queryable.
+		if sp.Name() == "cmux" && spec.WsTitle != "" {
+			if cli := cmuxCLIPath(); cli != "" {
+				if id, ok := findCmuxWorkspaceByNameRetry(cli, spec.WsTitle); ok {
+					manifestSetWsID(spec.Server, spec.Repo, spec.Worktree, spec.Session, id)
+				}
+			}
+		}
 	}
 	return sp.Name(), nil
 }
@@ -1208,6 +1229,25 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, c)
 		}
 		return m, tea.Batch(cmds...)
+
+	case cmuxWorkspaceClosedMsg:
+		// A workspace disappeared on the cmux side (sidebar X, Close menu,
+		// Cmd-W). Burst = cmux quitting/restarting, not user intent: ignore
+		// and let the next reconcile heal. Singles get verified (workspace
+		// really gone, cmux still answering) and then deleted like dd.
+		now := time.Now()
+		recent := m.recentWsCloses[:0]
+		for _, t := range m.recentWsCloses {
+			if now.Sub(t) < 5*time.Second {
+				recent = append(recent, t)
+			}
+		}
+		m.recentWsCloses = append(recent, now)
+		if len(m.recentWsCloses) > 2 {
+			log().Warn("cmux-close-burst-ignored", "n", len(m.recentWsCloses), "ws", msg.title)
+			return m, nil
+		}
+		return m, m.cmuxWorkspaceClosedCmd(msg)
 
 	case runSyncMsg:
 		// Debounced post-startup sync (a server reconnected/refreshed).
@@ -1895,6 +1935,58 @@ func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
 // syncCmd runs the reconcile off the UI goroutine. `quiet` suppresses the
 // "already in sync" note (used by the automatic startup pass, which
 // shouldn't chatter when there's nothing to do).
+// cmuxWorkspaceClosedCmd verifies a cmux-side workspace close and, when it
+// holds up, deletes the session the way dd does (kill tmux + forget in the
+// manifest). Guards, in order: cmux must still answer (a dying cmux mustn't
+// mass-delete), the workspace must actually be gone, and the session must be
+// tracked. cctl-initiated closes never get here as tracked — every internal
+// path removes the manifest entry BEFORE closing the workspace.
+func (m *tuiModel) cmuxWorkspaceClosedCmd(msg cmuxWorkspaceClosedMsg) tea.Cmd {
+	cfg := m.cfg
+	return func() tea.Msg {
+		time.Sleep(1500 * time.Millisecond)
+		cli := cmuxCLIPath()
+		if cli == "" {
+			return nil
+		}
+		wss := listCmuxWorkspaces(cli)
+		if len(wss) == 0 {
+			return nil // CLI failed / cmux shutting down — not user intent
+		}
+		for _, w := range wss {
+			if msg.wsID != "" && w.id == msg.wsID {
+				return nil // still exists — spurious
+			}
+		}
+		var entry *wsEntry
+		for _, e := range loadManifestEntries() {
+			if (msg.wsID != "" && e.WsID == msg.wsID) ||
+				(msg.title != "" && cmuxWsTitle(e.Repo, e.Worktree, e.Session) == msg.title) {
+				ec := e
+				entry = &ec
+				break
+			}
+		}
+		if entry == nil {
+			return nil // untracked (or cctl removed it first) — nothing to do
+		}
+		srv, ok := cfg.Servers[entry.Server]
+		if !ok {
+			return nil
+		}
+		log().Info("cmux-close-dd", "ws", msg.title, "session", entry.TmuxName, "server", entry.Server)
+		if _, err := runRemote(srv, fmt.Sprintf("tmux kill-session -t %s", shellQuote(entry.TmuxName))); err != nil {
+			log().Debug("cmux-close-dd-kill-fail", "session", entry.TmuxName, "err", err.Error())
+		}
+		manifestRemove(entry.Server, entry.Repo, entry.Worktree, entry.Session)
+		return actionDoneMsg{
+			msg:     fmt.Sprintf("closed %s — session removed", cmuxWsTitle(entry.Repo, entry.Worktree, entry.Session)),
+			refresh: entry.Server,
+			taskID:  -1,
+		}
+	}
+}
+
 func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 	return func() tea.Msg {
 		res := syncCmuxState(m.cfg)
@@ -2155,7 +2247,7 @@ func (m *tuiModel) openSessionViaReconcile(e wsEntry, label, refresh string, tas
 	}
 	manifestUpsertEntry(e)
 	if !up {
-		if err := restoreSpawn(m.cfg, e); err != nil {
+		if err := restoreSpawn(m.cfg, e, true); err != nil {
 			log().Warn("tui-open-spawn-fail", "ws", e.WsTitle, "err", err.Error())
 			return prepareDoneMsg{err: err, label: label, refresh: refresh, taskID: taskID}
 		}
@@ -2267,8 +2359,15 @@ func (m *tuiModel) killCmd(serverName, repoName, tmuxFullName, worktreeName, ses
 		// dd removes the session everywhere: forget it in the restore
 		// manifest (so sync won't bring it back) and close its cmux workspace
 		// so the window matches cctl. Best-effort — a missing one is fine.
+		wsID := ""
+		for _, e := range loadManifestEntries() {
+			if e.Server == serverName && e.Repo == repoName && e.Worktree == worktreeName && e.Session == session {
+				wsID = e.WsID
+				break
+			}
+		}
 		manifestRemove(serverName, repoName, worktreeName, session)
-		closeCmuxWorkspaceByTitle(cmuxWsTitle(repoName, worktreeName, session))
+		closeCmuxWorkspaceByIDOrTitle(wsID, cmuxWsTitle(repoName, worktreeName, session))
 		// "main" worktree is the original checkout — never delete it.
 		if removeWorktree && worktreeName != "main" {
 			wt := worktreePath(r.WorktreeBase, r.RepoName, worktreeName)

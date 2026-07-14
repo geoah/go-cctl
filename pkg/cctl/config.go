@@ -289,6 +289,24 @@ func (c *Config) resolve(serverName, repoName string) (*Resolved, error) {
 		}
 	}
 	repo, ok := allRepos[repoName]
+	if !ok && repoName != "" {
+		// Heal tmux-sanitized aliases: adoption used to record parseTmuxName
+		// output verbatim, so "rxtx.dev" sessions were tracked under repo
+		// "rxtx_dev" — a name that can never match. When exactly one available
+		// repo sanitizes to the requested name, resolve to it (ambiguity stays
+		// an error: never guess between "a.b" and "a:b").
+		match, n := "", 0
+		for name := range allRepos {
+			if tmuxSafeName(name) == repoName {
+				match, n = name, n+1
+			}
+		}
+		if n == 1 {
+			log().Info("resolve-repo-alias", "server", serverName, "from", repoName, "to", match)
+			repoName = match
+			repo, ok = allRepos[match]
+		}
+	}
 	if !ok {
 		if repoName == "" {
 			return nil, fmt.Errorf("server %q has %d repos; specify one with %s/<repo> (available: %s)", serverName, len(allRepos), serverName, strings.Join(repoNames(allRepos), ", "))

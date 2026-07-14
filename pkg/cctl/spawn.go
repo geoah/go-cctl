@@ -77,6 +77,10 @@ type SpawnSpec struct {
 	// mirror it. Everywhere else (new session, detached resurrect) the
 	// wrapper script MUST actually run.
 	FocusExisting bool
+	// Focus makes the spawned/healed surface take focus. Interactive opens
+	// set it (the user asked for THIS session right now); reconcile leaves
+	// it false so a background converge never yanks focus between tabs.
+	Focus bool
 	// Remote, when set, requests a cmux remote-SSH workspace instead of
 	// a local one running the wrapper Script: the workspace is created
 	// via `cmux ssh` and tabs run Remote.Command in remote shells. The
@@ -184,7 +188,7 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 			log().Warn("cmux-ssh-spawn-fail (falling back to local wrapper workspace)", "ws", spec.WsTitle, "err", err.Error())
 		}
 	}
-	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle)
+	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle, spec.Focus)
 	if err != nil {
 		return fmt.Errorf("cmux build args: %w", err)
 	}
@@ -367,15 +371,18 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 			if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
 				return fmt.Errorf("respawn-pane (heal existing tab): %w: %s", err, strings.TrimSpace(string(out)))
 			}
-			// No select-workspace: reconcile runs this for many sessions and
-			// stealing focus per heal makes the UI jump between tabs. Interactive
-			// opens focus explicitly via focusCmuxWorkspace.
+			// Focus only when the spawn is interactive (spec.Focus) —
+			// background reconcile heals many sessions and must not yank
+			// focus between tabs.
 			setCmuxSurfaceResume(cli, wsID, sid, spec.TabTitle, spec.Cwd, spec.Script)
+			if spec.Focus {
+				focusCmuxSurface(cli, wsID, sid)
+			}
 			log().Info("cmux-heal-tab", "ws", wsID, "surface", sid, "tab", spec.TabTitle)
 			return nil
 		}
 	}
-	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", "false").CombinedOutput()
+	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", fmt.Sprintf("%v", spec.Focus)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("new-surface: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -403,9 +410,25 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 		}
 	}
 	setCmuxSurfaceResume(cli, wsID, sid, spec.TabTitle, spec.Cwd, spec.Script)
-	// No select-workspace: background reconcile spawns many sessions and must
-	// not yank focus between them. Interactive opens focus via focusCmuxWorkspace.
+	// Focus only for interactive spawns (spec.Focus); background reconcile
+	// must not yank focus between the many sessions it heals.
+	if spec.Focus {
+		focusCmuxSurface(cli, wsID, sid)
+	}
 	return nil
+}
+
+// focusCmuxSurface brings the user to a spawned/healed session's workspace —
+// the "drop me on what I just opened" step of an interactive open. cmux's CLI
+// has no surface/tab-select verb (only creation-time --focus, which the
+// new-surface path already uses), so an existing healed tab can only be
+// focused at workspace granularity. Best-effort: failures are logged, never
+// fatal.
+func focusCmuxSurface(cli, wsID, sid string) {
+	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+		log().Debug("cmux-select-workspace-fail", "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	}
+	_ = sid // no CLI verb to select an existing surface (cmux 0.64.x)
 }
 
 // cmuxUUIDRe / cmuxSurfaceRefRe match the two id shapes the cmux CLI
@@ -611,7 +634,7 @@ func parseCmuxWorkspaceList(raw string) []cmuxWorkspace {
 // cmuxNewWorkspaceArgs builds the argv for `cmux new-workspace ...` with a
 // single-terminal layout (no Files panel). Split out so the args are testable
 // without spawning cmux.
-func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
+func cmuxNewWorkspaceArgs(script, cwd, title string, focus bool) ([]string, error) {
 	layout, err := buildCmuxLayout(script)
 	if err != nil {
 		return nil, err
@@ -623,9 +646,9 @@ func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
 	args = append(args,
 		"--cwd", cwd,
 		"--layout", layout,
-		// --focus false: reconcile creates many workspaces and must not steal
-		// focus. Interactive opens focus the target via focusCmuxWorkspace.
-		"--focus", "false",
+		// focus=false for reconcile (creating many workspaces must not steal
+		// focus); true for interactive opens so the user lands on the new tab.
+		"--focus", fmt.Sprintf("%v", focus),
 	)
 	return args, nil
 }

@@ -89,6 +89,7 @@ func syncCmuxState(cfg *Config) syncResult {
 	// Clean up legacy cctl resume-command bindings (the cmux "auto restore?"
 	// prompt spam). No-op once gone, since cctl no longer creates them.
 	pruneCctlResumeCommands(cli)
+	manifestCompact()
 	localName, _, hasLocal := findLocalServer(cfg)
 
 	// Pick the servers to reconcile against.
@@ -157,6 +158,8 @@ func syncCmuxState(cfg *Config) syncResult {
 	// Re-read after adoption so open/group/close see the full tracked set.
 	entries := loadManifestEntries()
 	entries = dropUnrepresentableEntries(cli, views, entries, &res)
+	entries = backfillWsIDs(views, entries)
+	entries = healSanitizedRepoNames(cli, cfg, views, entries)
 
 	// Converge to the manifest (desired state): (re)spawn every tracked
 	// session that has no workspace OR no live tmux session. This revives
@@ -166,7 +169,7 @@ func syncCmuxState(cfg *Config) syncResult {
 	// something you deleted. Do this BEFORE grouping so the grouping pass
 	// files the freshly-opened workspaces too.
 	for _, e := range entriesToSpawn(views, liveByServer, entries) {
-		if err := restoreSpawn(cfg, e); err != nil {
+		if err := restoreSpawn(cfg, e, false); err != nil {
 			log().Warn("sync-spawn-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
 			res.errs++
 			continue
@@ -333,8 +336,9 @@ func dropCmuxGroupsAndAnchors(cli string, cfg *Config, views []cmuxWsView, entri
 		log().Info("sync-ungroup", "group", g.name)
 	}
 	desired := manifestWsSet()
+	desiredIDs := manifestWsIDSet()
 	for _, w := range views {
-		if desired[w.name] || !anchors[w.name] {
+		if desired[w.name] || desiredIDs[w.id] || !anchors[w.name] {
 			continue // a tracked session, or not a repo-group anchor name
 		}
 		if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
@@ -408,8 +412,10 @@ func dropUnrepresentableEntries(cli string, views []cmuxWsView, entries []wsEntr
 // the spawn would fail). Pure, so it's unit-testable.
 func entriesToSpawn(views []cmuxWsView, liveByServer map[string]map[string]bool, entries []wsEntry) []wsEntry {
 	existing := map[string]bool{}
+	existingID := map[string]bool{}
 	for _, w := range views {
 		existing[w.name] = true
+		existingID[w.id] = true
 	}
 	var out []wsEntry
 	for _, e := range entries {
@@ -418,13 +424,94 @@ func entriesToSpawn(views []cmuxWsView, liveByServer map[string]map[string]bool,
 			continue // server unreachable — leave it alone
 		}
 		name := cmuxWsTitle(e.Repo, e.Worktree, e.Session)
-		if srvLive[e.TmuxName] && existing[name] {
+		// The workspace counts as present when its recorded UUID is live
+		// (rename-proof) or, for entries without one yet, its title matches.
+		hasWs := (e.WsID != "" && existingID[e.WsID]) || existing[name]
+		if srvLive[e.TmuxName] && hasWs {
 			continue // already up (live + has a tab)
 		}
 		existing[name] = true // de-dup if two entries map to the same name
 		out = append(out, e)
 	}
 	return out
+}
+
+// healSanitizedRepoNames rewrites entries whose Repo is the tmux-sanitized
+// alias of exactly one statically-configured repo on their server — adoption
+// used to record parseTmuxName output verbatim, so "rxtx.dev" sessions were
+// tracked under repo "rxtx_dev". Such an entry can never cfg.resolve, which
+// made every reconcile burn an error on it forever (errs=4 in every summary).
+// The entry is rewritten in place (wrapper script kept) and its workspace —
+// matched by recorded UUID, else by the old title — renamed to the canonical
+// "repo/worktree/session".
+func healSanitizedRepoNames(cli string, cfg *Config, views []cmuxWsView, entries []wsEntry) []wsEntry {
+	for i := range entries {
+		e := entries[i]
+		srv, ok := cfg.Servers[e.Server]
+		if !ok {
+			continue
+		}
+		if _, ok := srv.Repos[e.Repo]; ok {
+			continue // resolves as-is
+		}
+		match, n := "", 0
+		for name := range srv.Repos {
+			if tmuxSafeName(name) == e.Repo {
+				match, n = name, n+1
+			}
+		}
+		if n != 1 {
+			continue // no alias match, or ambiguous — leave it for the human
+		}
+		oldTitle := cmuxWsTitle(e.Repo, e.Worktree, e.Session)
+		log().Info("sync-heal-repo-alias", "server", e.Server, "from", e.Repo, "to", match)
+		manifestRewriteRepo(e.Server, e.Repo, e.Worktree, e.Session, match)
+		entries[i].Repo = match
+		entries[i].WsTitle = cmuxWsTitle(match, e.Worktree, e.Session)
+		id := e.WsID
+		if id == "" {
+			for _, w := range views {
+				if w.name == oldTitle {
+					id = w.id
+					break
+				}
+			}
+		}
+		if id != "" && cli != "" {
+			if out, err := cmuxCmd(cli, "workspace-action", "--action", "rename", "--workspace", id, "--title", entries[i].WsTitle).CombinedOutput(); err != nil {
+				log().Debug("sync-heal-rename-fail", "ws", oldTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			}
+		}
+	}
+	return entries
+}
+
+// backfillWsIDs records each tracked session's cmux workspace UUID: entries
+// whose recorded id is missing (or points at a workspace that no longer
+// exists) get the id of the workspace matching their title. UUIDs make
+// matching rename-proof; titles remain the bootstrap. Returns the updated
+// slice for downstream passes; changed ids are persisted via manifestSetWsID.
+func backfillWsIDs(views []cmuxWsView, entries []wsEntry) []wsEntry {
+	liveID := map[string]bool{}
+	byName := map[string]string{}
+	for _, w := range views {
+		liveID[w.id] = true
+		byName[w.name] = w.id
+	}
+	for i := range entries {
+		e := entries[i]
+		if e.WsID != "" && liveID[e.WsID] {
+			continue // recorded id still valid — never let a title collision move it
+		}
+		id := byName[cmuxWsTitle(e.Repo, e.Worktree, e.Session)]
+		if id == "" || id == e.WsID {
+			continue
+		}
+		entries[i].WsID = id
+		manifestSetWsID(e.Server, e.Repo, e.Worktree, e.Session, id)
+		log().Debug("sync-wsid-backfill", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "id", id)
+	}
+	return entries
 }
 
 // psSplitMarker separates the two payloads claudeRunningSessions fetches in a
@@ -615,6 +702,14 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 		}
 	}
 	have := manifestKeySet()
+	// Dedupe by tmux identity as well: an entry adopted under a sanitized
+	// alias ("rxtx_dev") and later healed to the canonical repo ("rxtx.dev")
+	// has a different KEY but the same tmux session — without this check
+	// every reconcile re-adopted the alias and the manifest ping-ponged.
+	haveTmux := map[string]bool{}
+	for _, e := range loadManifestEntries() {
+		haveTmux[e.Server+"\x00"+e.TmuxName] = true
+	}
 	n := 0
 	for _, s := range sessions {
 		repo := s.Repo
@@ -626,7 +721,7 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 			worktree = real
 		}
 		key := manifestKey(serverName, repo, worktree, s.Session)
-		if have[key] {
+		if have[key] || haveTmux[serverName+"\x00"+s.Name] {
 			continue
 		}
 		manifestUpsertEntry(wsEntry{
@@ -661,6 +756,7 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 			desiredTmux[tmuxName(r, w, s)] = true
 		}
 	}
+	desiredIDs := manifestWsIDSet()
 	srvByWs := map[string]string{}
 	for _, e := range entries {
 		srvByWs[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e.Server
@@ -677,6 +773,9 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		live := liveByServer[server]
 		if live == nil {
 			continue // server unreachable — can't tell; leave it
+		}
+		if desiredIDs[w.id] {
+			continue // tracked by UUID — renames can't make it look like junk
 		}
 		if !shouldCloseDeadWorkspace(w.name, meta, live, desired, desiredTmux, closeUnmatched) {
 			continue
@@ -1068,10 +1167,17 @@ func parseCmuxGroups(raw []byte) []cmuxGroup {
 // restoreSpawn (re)opens a manifest entry's tab via the normal spawn path,
 // which heals an existing same-titled tab or creates the workspace, binds
 // the durable wrapper, and refreshes the manifest record.
-func restoreSpawn(cfg *Config, e wsEntry) error {
+func restoreSpawn(cfg *Config, e wsEntry, focus bool) error {
 	r, err := cfg.resolve(e.Server, e.Repo)
 	if err != nil {
 		return err
+	}
+	// resolve may have healed a tmux-sanitized repo alias ("rxtx_dev" →
+	// "rxtx.dev"); canonicalize the manifest entry and everything derived
+	// from it so the workspace gets the real name.
+	if r.RepoName != e.Repo {
+		manifestRewriteRepo(e.Server, e.Repo, e.Worktree, e.Session, r.RepoName)
+		e.Repo = r.RepoName
 	}
 	cwd := r.Repo.Path
 	if e.Worktree != "" && e.Worktree != "main" {
@@ -1106,6 +1212,7 @@ func restoreSpawn(cfg *Config, e wsEntry) error {
 			TabTitle:   e.Session,
 			GroupTitle: group,
 			GroupCwd:   groupCwd,
+			Focus:      focus,
 		})
 	return err
 }
@@ -1118,7 +1225,7 @@ func sessionIsUp(cfg *Config, e wsEntry) bool {
 	if cli == "" {
 		return false
 	}
-	if _, ok := findCmuxWorkspaceByName(cli, cmuxWsTitle(e.Repo, e.Worktree, e.Session)); !ok {
+	if _, ok := findCmuxWorkspaceByEntry(cli, e); !ok {
 		return false
 	}
 	srv, ok := cfg.Servers[e.Server]
@@ -1131,10 +1238,28 @@ func sessionIsUp(cfg *Config, e wsEntry) bool {
 	}
 	for _, s := range sessions {
 		if s.Name == e.TmuxName {
-			return true
+			// Attached = some client (normally the cmux tab) is showing it.
+			// Live-but-detached means the tab's wrapper exited (post-restart
+			// bare shell, Ctrl-b d, closed surface) — report not-up so the
+			// caller heals via restoreSpawn (respawn the tab, re-attach).
+			return s.Attached
 		}
 	}
 	return false
+}
+
+// findCmuxWorkspaceByEntry resolves a tracked session's workspace: by its
+// recorded UUID first (rename-proof), falling back to the title for entries
+// that predate id tracking.
+func findCmuxWorkspaceByEntry(cli string, e wsEntry) (string, bool) {
+	if e.WsID != "" {
+		for _, w := range listCmuxWorkspaces(cli) {
+			if w.id == e.WsID {
+				return w.id, true
+			}
+		}
+	}
+	return findCmuxWorkspaceByName(cli, cmuxWsTitle(e.Repo, e.Worktree, e.Session))
 }
 
 // ---- small helpers ---------------------------------------------------------
@@ -1175,7 +1300,38 @@ func manifestWsSet() map[string]bool {
 	return set
 }
 
+// manifestWsIDSet is the UUID companion of manifestWsSet: workspaces cctl
+// owns by recorded id, so the close passes spare a tracked workspace even if
+// its title drifted or was renamed.
+func manifestWsIDSet() map[string]bool {
+	set := map[string]bool{}
+	for _, e := range loadManifestEntries() {
+		if e.WsID != "" {
+			set[e.WsID] = true
+		}
+	}
+	return set
+}
+
 // ---- targeted close (used by delete) ---------------------------------------
+
+// closeCmuxWorkspaceByIDOrTitle closes a workspace by UUID when known
+// (rename-proof), falling back to the exact title. Best-effort.
+func closeCmuxWorkspaceByIDOrTitle(wsID, wsTitle string) {
+	cli := cmuxCLIPath()
+	if cli == "" {
+		return
+	}
+	if wsID != "" {
+		if out, err := exec.Command(cli, "close-workspace", "--workspace", wsID).CombinedOutput(); err == nil {
+			log().Info("cmux-close-workspace", "id", wsID, "ws", wsTitle)
+			return
+		} else {
+			log().Debug("cmux-close-by-id-fail (trying title)", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		}
+	}
+	closeCmuxWorkspaceByTitle(wsTitle)
+}
 
 // closeCmuxWorkspaceByTitle closes the workspace with the given exact name
 // (one session = one workspace, so deleting a session closes its workspace).
