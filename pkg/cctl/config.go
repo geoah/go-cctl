@@ -49,6 +49,12 @@ type Defaults struct {
 	// closed. Set true to aggressively prune them. Tabs whose name isn't
 	// cctl-shaped (plain shells, custom names) are never auto-closed either way.
 	SyncCloseUnmatched *bool `yaml:"sync_close_unmatched"`
+	// OrderWorkspaces controls whether the reconcile sorts cctl's cmux
+	// workspaces by name (repo/worktree/session), so each repo's sessions
+	// cluster together in the sidebar without needing native groups (which
+	// require an empty anchor workspace). Default true; set false to leave the
+	// order alone (e.g. if you drag-reorder manually).
+	OrderWorkspaces *bool `yaml:"order_workspaces"`
 	// BetaRemoteClaudeStatus (beta) makes cmux show live Claude status for
 	// REMOTE sessions. cmux's native integration can't reach a remote claude
 	// (it runs on another host, behind mosh+tmux); with this on, cctl relays
@@ -84,6 +90,15 @@ type Defaults struct {
 func (c *Config) syncAllServers() bool {
 	if c.Defaults.SyncAllServers != nil {
 		return *c.Defaults.SyncAllServers
+	}
+	return true
+}
+
+// orderWorkspaces reports whether reconcile sorts cmux workspaces by name so a
+// repo's sessions cluster together. Default true.
+func (c *Config) orderWorkspaces() bool {
+	if c.Defaults.OrderWorkspaces != nil {
+		return *c.Defaults.OrderWorkspaces
 	}
 	return true
 }

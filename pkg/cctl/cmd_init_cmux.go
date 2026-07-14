@@ -8,8 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/spf13/cobra"
 )
 
 // cmuxConfigDefaults are the cmux.json keys we set on the user's behalf so
@@ -52,53 +50,18 @@ var cmuxConfigDefaults = map[string]map[string]any{
 	},
 	"terminal": {
 		"scrollSpeed": 3,
+		// copyOnSelect: a shift-drag selection inside cmux (shift bypasses
+		// tmux's mouse capture, handing cmux a raw selection) is copied to the
+		// system clipboard automatically. cmux defaults this off; without it,
+		// select-to-copy inside cmux silently does nothing.
+		"copyOnSelect": true,
 	},
 }
 
-func newInitCmuxCmd() *cobra.Command {
-	var (
-		force       bool
-		skipHooks   bool
-		skipReload  bool
-		skipControl bool
-	)
-	cmd := &cobra.Command{
-		Use:   "cmux",
-		Short: "Apply cmux best-practice config for mosh/tmux/claude workflows",
-		Long: `init cmux upserts a curated set of keys in ~/.config/cmux/cmux.json so
-cmux plays nicely with cctl's session orchestration:
-
-  app.reorderOnNotification, app.workspaceInheritWorkingDirectory,
-  app.commandPaletteSearchesAllSurfaces, sidebar.showNotificationMessage,
-  sidebar.showBranchDirectory, notifications.dockBadge,
-  notifications.unreadPaneRing, notifications.paneFlash,
-  notifications.showInMenuBar, terminal.scrollSpeed.
-
-By default we only set a key if it's absent (so your customizations are
-preserved); pass --force to overwrite.
-
-Also runs ` + "`cmux hooks setup`" + ` so cmux's notification hooks attach to any
-agents on $PATH (codex/opencode/pi/cursor/gemini/...). Claude Code's hooks
-are injected automatically by cmux's own claude wrapper — there's no
-explicit "claude" hook target. Then ` + "`cmux reload-config`" + ` applies the
-settings without restarting cmux. Disable either step with --no-hooks /
---no-reload.
-
-Terminal rendering settings (font, theme, transparency, scrollback)
-belong in ~/.config/ghostty/config — run ` + "`cctl init ghostty`" + ` for
-those. For tmux on a remote server, run ` + "`cctl init tmux --server <name>`" + `.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runInitCmux(force, skipHooks, skipReload, skipControl)
-		},
-	}
-	cmd.Flags().BoolVar(&force, "force", false, "overwrite cmux.json keys even if already present")
-	cmd.Flags().BoolVar(&skipHooks, "no-hooks", false, "don't run `cmux hooks setup --agent claude`")
-	cmd.Flags().BoolVar(&skipReload, "no-reload", false, "don't call `cmux reload-config` afterwards")
-	cmd.Flags().BoolVar(&skipControl, "no-control", false, "don't set up the persistent cctl control workspace (keeps the TUI alive across cmux restarts/reboots)")
-	return cmd
-}
-
+// runInitCmux applies cmux's best-practice config (cmux.json keys), runs
+// `cmux hooks setup`, `cmux reload-config`, and sets up the persistent cctl
+// control workspace. Driven by `cctl init` when the cmux tool is selected; the
+// skip* knobs stay available for callers though the current flow passes false.
 func runInitCmux(force, skipHooks, skipReload, skipControl bool) error {
 	cli := cmuxCLIPath()
 	if cli == "" {

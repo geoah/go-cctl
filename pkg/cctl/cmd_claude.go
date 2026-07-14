@@ -74,6 +74,15 @@ func runClaude(r *Resolved, sessionName, branchOverride, prompt string, noWorktr
 // (reuse); when only the worktree exists, we start a new tmux session inside
 // it; when neither exists, we create the worktree first.
 func prepareClaude(r *Resolved, worktreeName, sessionName, branchOverride, prompt string, noWorktree, fresh bool) (string, error) {
+	// A branch-style name ("feat/core") can't be a slash-delimited identity
+	// component; slug it and keep the original as the branch (see
+	// normalizeWorktree). Idempotent when the caller already normalized.
+	if wtName, wtBranch := normalizeWorktree(worktreeName); wtBranch != "" {
+		worktreeName = wtName
+		if branchOverride == "" {
+			branchOverride = wtBranch
+		}
+	}
 	tname := tmuxName(r.RepoName, worktreeName, sessionName)
 
 	if fresh {

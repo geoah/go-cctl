@@ -545,7 +545,7 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 			t.Fatalf("first arg should be new-workspace: %v", args)
 		}
 		joined := strings.Join(args, " ")
-		for _, want := range []string{"--name my-app/b300/test", "--cwd /home/user/repo", "--focus true", "--layout "} {
+		for _, want := range []string{"--name my-app/b300/test", "--cwd /home/user/repo", "--focus false", "--layout "} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("argv missing %q: %v", want, args)
 			}
@@ -580,6 +580,40 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 // it with "[selected]". If those markers aren't stripped, the selected
 // workspace parses with id "*" and a name that never matches, so
 // findCmuxWorkspaceByName can't see it and callers create a duplicate.
+func TestParseCmuxWorkspaceListJSON_KeysOnCustomTitle(t *testing.T) {
+	// Captured shape of `cmux workspace list --json`: custom_title is the
+	// durable cctl name; title is the volatile display that drifts to cwd.
+	raw := []byte(`{
+	  "workspaces": [
+	    {"ref":"workspace:1","title":"~","custom_title":null,"has_custom_title":false,"description":"Claude Control Center"},
+	    {"ref":"workspace:13","title":"…/remotes/workspace/olympus/gb300-vast","custom_title":"olympus/gb300-vast/poc","has_custom_title":true},
+	    {"id":"9AED4D5F-F9F2-47CF-81E6-45D6868999AB","ref":"workspace:9","title":"…/geoah/rxtx.dev","custom_title":"olympus/gb300-k8s/docs","has_custom_title":true}
+	  ]
+	}`)
+	got := parseCmuxWorkspaceListJSON(raw)
+	if len(got) != 3 {
+		t.Fatalf("want 3 workspaces, got %d: %+v", len(got), got)
+	}
+	// No custom title → fall back to the (volatile) title, id from ref.
+	if got[0].name != "~" || got[0].id != "workspace:1" {
+		t.Errorf("control ws = %+v, want name=~ id=workspace:1", got[0])
+	}
+	// A drifted title must NOT win — the durable custom_title is the identity.
+	if got[1].name != "olympus/gb300-vast/poc" {
+		t.Errorf("ws[1].name = %q, want the custom_title (not the cwd title)", got[1].name)
+	}
+	if got[1].id != "workspace:13" {
+		t.Errorf("ws[1].id = %q, want ref fallback workspace:13", got[1].id)
+	}
+	// Prefer the UUID when present.
+	if got[2].id != "9AED4D5F-F9F2-47CF-81E6-45D6868999AB" {
+		t.Errorf("ws[2].id = %q, want the UUID", got[2].id)
+	}
+	if got[2].name != "olympus/gb300-k8s/docs" {
+		t.Errorf("ws[2].name = %q, want custom_title olympus/gb300-k8s/docs", got[2].name)
+	}
+}
+
 func TestParseCmuxWorkspaceList_SelectedRowMarkers(t *testing.T) {
 	raw := strings.Join([]string{
 		"  AA3721EF-C46A-4B08-AB99-902EE24E8872  dev/olympus",

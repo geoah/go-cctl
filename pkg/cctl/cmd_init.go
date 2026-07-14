@@ -16,90 +16,288 @@ import (
 
 func newInitCmd() *cobra.Command {
 	var (
+		// config bootstrap (repo scan → starter ~/.cctl.yaml)
+		bootstrap  bool
 		force      bool
 		searchRoot string
 		maxScan    int
+		// tool/server selection (interactive by default; these drive it headless)
+		tools      []string
+		servers    []string
+		allServers bool
+		restart    bool
+		yes        bool
 	)
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Generate a starter ~/.cctl.yaml, or init a specific tool (tmux/ghostty/...)",
-		Long: `init (no arg) scans $HOME (or --root) for git repos, finds the most
-populated common ancestor, and writes a config that uses it as a
-repo_source. Existing ~/.cctl.yaml files are not overwritten without
---force.
+		Short: "Configure tools (tmux/ghostty/mosh/claude/cmux) across your servers",
+		Long: `init configures the tools cctl relies on — tmux, ghostty, mosh, claude,
+and cmux — so scroll/select/copy/paste and agent orchestration work across
+local and mosh-attached sessions.
 
-Subcommands configure individual tools so they play nicely together
-(scroll, select, copy/paste) across local and mosh-attached tmux sessions:
+Run with no flags for an interactive picker: choose which tools, which
+servers (local + configured remotes), and whether to restart all tracked
+sessions afterward. ghostty and cmux are always local (they're your
+laptop's terminal + multiplexer); tmux/mosh/claude apply to the servers you
+pick, skipping any that are unreachable.
 
-  cctl init tmux       upsert managed block in ~/.tmux.conf
-  cctl init ghostty    upsert managed block in ~/.config/ghostty/config
-  cctl init mosh       version + scrollback hints (no edits)
-  cctl init claude     verify claude install + projects dir
-  cctl init all        do all of the above
+Non-interactive (for scripts / no-TTY), drive it with flags:
+  cctl init --yes                          # all tools, local only
+  cctl init --tools tmux,mosh --all-servers
+  cctl init --tools tmux --servers workspace --restart
 
-Each tool subcommand accepts --server <name> to apply on a configured
-remote (tmux is the only one that writes files remotely; mosh/claude
-just report).`,
+init needs an existing ~/.cctl.yaml. To generate a starter by scanning your
+repos, run: cctl init --bootstrap`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, err := resolveConfigPath()
+			if bootstrap {
+				return generateConfig(force, searchRoot, maxScan)
+			}
+			cfg, _, err := loadConfig()
+			if err != nil {
+				path, _ := resolveConfigPath()
+				return fmt.Errorf("no usable config (%v).\n\n"+
+					"cctl init configures tools for the servers in %s, so it needs that file first.\n"+
+					"Generate a starter by scanning your repos:  cctl init --bootstrap",
+					err, path)
+			}
+
+			// Interactive unless a selection flag is set or stdin isn't a TTY.
+			flagDriven := yes || allServers || restart ||
+				len(tools) > 0 || len(servers) > 0
+			if !flagDriven && !stdinIsTTY() {
+				// No TTY and no explicit selection: refuse rather than silently
+				// reconfiguring tmux/ghostty/cmux with the all-tools default
+				// (e.g. a piped or CI invocation).
+				return fmt.Errorf("no TTY for the interactive picker — pass --yes (all tools, local) or --tools/--servers to run headless")
+			}
+			var sel initSelection
+			if flagDriven || !stdinIsTTY() {
+				sel, err = selectionFromFlags(cfg, tools, servers, allServers, restart)
+			} else {
+				sel, err = runInitWizard(cfg)
+			}
 			if err != nil {
 				return err
 			}
-			if _, err := os.Stat(path); err == nil && !force {
-				return fmt.Errorf("%s already exists — pass --force to overwrite", path)
-			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-				return fmt.Errorf("stat %s: %w", path, err)
+			if sel.canceled {
+				fmt.Fprintln(os.Stderr, "init: canceled.")
+				return nil
 			}
-
-			home, err := os.UserHomeDir()
-			if err != nil {
-				return fmt.Errorf("resolve $HOME: %w", err)
-			}
-			root := searchRoot
-			if root == "" {
-				root = home
-			}
-			root = expandPath(root)
-
-			fmt.Fprintf(os.Stderr, "scanning %s for git repos (maxdepth=%d)...\n", root, maxScan)
-			repos, err := findGitRepos(root, maxScan)
-			if err != nil {
-				return fmt.Errorf("scan %s: %w", root, err)
-			}
-			if len(repos) == 0 {
-				return fmt.Errorf("no git repos found under %s — pass --root to point elsewhere", root)
-			}
-
-			source, count, depth := pickRepoSource(home, repos)
-			sourceForConfig := tildify(home, source)
-
-			username := "me"
-			if u, err := user.Current(); err == nil && u.Username != "" {
-				username = u.Username
-			}
-
-			fmt.Fprintf(os.Stderr, "found %d repo(s); using %s as repo_source (%d repos at depth %d)\n",
-				len(repos), source, count, depth)
-
-			content := renderInitConfig(username, sourceForConfig, depth)
-			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-				return fmt.Errorf("write %s: %w", path, err)
-			}
-			fmt.Fprintf(os.Stderr, "wrote %s\n", path)
-
-			// Show a handful of discovered repos so the user can sanity-check.
-			previewRepos(os.Stderr, source, repos, 8)
-			return nil
+			return runInit(cfg, sel)
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "overwrite an existing config file")
-	cmd.Flags().StringVar(&searchRoot, "root", "", "directory to scan (default: $HOME)")
-	cmd.Flags().IntVar(&maxScan, "max-depth", 5, "maximum directory depth to scan for .git")
-	for _, sub := range newInitToolsCmds() {
-		cmd.AddCommand(sub)
-	}
+	cmd.Flags().BoolVar(&bootstrap, "bootstrap", false, "scan for git repos and write a starter ~/.cctl.yaml, then exit")
+	cmd.Flags().BoolVar(&force, "force", false, "with --bootstrap: overwrite an existing config file")
+	cmd.Flags().StringVar(&searchRoot, "root", "", "with --bootstrap: directory to scan (default: $HOME)")
+	cmd.Flags().IntVar(&maxScan, "max-depth", 5, "with --bootstrap: maximum directory depth to scan for .git")
+	cmd.Flags().StringSliceVar(&tools, "tools", nil, "headless: tools to configure (tmux,ghostty,mosh,claude,cmux; default: all)")
+	cmd.Flags().StringSliceVar(&servers, "servers", nil, "headless: server names to apply to (use 'local'; default: local)")
+	cmd.Flags().BoolVar(&allServers, "all-servers", false, "headless: apply to local + every configured remote")
+	cmd.Flags().BoolVar(&restart, "restart", false, "restart all tracked sessions after applying")
+	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "headless: apply flag selections (or defaults) without prompting")
+	cmd.MarkFlagsMutuallyExclusive("servers", "all-servers")
 	return cmd
+}
+
+// generateConfig is the `cctl init --bootstrap` path: scan for git repos and
+// write a starter ~/.cctl.yaml. Split out from the interactive flow so the two
+// concerns don't tangle.
+func generateConfig(force bool, searchRoot string, maxScan int) error {
+	path, err := resolveConfigPath()
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(path); err == nil && !force {
+		return fmt.Errorf("%s already exists — pass --force to overwrite", path)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("resolve $HOME: %w", err)
+	}
+	root := searchRoot
+	if root == "" {
+		root = home
+	}
+	root = expandPath(root)
+
+	fmt.Fprintf(os.Stderr, "scanning %s for git repos (maxdepth=%d)...\n", root, maxScan)
+	repos, err := findGitRepos(root, maxScan)
+	if err != nil {
+		return fmt.Errorf("scan %s: %w", root, err)
+	}
+	if len(repos) == 0 {
+		return fmt.Errorf("no git repos found under %s — pass --root to point elsewhere", root)
+	}
+
+	source, count, depth := pickRepoSource(home, repos)
+	sourceForConfig := tildify(home, source)
+
+	username := "me"
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		username = u.Username
+	}
+
+	fmt.Fprintf(os.Stderr, "found %d repo(s); using %s as repo_source (%d repos at depth %d)\n",
+		len(repos), source, count, depth)
+
+	content := renderInitConfig(username, sourceForConfig, depth)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	fmt.Fprintf(os.Stderr, "wrote %s\n", path)
+
+	// Show a handful of discovered repos so the user can sanity-check.
+	previewRepos(os.Stderr, source, repos, 8)
+	return nil
+}
+
+// stdinIsTTY reports whether stdin is an interactive terminal. When it isn't
+// (piped, cron, CI), the wizard can't run, so init falls back to flag/defaults.
+func stdinIsTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && (fi.Mode()&os.ModeCharDevice) != 0
+}
+
+var allInitTools = []string{"tmux", "ghostty", "mosh", "claude", "cmux"}
+
+func validInitTool(t string) bool {
+	for _, v := range allInitTools {
+		if v == t {
+			return true
+		}
+	}
+	return false
+}
+
+// selectionFromFlags builds an initSelection from the headless flags, applying
+// defaults (all tools, local only) when a dimension is left unset.
+func selectionFromFlags(cfg *Config, tools, servers []string, allServers, restart bool) (initSelection, error) {
+	sel := initSelection{restart: restart}
+	if len(tools) == 0 {
+		sel.tools = append(sel.tools, allInitTools...)
+	} else {
+		for _, t := range tools {
+			t = strings.ToLower(strings.TrimSpace(t))
+			if !validInitTool(t) {
+				return sel, fmt.Errorf("unknown tool %q (valid: %s)", t, strings.Join(allInitTools, ", "))
+			}
+			sel.tools = append(sel.tools, t)
+		}
+	}
+	switch {
+	case allServers:
+		sel.localSelected = true
+		sel.remotes = sortedRemoteNames(cfg)
+	case len(servers) == 0:
+		sel.localSelected = true // default: local only
+	default:
+		for _, s := range servers {
+			s = strings.TrimSpace(s)
+			if s == "" || s == "local" {
+				sel.localSelected = true
+				continue
+			}
+			srv, ok := cfg.Servers[s]
+			if !ok {
+				return sel, fmt.Errorf("unknown server %q", s)
+			}
+			if srv.Local {
+				sel.localSelected = true
+			} else {
+				sel.remotes = append(sel.remotes, s)
+			}
+		}
+	}
+	return sel, nil
+}
+
+// runInit applies the selected tools to the selected servers, then optionally
+// restarts all tracked sessions. Per-server tool failures (e.g. an unreachable
+// remote) are logged and skipped so one dead host doesn't abort the rest.
+func runInit(cfg *Config, sel initSelection) error {
+	has := func(tool string) bool {
+		for _, t := range sel.tools {
+			if t == tool {
+				return true
+			}
+		}
+		return false
+	}
+
+	if has("tmux") {
+		applyServerScopedTool(cfg, sel, "tmux",
+			func() error { return applyManaged("tmux", "~/.tmux.conf", tmuxManagedBody, "") },
+			func(name string, _ Server) error { return applyManaged("tmux", "~/.tmux.conf", tmuxManagedBody, name) })
+	}
+	if has("ghostty") {
+		if err := applyManaged("ghostty", "~/.config/ghostty/config", ghostlyManagedBody, ""); err != nil {
+			fmt.Fprintf(os.Stderr, "ghostty (local): %v\n", err)
+		}
+	}
+	if has("mosh") {
+		applyServerScopedTool(cfg, sel, "mosh",
+			func() error { reportMoshLocal(); return nil },
+			func(name string, srv Server) error { reportMoshRemote(name, srv); return nil })
+	}
+	if has("claude") {
+		applyServerScopedTool(cfg, sel, "claude",
+			func() error { reportClaudeLocal(); return nil },
+			func(name string, srv Server) error { reportClaudeRemote(name, srv); return nil })
+	}
+	if has("cmux") {
+		if err := runInitCmux(false, false, false, false); err != nil {
+			fmt.Fprintf(os.Stderr, "cmux (local): %v\n", err)
+		}
+	}
+
+	if sel.restart {
+		fmt.Fprintln(os.Stderr, "\ninit: restarting all tracked sessions...")
+		res := restartAllTrackedSessions(cfg)
+		fmt.Fprintf(os.Stderr, "init: reloaded config on %d/%d server(s), killed %d session(s)",
+			res.reloaded, res.servers, res.killed)
+		if res.unreachable > 0 {
+			fmt.Fprintf(os.Stderr, " (%d server(s) unreachable, %d session(s) left tracked)", res.unreachable, res.skipped)
+		}
+		fmt.Fprintln(os.Stderr, ".")
+		if !stdinIsTTY() {
+			fmt.Fprintln(os.Stderr, "init: no TTY — sessions killed but not revived. Run `cctl` to reconcile cmux ↔ tmux and revive them.")
+			return nil
+		}
+		// Revive through the TUI's startup reconcile — NOT a bare
+		// syncCmuxState(cfg) here. The correct cmux↔tmux sync must wait until
+		// every server's real session list has loaded, and it also closes the
+		// now-dead workspaces and regroups. That sequencing lives in the TUI
+		// (maybeStartupSync); reconciling immediately after the kills — before
+		// cmux has caught up — leaves stale/duplicate workspaces and empty
+		// groups. This is exactly what `cctl --restart-all` does.
+		fmt.Fprintln(os.Stderr, "init: opening cctl to reconcile cmux ↔ tmux and revive sessions...")
+		return runTUI()
+	}
+	return nil
+}
+
+// applyServerScopedTool runs a tool's local step (if local is selected) and its
+// remote step for each selected remote, logging and continuing past per-server
+// failures.
+func applyServerScopedTool(cfg *Config, sel initSelection, tool string, local func() error, remote func(name string, srv Server) error) {
+	if sel.localSelected {
+		if err := local(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s (local): %v\n", tool, err)
+		}
+	}
+	for _, name := range sel.remotes {
+		srv, ok := cfg.Servers[name]
+		if !ok {
+			continue
+		}
+		if err := remote(name, srv); err != nil {
+			fmt.Fprintf(os.Stderr, "%s (%s): %v — skipped\n", tool, name, err)
+		}
+	}
 }
 
 // findGitRepos returns absolute paths of every git repo under root, up to

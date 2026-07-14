@@ -442,6 +442,9 @@ type tuiModel struct {
 	// reconnect+load in a burst (e.g. a manual refresh), they coalesce into a
 	// single sync fired by runSyncMsg.
 	syncPending bool
+	// syncing is true while a reconcile is in flight; detached session rows
+	// render as amber "syncing" during it, settling to green/red after.
+	syncing bool
 
 	// scrollOffset is the index of the first tree row drawn in the main
 	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
@@ -628,28 +631,14 @@ type retryProbeMsg struct {
 // run the cmux↔cctl sync once for the burst. See requestSync.
 type runSyncMsg struct{}
 
+// prepareDoneMsg reports the outcome of an interactive "open a session" prepare
+// cmd (new / terminal / attach). Those cmds now do the work themselves —
+// record the manifest + converge cmux via the single reconcile path
+// (openSessionViaReconcile) — so this only carries what the handler needs to
+// resolve the footer task and refresh the tree.
 type prepareDoneMsg struct {
-	server   Server
-	useMosh  bool
-	cmdStr   string
-	cwd      string // suggested workspace cwd (used by cmuxSpawner)
-	wsTitle  string // workspace label: "repo/worktree" (one workspace per worktree)
-	tabTitle string // tab label inside the workspace: the session name
-	// serverName/repo/worktree/session are the session's identity, carried
-	// through to SpawnSpec for the durable wrapper path + restore manifest.
-	serverName string
-	repo       string
-	worktree   string
-	session    string
-	agent      string // resolved agent for this session ("claude"/"codex"), persisted to the manifest
-	group      string // sidebar group: the repo ("rxtx.dev" local, "server/repo" remote)
-	groupCwd   string // anchor cwd when the group is first created (repo path)
-	label      string
-	refresh    string
-	// focusExisting allows the spawner to focus a same-titled workspace
-	// instead of creating one. Only safe when a live tmux client is known
-	// to sit in that tab (attach-to-attached-session); see Spawner.
-	focusExisting bool
+	label   string
+	refresh string
 	// taskID ties this result back to the bgTask started when the action
 	// was triggered, so the right footer entry resolves.
 	taskID int
@@ -662,8 +651,12 @@ type actionDoneMsg struct {
 	// refreshAll reloads every server after the action (used by restore,
 	// which can bring sessions back across all of them).
 	refreshAll bool
-	taskID     int
-	err        error
+	// refreshConnected re-fetches connected servers (no probe) after the
+	// action — used by reconcile so the tree shows revived/attached sessions
+	// without re-probing/looping.
+	refreshConnected bool
+	taskID           int
+	err              error
 }
 
 // refreshServerMsg triggers a one-server reload, used as a follow-up after
@@ -902,6 +895,7 @@ func (m *tuiModel) maybeStartupSync() tea.Cmd {
 		return nil
 	}
 	m.startupSynced = true
+	m.syncing = true
 	sweepLegacySpawnScripts()
 	// The startup sync covers every server, so clear their pendingSync flags
 	// — otherwise the post-startup reconnect path would immediately re-sync.
@@ -1070,6 +1064,23 @@ func (m *tuiModel) refreshAllCmd() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// refreshConnectedCmd re-fetches sessions/worktrees for already-CONNECTED
+// servers only — no reachability probe. Used right after a reconcile so the
+// tree reflects revived/attached sessions immediately, without re-probing
+// (which would time out on unreachable hosts and re-trigger a sync loop).
+func (m *tuiModel) refreshConnectedCmd() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, n := range m.serverNames {
+		if st := m.state[n]; st != nil && st.conn == connConnected {
+			cmds = append(cmds, m.fetchServerCmd(n)...)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -1174,25 +1185,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, m.finishTask(msg.taskID, msg.label+": prepare failed", msg.err)
 		}
-		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, SpawnSpec{
-			Server:        msg.serverName,
-			Repo:          msg.repo,
-			Worktree:      msg.worktree,
-			Session:       msg.session,
-			Agent:         msg.agent,
-			Cwd:           msg.cwd,
-			WsTitle:       msg.wsTitle,
-			TabTitle:      msg.tabTitle,
-			GroupTitle:    msg.group,
-			GroupCwd:      msg.groupCwd,
-			FocusExisting: msg.focusExisting,
-		})
-		if err != nil {
-			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
-			return m, m.finishTask(msg.taskID, provider+" spawn failed", err)
-		}
-		log().Info("tui-spawn-ok", "label", msg.label, "provider", provider)
-		finish := m.finishTask(msg.taskID, fmt.Sprintf("opened %s (%s tab)", msg.label, provider), nil)
+		// Every interactive open (new / terminal / attach) has already recorded
+		// the manifest and converged cmux through the single reconcile path
+		// (openSessionViaReconcile). Nothing to spawn here — just resolve the
+		// task and refresh the tree.
+		finish := m.finishTask(msg.taskID, "opened "+msg.label, nil)
 		refresh := msg.refresh
 		return m, tea.Batch(finish,
 			tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
@@ -1215,6 +1212,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case runSyncMsg:
 		// Debounced post-startup sync (a server reconnected/refreshed).
 		m.syncPending = false
+		m.syncing = true
 		id, tick := m.startTask("sync", "syncing cmux ↔ cctl…")
 		return m, tea.Batch(m.syncCmd(id, false), tick)
 
@@ -1230,6 +1228,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		statusCmd := m.finishTask(msg.taskID, label, msg.err)
 		if msg.refreshAll {
 			return m, tea.Batch(m.refreshAllCmd(), statusCmd)
+		}
+		if msg.refreshConnected {
+			m.syncing = false // reconcile finished; rows settle green/red
+			return m, tea.Batch(m.refreshConnectedCmd(), statusCmd)
 		}
 		if msg.refresh != "" {
 			cmds := m.loadServerCmd(msg.refresh)
@@ -1326,13 +1328,16 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = "" // hide any earlier error so the red prompt below stands alone
 		m.statusMsg = ""
 		return m, nil
-	case "S", "R":
-		// Reconcile: converge cmux+tmux to the manifest (the same pass the
-		// startup/reconnect sync runs). Revives tracked sessions that aren't
-		// up, opens missing tabs, groups, and closes orphaned tabs. S and R
-		// are the same action — kept as two keys for muscle memory.
+	case "r", "R", "S":
+		// One action: refresh every server's data, then reconcile. The refresh
+		// probes set pendingSync, and the debounced runSyncMsg fires ONE
+		// reconcile after the loads settle — kicking a second syncCmd here in
+		// parallel raced it (two concurrent reconciles can both see the same
+		// dead session as missing and spawn duplicates).
 		m.clearPending()
-		return m.syncCmux()
+		m.statusErr = ""
+		log().Info("tui-refresh-reconcile")
+		return m, m.refreshAllCmd()
 	case "U":
 		// UU, same arming flow as dd: upgrading claude restarts every
 		// claude session on the target server (killing whatever they
@@ -1348,11 +1353,6 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = ""
 		m.statusMsg = ""
 		return m, nil
-	case "r":
-		m.clearPending()
-		m.statusErr = ""
-		log().Info("tui-refresh-all")
-		return m, m.refreshAllCmd()
 	case "/":
 		m.clearPending()
 		m.mode = modeFilter
@@ -1368,7 +1368,7 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · S/R reconcile (match cmux to cctl) · UU upgrade · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · R refresh+reconcile (match cmux to cctl) · UU upgrade · / filter · q quit"
 	default:
 		// any other key cancels a pending dd/UU so the next press starts fresh
 		m.clearPending()
@@ -1862,28 +1862,21 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 		if err != nil {
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
-		cwd := r.Repo.Path
-		if worktree != "" && worktree != "main" {
-			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktree)
+		// A terminal session is a plain shell; reconcile's spawn recognizes the
+		// term/term2/… name and uses terminalCmd, so it converges like any other
+		// session through the single path.
+		e := wsEntry{
+			Server:   serverName,
+			Repo:     repoName,
+			Worktree: worktree,
+			Session:  name,
+			TmuxName: tmuxName(r.RepoName, worktree, name),
+			WsTitle:  cmuxWsTitle(repoName, worktree, name),
+			TabTitle: name,
+			Cwd:      workspaceCwd(r, worktree),
 		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     terminalCmd(tmuxName(r.RepoName, worktree, name), cwd),
-			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    cmuxWsTitle(repoName, worktree, name),
-			tabTitle:   name,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   worktree,
-			session:    name,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, name),
-			refresh:    serverName,
-			taskID:     taskID,
-		}
+		return m.openSessionViaReconcile(e,
+			fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, name), serverName, taskID)
 	}
 }
 
@@ -1894,6 +1887,7 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 // dd is the only way to drop a session. See syncCmuxState for the algorithm
 // and safety rails.
 func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
+	m.syncing = true
 	id, tick := m.startTask("", "reconciling cmux ↔ cctl…")
 	return m, tea.Batch(tick, m.syncCmd(id, false))
 }
@@ -1915,11 +1909,10 @@ func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
 				msg = "cmux already matches cctl"
 			}
 		}
-		// No tree refresh: reconcile only touches cmux workspaces + the
-		// manifest. A revive does create a tmux session, but the tree catches
-		// up on the next reconnect/`r`; refreshing here would re-probe every
-		// server and loop back into another reconcile.
-		return actionDoneMsg{msg: msg, taskID: taskID}
+		// Refresh CONNECTED servers (fetch-only, no probe) so the tree shows
+		// the sessions reconcile just revived/attached — without re-probing
+		// (which would time out on unreachable hosts and loop into another sync).
+		return actionDoneMsg{msg: msg, taskID: taskID, refreshConnected: true}
 	}
 }
 
@@ -2062,43 +2055,28 @@ func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, task
 		if err != nil {
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
-		// attachOrRespawn (not bare `tmux attach`): cmux re-runs the wrapper
-		// script when restoring the workspace, possibly long after the
-		// session died — see the helper's doc comment.
-		cwd := r.Repo.Path
-		if sess.Worktree != "" && sess.Worktree != "main" {
-			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
-		}
-		// Preserve the session's recorded agent across attach (so re-recording
-		// the manifest doesn't overwrite a per-session override with the config
-		// default); fall back to the resolved agent for untracked sessions.
+		// Preserve the session's recorded agent (so re-recording the manifest
+		// doesn't overwrite a per-session override with the config default);
+		// fall back to the resolved agent for untracked sessions.
 		if a := manifestAgent(serverName, repoName, sess.Worktree, sess.Session); a != "" {
 			r.Agent = a
 		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     agentAttachOrRespawn(r, sess.Name, cwd),
-			agent:      r.Agent,
-			cwd:        workspaceCwd(r, sess.Worktree),
-			wsTitle:    cmuxWsTitle(repoName, sess.Worktree, sess.Session),
-			tabTitle:   sess.Session,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   sess.Worktree,
-			session:    sess.Session,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
-			refresh:    serverName,
-			// Reuse the existing cmux tab only when a tmux client is
-			// already attached — that's the tab holding it. A detached
-			// session's old tab (if any) is a dead shell; the wrapper
-			// must run, so force a fresh workspace.
-			focusExisting: sess.Attached,
-			taskID:        taskID,
+		// Attaching = "make sure this session's workspace exists + focus it",
+		// which is exactly what the reconcile converges to: a live session is
+		// left alone (just focused), a detached one is revived. One path.
+		e := wsEntry{
+			Server:   serverName,
+			Repo:     repoName,
+			Worktree: sess.Worktree,
+			Session:  sess.Session,
+			TmuxName: sess.Name,
+			WsTitle:  cmuxWsTitle(repoName, sess.Worktree, sess.Session),
+			TabTitle: sess.Session,
+			Cwd:      workspaceCwd(r, sess.Worktree),
+			Agent:    r.Agent,
 		}
+		return m.openSessionViaReconcile(e,
+			fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session), serverName, taskID)
 	}
 }
 
@@ -2118,31 +2096,89 @@ func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionN
 		if agent != "" {
 			r.Agent = agent
 		}
-		cmdStr, err := prepareAgent(r, worktree, sessionName, "", prompt, false, false)
-		log().Info("tui-new-session-prepare-done",
-			"server", serverName, "session", sessionName,
-			"dur", time.Since(start).String(), "err", errString(err))
-		if err != nil {
+		// A branch-style worktree name ("feat/core") would break the slash-
+		// delimited identity scheme (invisible session + eternal respawn-kill
+		// loop); use the slug as the identity and the original as the branch.
+		worktree, wtBranch := normalizeWorktree(worktree)
+		// prepareAgent does the SETUP (create the worktree, resolve the branch).
+		// Its returned launch command is intentionally ignored: the single
+		// reconcile path rebuilds the launch from the manifest entry, so cmux
+		// mutation happens in exactly one place (syncCmuxState). The initial
+		// prompt is carried on the manifest entry and consumed by the first
+		// reconcile spawn.
+		if _, err := prepareAgent(r, worktree, sessionName, wtBranch, prompt, false, false); err != nil {
+			log().Info("tui-new-session-prepare-done", "server", serverName, "session", sessionName,
+				"dur", time.Since(start).String(), "err", errString(err))
 			return prepareDoneMsg{err: err, taskID: taskID}
 		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     cmdStr,
-			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    cmuxWsTitle(repoName, worktree, sessionName),
-			tabTitle:   sessionName,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   worktree,
-			session:    sessionName,
-			agent:      r.Agent,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
-			refresh:    serverName,
-			taskID:     taskID,
+		// Record desired state, then converge cmux through the one reconcile
+		// path (runs here, off the UI goroutine) and focus the new workspace.
+		e := wsEntry{
+			Server:   serverName,
+			Repo:     repoName,
+			Worktree: worktree,
+			Session:  sessionName,
+			TmuxName: tmuxName(repoName, worktree, sessionName),
+			WsTitle:  cmuxWsTitle(repoName, worktree, sessionName),
+			TabTitle: sessionName,
+			Cwd:      workspaceCwd(r, worktree),
+			Agent:    r.Agent,
+			Prompt:   prompt,
+		}
+		log().Info("tui-new-session-prepare-done", "server", serverName, "session", sessionName,
+			"dur", time.Since(start).String())
+		return m.openSessionViaReconcile(e,
+			fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName), serverName, taskID)
+	}
+}
+
+// openSessionViaReconcile is the ONE interactive "open a session" path: it
+// records the session in the manifest (desired state), converges cmux through
+// the single reconcile (syncCmuxState) — which spawns/heals the workspace,
+// prunes stray tabs, and first-launches with any pending prompt — then focuses
+// it. new-session, terminal, and attach all funnel through here, so no
+// interactive action mutates cmux directly. Runs inside a tea.Cmd (off the UI
+// goroutine), so the reconcile's ssh work doesn't block rendering.
+func (m *tuiModel) openSessionViaReconcile(e wsEntry, label, refresh string, taskID int) prepareDoneMsg {
+	// Converge ONLY this session, not the whole multi-server reconcile — a full
+	// syncCmuxState here would make every Enter block on unreachable remotes
+	// (10s/ssh). If the session is already live with a workspace, just focus it;
+	// otherwise spawn it via the shared restoreSpawn primitive (idempotent, and
+	// it consumes any first-launch prompt on the entry). Only the session's own
+	// server is touched.
+	up := sessionIsUp(m.cfg, e)
+	if up {
+		// Nothing will consume a first-launch prompt on an already-up session;
+		// persisting it would fire a stale prompt when the session later dies
+		// and reconcile revives it.
+		e.Prompt = ""
+	}
+	manifestUpsertEntry(e)
+	if !up {
+		if err := restoreSpawn(m.cfg, e); err != nil {
+			log().Warn("tui-open-spawn-fail", "ws", e.WsTitle, "err", err.Error())
+			return prepareDoneMsg{err: err, label: label, refresh: refresh, taskID: taskID}
+		}
+		// A fresh workspace lands at the END of cmux's list, splitting its
+		// repo's cluster in the sidebar until the next reconcile. Slot it into
+		// name order now (cheap, local; no-op when already ordered).
+		if m.cfg.orderWorkspaces() {
+			orderCmuxWorkspacesByName(cmuxCLIPath())
+		}
+	}
+	focusCmuxWorkspace(e.WsTitle)
+	return prepareDoneMsg{label: label, refresh: refresh, taskID: taskID}
+}
+
+// focusCmuxWorkspace selects the workspace with the given cctl name, best-effort.
+func focusCmuxWorkspace(wsTitle string) {
+	cli := cmuxCLIPath()
+	if cli == "" || wsTitle == "" {
+		return
+	}
+	if id, ok := findCmuxWorkspaceByNameRetry(cli, wsTitle); ok {
+		if out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput(); err != nil {
+			log().Debug("cmux-focus-fail", "ws", wsTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
 }
@@ -2852,16 +2888,12 @@ func (m *tuiModel) bottomStatus() string {
 // keyHints is the compact one-liner legend along the bottom (renderKeyHints
 // joins + wraps it). The full reference is `?` (legendLines).
 var keyHints = []string{
-	"↑↓ move",
-	"←→ fold",
-	"⏎ open",
 	"n new",
 	"t term",
 	"dd delete",
-	"S/R reconcile",
+	"R refresh+reconcile",
 	"UU upgrade",
 	"/ filter",
-	"r refresh",
 	"? help",
 	"q quit",
 }
@@ -3089,22 +3121,21 @@ func (m *tuiModel) rowCells(r treeRow, selected bool) (name, info, age string) {
 
 	case rowSession:
 		sess := r.session
-		marker := "○"
-		mStyle := dimStyle
-		if sess.Attached {
-			marker = "●"
-			mStyle = okStyle
+		// Status: green ● attached, amber ◐ syncing (while a reconcile runs),
+		// red ○ detached otherwise.
+		marker, mStyle, label := "○", darkRedStyle, "detached"
+		switch {
+		case sess.Attached:
+			marker, mStyle, label = "●", okStyle, "attached"
+		case m.syncing:
+			marker, mStyle, label = "◐", warnStyle, "syncing"
 		}
 		nm := highlightMatch(sess.Session, m.filter)
 		if m.filter == "" && selected {
 			nm = cursorStyle.Render(sess.Session)
 		}
 		name = indent + mStyle.Render(marker) + " " + tagStyle.Render("(s)") + " " + m.preparingPrefix(r) + nm
-		if sess.Attached {
-			info = okStyle.Render("attached")
-		} else {
-			info = dimStyle.Render("detached")
-		}
+		info = mStyle.Render(label)
 		age = dimStyle.Render(humanAge(sess.Age))
 
 	case rowEmpty, rowLoading:

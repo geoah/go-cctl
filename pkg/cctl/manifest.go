@@ -40,7 +40,13 @@ type wsEntry struct {
 	// "codex"). Empty for sessions created before per-session agent tracking
 	// (and for adopted sessions) — callers fall back to the config-resolved
 	// agent, so old manifests keep working.
-	Agent   string `json:"agent,omitempty"`
+	Agent string `json:"agent,omitempty"`
+	// Prompt is a pending FIRST-LAUNCH prompt. When set, the reconcile spawn
+	// launches the agent with this prompt (a brand-new session) and then clears
+	// it, so later reconciles just attach. This is how "new session with an
+	// initial prompt" flows through the single reconcile path instead of a
+	// separate interactive spawn. Empty for restores and adopted sessions.
+	Prompt  string `json:"prompt,omitempty"`
 	Updated int64  `json:"updated"`
 }
 
@@ -189,8 +195,13 @@ func manifestUpsert(spec SpawnSpec) {
 	}
 }
 
-// manifestUpsertEntry records a fully-formed entry (used by the sync pass to
-// adopt sessions discovered in tmux/cmux that predate the manifest).
+// manifestUpsertEntry records an entry, MERGING over any existing one (used by
+// adoption and by the interactive open paths). Callers often carry a sparse
+// entry — an attach knows the identity but not the wrapper script or group —
+// and replacing wholesale would clobber fields the full spawn recorded earlier
+// (losing Script leaks the wrapper on a later dd, since manifestRemove deletes
+// by that path). mergeWsEntry keeps the old value wherever the incoming one is
+// empty; Prompt is the exception (one-shot, never inherited).
 func manifestUpsertEntry(e wsEntry) {
 	if e.Server == "" || e.Repo == "" || e.Worktree == "" || e.Session == "" {
 		return
@@ -203,7 +214,7 @@ func manifestUpsertEntry(e wsEntry) {
 	entries := loadManifest()
 	for i := range entries {
 		if entries[i].key() == e.key() {
-			entries[i] = e
+			entries[i] = mergeWsEntry(entries[i], e)
 			if err := saveManifest(entries); err != nil {
 				log().Warn("manifest-save-fail", "err", err.Error())
 			}
@@ -282,6 +293,42 @@ func manifestDedupByTmux() int {
 		log().Warn("manifest-save-fail", "err", err.Error())
 	}
 	return len(drop)
+}
+
+// mergeWsEntry overlays an incoming (possibly sparse) entry on the stored one:
+// identity/Updated come from the incoming entry, every other field keeps the
+// old value when the incoming one is empty. Prompt is NEVER inherited from the
+// old entry — a pending first-launch prompt is one-shot, and re-inheriting it
+// would relaunch a dead session with a stale prompt. Pure, so it's testable.
+func mergeWsEntry(old, in wsEntry) wsEntry {
+	if in.TmuxName == "" {
+		in.TmuxName = old.TmuxName
+	}
+	if in.WsTitle == "" {
+		in.WsTitle = old.WsTitle
+	}
+	if in.TabTitle == "" {
+		in.TabTitle = old.TabTitle
+	}
+	if in.Group == "" {
+		in.Group = old.Group
+	}
+	if in.GroupCwd == "" {
+		in.GroupCwd = old.GroupCwd
+	}
+	if in.Cwd == "" {
+		in.Cwd = old.Cwd
+	}
+	if in.Script == "" {
+		in.Script = old.Script
+	}
+	if in.Agent == "" {
+		in.Agent = old.Agent
+	}
+	if !in.Remote {
+		in.Remote = old.Remote
+	}
+	return in
 }
 
 // manifestRemoveWorktree drops every session on a worktree (called when the

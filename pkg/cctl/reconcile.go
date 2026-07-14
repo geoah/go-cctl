@@ -3,8 +3,10 @@ package cctl
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -37,11 +39,13 @@ type syncResult struct {
 	closed   int
 	migrated int
 	grouped  int
+	pruned   int
+	bound    int
 	errs     int
 }
 
 func (r syncResult) touched() bool {
-	return r.adopted+r.restored+r.closed+r.migrated+r.grouped+r.errs > 0
+	return r.adopted+r.restored+r.closed+r.migrated+r.grouped+r.pruned+r.bound+r.errs > 0
 }
 
 func (r syncResult) summary() string {
@@ -152,6 +156,7 @@ func syncCmuxState(cfg *Config) syncResult {
 
 	// Re-read after adoption so open/group/close see the full tracked set.
 	entries := loadManifestEntries()
+	entries = dropUnrepresentableEntries(cli, views, entries, &res)
 
 	// Converge to the manifest (desired state): (re)spawn every tracked
 	// session that has no workspace OR no live tmux session. This revives
@@ -205,13 +210,193 @@ func syncCmuxState(cfg *Config) syncResult {
 	// workspace being listed yet.
 	views = snapshotCmuxViews(cli)
 	wsMetaByID := mapWorkspaceMeta(cli, cfg, localName)
-	res.grouped = ensureRepoGrouping(cli, cfg, localName, views, wsMetaByID, entries)
+
+	// Grouping is intentionally disabled: cmux groups require a per-group
+	// anchor workspace that runs no session, which conflicts with the invariant
+	// that every workspace is a live claude session. cctl keeps a flat list of
+	// session workspaces instead. (wsMetaByID is still used by closeDead below.)
+
+	// Enforce one tab per session workspace: prune leftover junk surfaces (cwd
+	// shells from an earlier failed/duplicated spawn) so each workspace shows
+	// its session, not a stray shell.
+	pruneWorkspaceSurfaces(cli, views, entries, &res)
+
+	// (Resume-binding heal removed: cmux prompts to approve every CLI-set
+	// resume command, which spammed popups. Remote-restore needs a prompt-free
+	// approach — tracked separately.)
 
 	// Close cctl workspaces whose tmux session is dead. Sync NEVER revives and
 	// sets NO resume bindings: that churn is what triggered cmux's "auto
 	// restore?" prompts. Bringing dead sessions back is the explicit R key.
 	closeDead(cli, views, wsMetaByID, liveByServer, localName, entries, cfg.syncCloseUnmatched(), &res)
+
+	// Converge to a FLAT layout: dissolve any native cmux group and close any
+	// leftover repo-group ANCHOR workspace. cctl no longer uses native groups
+	// (they need an anchor workspace that runs no session), so reconcile must
+	// REMOVE them, not just stop creating them — otherwise ungrouped anchors
+	// linger as empty workspaces.
+	dropCmuxGroupsAndAnchors(cli, cfg, views, entries, &res)
+
+	// Order the workspaces by name so each repo's sessions cluster together in
+	// the sidebar — grouping without native groups (which need an empty anchor
+	// workspace). Config-gated (defaults.order_workspaces, default true).
+	if cfg.orderWorkspaces() {
+		orderCmuxWorkspacesByName(cli)
+	}
 	return res
+}
+
+// orderCmuxWorkspacesByName sorts the window's workspaces by name and applies
+// that order in one `reorder-workspaces` call, so repo sessions
+// (repo/worktree/session) sit adjacent. The "cctl" control workspace is kept
+// first. Best-effort; a no-op when nothing moves.
+func orderCmuxWorkspacesByName(cli string) {
+	wss := listCmuxWorkspaces(cli)
+	ids := orderedCmuxWorkspaceIDs(wss)
+	if ids == nil {
+		return // fewer than 2, or already in order — nothing to move
+	}
+	if out, err := cmuxCmd(cli, "reorder-workspaces", "--order", strings.Join(ids, ",")).CombinedOutput(); err != nil {
+		log().Debug("sync-reorder-fail", "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	}
+}
+
+// orderedCmuxWorkspaceIDs returns the workspace ids in target order, or nil
+// when nothing needs to move. Only CCTL-OWNED workspaces are sorted ("cctl"
+// first, then session names alphabetically) and they are re-slotted into the
+// positions cctl workspaces already occupy — a user's own workspaces keep
+// their exact positions, so their manual drag-order is never touched. Pure,
+// so it's unit-testable.
+func orderedCmuxWorkspaceIDs(wss []cmuxWorkspace) []string {
+	if len(wss) < 2 {
+		return nil
+	}
+	isOurs := func(n string) bool {
+		if n == "cctl" {
+			return true
+		}
+		_, _, _, ok := parseWsTitle(n)
+		return ok
+	}
+	var ours []cmuxWorkspace
+	for _, w := range wss {
+		if isOurs(w.name) {
+			ours = append(ours, w)
+		}
+	}
+	sort.SliceStable(ours, func(i, j int) bool {
+		ci, cj := ours[i].name == "cctl", ours[j].name == "cctl"
+		if ci != cj {
+			return ci // control workspace first
+		}
+		return ours[i].name < ours[j].name
+	})
+	changed := false
+	ids := make([]string, 0, len(wss))
+	oi := 0
+	for _, w := range wss {
+		if isOurs(w.name) {
+			ids = append(ids, ours[oi].id)
+			if ours[oi].id != w.id {
+				changed = true
+			}
+			oi++
+		} else {
+			ids = append(ids, w.id)
+		}
+	}
+	if !changed {
+		return nil
+	}
+	return ids
+}
+
+// dropCmuxGroupsAndAnchors enforces the flat layout. It (1) ungroups every
+// native cmux group — ungroup preserves member workspaces, so a group anchored
+// on a live session leaves the session intact — and (2) closes any workspace
+// named like a cctl repo group ("repo" locally, "server/repo" remote) that
+// carries no tracked session (a former group header). Tracked sessions are
+// never touched.
+func dropCmuxGroupsAndAnchors(cli string, cfg *Config, views []cmuxWsView, entries []wsEntry, res *syncResult) {
+	anchors := cctlRepoGroupNames(cfg, entries)
+	// Only dissolve groups cctl itself would have created (named after a
+	// tracked repo). A group the user made for their own workspaces is none of
+	// cctl's business and must survive the reconcile.
+	for _, g := range listCmuxGroups(cli) {
+		if !anchors[g.name] {
+			continue
+		}
+		if out, err := exec.Command(cli, "workspace-group", "ungroup", g.name).CombinedOutput(); err != nil {
+			log().Debug("sync-ungroup-fail", "group", g.name, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			continue
+		}
+		log().Info("sync-ungroup", "group", g.name)
+	}
+	desired := manifestWsSet()
+	for _, w := range views {
+		if desired[w.name] || !anchors[w.name] {
+			continue // a tracked session, or not a repo-group anchor name
+		}
+		if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
+			log().Debug("sync-close-anchor-fail", "ws", w.name, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			continue
+		}
+		log().Info("sync-close-anchor", "ws", w.name)
+		res.closed++
+	}
+}
+
+// cctlRepoGroupNames returns the sidebar-group names cctl would use for the
+// tracked sessions' repos: the repo name locally, "server/repo" remotely —
+// exactly the names of groups/anchors cctl may own and tear down. Derived
+// directly from the entry + config (NOT via cfg.resolve, which triggers
+// discoverRepos and would fire one ssh per entry — a dozen 10s timeouts
+// against an unreachable host). Pure, so it's unit-testable.
+func cctlRepoGroupNames(cfg *Config, entries []wsEntry) map[string]bool {
+	out := map[string]bool{}
+	for _, e := range entries {
+		srv, ok := cfg.Servers[e.Server]
+		if !ok {
+			continue
+		}
+		if srv.Local {
+			out[e.Repo] = true
+		} else {
+			out[e.Server+"/"+e.Repo] = true
+		}
+	}
+	return out
+}
+
+// dropUnrepresentableEntries removes manifest entries whose identity
+// components contain "/" — created before worktree names were normalized
+// (e.g. worktree "feat/core"). Such names can't round-trip through the
+// slash-delimited tmux/workspace naming, so the session never looks "live"
+// and the spawn pass respawn-kills it forever. The entry is dropped and its
+// cmux workspace closed; the tmux session itself is left alone (an agent may
+// be running in it — the user decides its fate).
+func dropUnrepresentableEntries(cli string, views []cmuxWsView, entries []wsEntry, res *syncResult) []wsEntry {
+	kept := make([]wsEntry, 0, len(entries))
+	for _, e := range entries {
+		if !strings.Contains(e.Repo, "/") && !strings.Contains(e.Worktree, "/") && !strings.Contains(e.Session, "/") {
+			kept = append(kept, e)
+			continue
+		}
+		log().Warn("sync-drop-unrepresentable", "server", e.Server, "repo", e.Repo, "wt", e.Worktree, "session", e.Session)
+		manifestRemove(e.Server, e.Repo, e.Worktree, e.Session)
+		title := cmuxWsTitle(e.Repo, e.Worktree, e.Session)
+		for _, w := range views {
+			if w.name != title {
+				continue
+			}
+			if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
+				log().Debug("sync-close-unrepresentable-fail", "ws", w.name, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+				continue
+			}
+			res.closed++
+		}
+	}
+	return kept
 }
 
 // entriesToSpawn returns the tracked sessions that aren't fully up and should
@@ -552,6 +737,107 @@ func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired, desiredTm
 	}
 }
 
+// pruneWorkspaceSurfaces enforces one tab per session workspace: for each cmux
+// workspace matching a tracked session, it keeps the session's own tab and
+// closes any extra surfaces (leftover cwd shells from a spawn that added a tab
+// to a workspace that already had one, or that cmux restored). A workspace is
+// pruned only when its session tab is positively identified — so a mistitled or
+// still-settling tab is never mistaken for junk.
+func pruneWorkspaceSurfaces(cli string, views []cmuxWsView, entries []wsEntry, res *syncResult) {
+	byName := map[string]wsEntry{}
+	for _, e := range entries {
+		byName[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e
+	}
+	for _, w := range views {
+		e, ok := byName[w.name]
+		if !ok || len(w.surfaces) <= 1 {
+			continue
+		}
+		for _, sid := range surfacesToPrune(w, sessionTabTitles(e)) {
+			if err := closeCmuxSurface(cli, w.id, sid); err != nil {
+				log().Debug("sync-prune-surface-fail", "ws", w.name, "surface", sid, "err", err.Error())
+				continue
+			}
+			log().Info("sync-prune-surface", "ws", w.name)
+			res.pruned++
+		}
+	}
+}
+
+// ensureResumeBindings binds each tracked session surface's durable wrapper as
+// its cmux resume command, so cmux replays it when it restores the workspace.
+// cmux auto-binds a `tmux attach` for local tmux surfaces, but never the remote
+// mosh wrapper — so without this, a remote workspace reopens as a bare detached
+// shell after a cmux restart/reboot. Only touches local-wrapper sessions
+// (e.Remote == false) that have a durable script, and only writes when the
+// binding is missing or stale. Idempotent.
+func ensureResumeBindings(cli string, views []cmuxWsView, entries []wsEntry, res *syncResult) {
+	byName := map[string]wsEntry{}
+	for _, e := range entries {
+		byName[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e
+	}
+	for _, w := range views {
+		e, ok := byName[w.name]
+		if !ok || e.Remote || e.Script == "" {
+			continue // untracked, cmux-ssh (self-reconnecting), or no wrapper
+		}
+		titles := sessionTabTitles(e)
+		for _, s := range w.surfaces {
+			if !titles[s.title] {
+				continue // not the session's own tab
+			}
+			if cmuxSurfaceResumeIs(cli, w.id, s.id, e.Script) {
+				continue // already bound to the wrapper
+			}
+			setCmuxSurfaceResume(cli, w.id, s.id, e.Session, e.Cwd, e.Script)
+			res.bound++
+		}
+	}
+}
+
+// sessionTabTitles is the set of tab titles that legitimately identify a
+// session's own surface across local/remote flavors: the bare session name, the
+// full tmux name, and the mosh-prefixed form cmux shows for remote panes.
+func sessionTabTitles(e wsEntry) map[string]bool {
+	return map[string]bool{
+		e.Session:              true,
+		e.TmuxName:             true,
+		"[mosh] " + e.TmuxName: true,
+	}
+}
+
+// surfacesToPrune returns the ids of a workspace's junk surfaces — everything
+// that isn't the session's tab — but ONLY when the session tab is present. If
+// no surface matches (a settling/mistitled tab), it returns nil so nothing is
+// closed. Pure, so it's unit-testable.
+func surfacesToPrune(w cmuxWsView, sessionTitles map[string]bool) []string {
+	hasSession := false
+	for _, s := range w.surfaces {
+		if sessionTitles[s.title] {
+			hasSession = true
+			break
+		}
+	}
+	if !hasSession {
+		return nil
+	}
+	var out []string
+	for _, s := range w.surfaces {
+		if !sessionTitles[s.title] {
+			out = append(out, s.id)
+		}
+	}
+	return out
+}
+
+func closeCmuxSurface(cli, wsID, surfaceID string) error {
+	out, err := exec.Command(cli, "close-surface", "--workspace", wsID, "--surface", surfaceID).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("close-surface: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // ensureRepoGrouping files every cctl workspace under one sidebar group per
 // repo — "repo" for local, "server/repo" for remote (repoGroup decides which,
 // the same way spawn does). cmux otherwise groups workspaces by each one's own
@@ -796,8 +1082,19 @@ func restoreSpawn(cfg *Config, e wsEntry) error {
 		r.Agent = e.Agent
 	}
 	group, groupCwd := repoGroup(r)
-	_, err = spawnInNewWindow(cfg, r.Server, r.UseMosh,
-		agentAttachOrRespawn(r, tmuxName(r.RepoName, e.Worktree, e.Session), cwd),
+	tname := tmuxName(r.RepoName, e.Worktree, e.Session)
+	// Default: idempotent attach/resurrect. If the entry carries a pending
+	// first-launch prompt, create the session running the agent WITH that
+	// prompt instead — `tmux new-session -A` runs the command only on create,
+	// so it's naturally idempotent (a later reconcile just attaches). The
+	// prompt self-clears: manifestUpsert (inside spawnInNewWindow) rewrites the
+	// entry from the spec, which has no prompt.
+	cmdStr := agentAttachOrRespawn(r, tname, cwd)
+	if e.Prompt != "" {
+		cmdStr = fmt.Sprintf("tmux new-session -A -s %s %s",
+			shellQuote(tname), shellQuote(agentLaunchScript(r, cwd, e.Prompt, tname)))
+	}
+	_, err = spawnInNewWindow(cfg, r.Server, r.UseMosh, cmdStr,
 		SpawnSpec{
 			Server:     e.Server,
 			Repo:       e.Repo,
@@ -811,6 +1108,33 @@ func restoreSpawn(cfg *Config, e wsEntry) error {
 			GroupCwd:   groupCwd,
 		})
 	return err
+}
+
+// sessionIsUp reports whether a session is already live with a cmux workspace —
+// i.e. an interactive open just needs to focus it, not spawn. Scoped to the
+// session's OWN server so it never touches (and never blocks on) other servers.
+func sessionIsUp(cfg *Config, e wsEntry) bool {
+	cli := cmuxCLIPath()
+	if cli == "" {
+		return false
+	}
+	if _, ok := findCmuxWorkspaceByName(cli, cmuxWsTitle(e.Repo, e.Worktree, e.Session)); !ok {
+		return false
+	}
+	srv, ok := cfg.Servers[e.Server]
+	if !ok {
+		return false
+	}
+	sessions, err := listSessions(e.Server, srv)
+	if err != nil {
+		return false
+	}
+	for _, s := range sessions {
+		if s.Name == e.TmuxName {
+			return true
+		}
+	}
+	return false
 }
 
 // ---- small helpers ---------------------------------------------------------
@@ -901,9 +1225,11 @@ const tmuxReloadCmd = "tmux source-file ~/.tmux.conf 2>/dev/null || true"
 
 // restartResult summarizes a --restart-all destroy pass.
 type restartResult struct {
-	servers  int // servers in the config
-	reloaded int // servers whose tmux config we reloaded
-	killed   int // tracked sessions killed (to be revived by the reconcile)
+	servers     int // servers in the config
+	unreachable int // servers whose initial probe failed (skipped for the pass)
+	reloaded    int // servers whose tmux config we reloaded
+	killed      int // tracked sessions killed (to be revived by the reconcile)
+	skipped     int // tracked sessions left alone because their server is unreachable
 }
 
 // restartTargets returns the tracked sessions --restart-all will kill: every
@@ -928,23 +1254,40 @@ func restartTargets(cfg *Config, entries []wsEntry) []wsEntry {
 // the reloaded Ms/scroll settings. Live sessions are adopted first so nothing is
 // killed without a restore path. Per-server/-session errors are logged, not
 // fatal — one unreachable host shouldn't block the rest.
+//
+// An unreachable server is detected once (its step-1 probe) and then skipped
+// for the reload + every kill. Without that fail-fast a dead host cost a full
+// ssh timeout (~10s) on each of its ops — the list, the reload, and one kill
+// per tracked session — so a box with a dozen sessions stalled the whole pass
+// for minutes with no output. Progress is written to stderr so the destroy
+// phase is never silent while it waits on ssh.
 func restartAllTrackedSessions(cfg *Config) restartResult {
 	res := restartResult{servers: len(cfg.Servers)}
 
 	// 1. Adopt live sessions so the manifest is the complete tracked set before
 	//    we start killing (otherwise a live-but-unadopted session would be
-	//    killed with nothing in the manifest to restore it).
+	//    killed with nothing in the manifest to restore it). This first probe
+	//    per server also tells us which servers are reachable.
+	reachable := make(map[string]bool, len(cfg.Servers))
 	for name, s := range cfg.Servers {
 		sessions, err := listSessions(name, s)
 		if err != nil {
+			res.unreachable++
+			fmt.Fprintf(os.Stderr, "restart-all: server %q unreachable (%v)\n            — skipping its reload + kills; its sessions stay tracked and revive when it's back.\n", name, err)
 			log().Warn("restart-all-list-fail", "server", name, "err", err.Error())
 			continue
 		}
+		reachable[name] = true
 		adoptFromTmux(name, s, sessions)
 	}
 
-	// 2. Reload tmux config per server so the revived sessions get new settings.
+	// 2. Reload tmux config per reachable server so revived sessions get new
+	//    settings. Unreachable servers are skipped — the reload would only
+	//    time out.
 	for name, s := range cfg.Servers {
+		if !reachable[name] {
+			continue
+		}
 		if _, err := runRemote(s, tmuxReloadCmd); err != nil {
 			log().Warn("restart-all-reload-fail", "server", name, "err", err.Error())
 			continue
@@ -952,13 +1295,20 @@ func restartAllTrackedSessions(cfg *Config) restartResult {
 		res.reloaded++
 	}
 
-	// 3. Kill each tracked session. Manifest kept → the reconcile restores it.
+	// 3. Kill each tracked session on a reachable server. Manifest kept → the
+	//    reconcile restores it. Sessions on an unreachable server are left as-is
+	//    (still tracked) rather than eating a per-session timeout each.
 	for _, e := range restartTargets(cfg, loadManifestEntries()) {
+		if !reachable[e.Server] {
+			res.skipped++
+			continue
+		}
 		s := cfg.Servers[e.Server]
 		if _, err := runRemote(s, fmt.Sprintf("tmux kill-session -t %s 2>/dev/null || true", shellQuote(e.TmuxName))); err != nil {
 			log().Warn("restart-all-kill-fail", "session", e.TmuxName, "err", err.Error())
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "restart-all: killed %s\n", e.TmuxName)
 		res.killed++
 	}
 	return res

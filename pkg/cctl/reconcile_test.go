@@ -560,3 +560,113 @@ func TestFindLocalServer(t *testing.T) {
 		t.Error("findLocalServer should report false when no local server")
 	}
 }
+
+func TestSurfacesToPrune(t *testing.T) {
+	titles := sessionTabTitles(wsEntry{Session: "docs", TmuxName: "cctl/olympus/gb300-k8s/docs"})
+	// Junk cwd shells alongside the real "docs" tab → prune the shells only.
+	w := cmuxWsView{id: "w1", name: "olympus/gb300-k8s/docs", surfaces: []cmuxSurface{
+		{id: "s1", title: "…/github.com/geoah/rxtx.dev"},
+		{id: "s2", title: "…/workspace/olympus/gb300-k8s"},
+		{id: "s3", title: "docs"},
+	}}
+	got := surfacesToPrune(w, titles)
+	if len(got) != 2 || got[0] != "s1" || got[1] != "s2" {
+		t.Fatalf("want [s1 s2] pruned, got %v", got)
+	}
+	// The full tmux name also counts as the session tab (local flavor).
+	w2 := cmuxWsView{id: "w2", name: "go-cctl/main/default", surfaces: []cmuxSurface{
+		{id: "a", title: "cctl/go-cctl/main/default"},
+	}}
+	if got := surfacesToPrune(w2, sessionTabTitles(wsEntry{Session: "default", TmuxName: "cctl/go-cctl/main/default"})); got != nil {
+		t.Fatalf("single session tab (full-name titled) must not be pruned, got %v", got)
+	}
+	// No identifiable session tab → prune NOTHING (never nuke a settling tab).
+	w3 := cmuxWsView{id: "w3", name: "rxtx.dev/mneme/default", surfaces: []cmuxSurface{
+		{id: "x", title: "✳ Some other conversation"},
+		{id: "y", title: "…/worktrees/rxtx.dev/mneme"},
+	}}
+	if got := surfacesToPrune(w3, sessionTabTitles(wsEntry{Session: "default", TmuxName: "cctl/rxtx_dev/mneme/default"})); got != nil {
+		t.Fatalf("no session tab present → must prune nothing, got %v", got)
+	}
+}
+
+func TestMergeWsEntry_PreservesRichFieldsDropsPrompt(t *testing.T) {
+	old := wsEntry{
+		Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		TmuxName: "cctl/olympus/gb300-k8s/docs", WsTitle: "olympus/gb300-k8s/docs",
+		TabTitle: "docs", Group: "workspace/olympus", GroupCwd: "/x", Cwd: "/y",
+		Script: "/Users/me/.cctl/spawn/w.sh", Agent: "claude", Remote: true,
+		Prompt: "stale pending prompt",
+	}
+	// A sparse attach-style upsert: identity only.
+	in := wsEntry{Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		TmuxName: "cctl/olympus/gb300-k8s/docs", Updated: 42}
+	got := mergeWsEntry(old, in)
+	if got.Script != old.Script {
+		t.Errorf("Script clobbered: %q (dd would leak the wrapper)", got.Script)
+	}
+	if got.Agent != "claude" || !got.Remote || got.Group != old.Group || got.Cwd != "/y" {
+		t.Errorf("rich fields lost: %+v", got)
+	}
+	if got.Prompt != "" {
+		t.Errorf("stale Prompt inherited (%q) — a dead session would relaunch with it", got.Prompt)
+	}
+	// Incoming non-empty values win.
+	in2 := wsEntry{Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		Agent: "codex", Prompt: "fresh"}
+	got2 := mergeWsEntry(old, in2)
+	if got2.Agent != "codex" || got2.Prompt != "fresh" {
+		t.Errorf("incoming values should win: %+v", got2)
+	}
+}
+
+func TestCctlRepoGroupNames(t *testing.T) {
+	cfg := &Config{Servers: map[string]Server{
+		"local":     {Local: true},
+		"workspace": {},
+	}}
+	entries := []wsEntry{
+		{Server: "local", Repo: "rxtx.dev"},
+		{Server: "workspace", Repo: "olympus"},
+		{Server: "gone", Repo: "zombie"}, // server removed from config → skipped
+	}
+	got := cctlRepoGroupNames(cfg, entries)
+	if !got["rxtx.dev"] || !got["workspace/olympus"] {
+		t.Fatalf("missing expected group names: %v", got)
+	}
+	if got["zombie"] || got["gone/zombie"] {
+		t.Fatalf("entry for a removed server must not own a group name: %v", got)
+	}
+}
+
+func TestOrderedCmuxWorkspaceIDs(t *testing.T) {
+	// Out of order, control not first, with a USER workspace ("scratch", not
+	// cctl-shaped) between them → the cctl block sorts into the cctl-occupied
+	// slots; the user workspace keeps its exact position.
+	wss := []cmuxWorkspace{
+		{id: "B", name: "rxtx.dev/main/x"},
+		{id: "U", name: "scratch"},
+		{id: "C", name: "cctl"},
+		{id: "A", name: "go-cctl/main/default"},
+	}
+	got := orderedCmuxWorkspaceIDs(wss)
+	want := []string{"C", "U", "A", "B"} // slots 0,2,3 are cctl's; slot 1 stays U
+	if len(got) != 4 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+	// Only user workspaces "out of order" → nil (we never touch them).
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{
+		{id: "Z", name: "zeta"}, {id: "Y", name: "alpha"},
+	}); got != nil {
+		t.Fatalf("user-only workspaces must never be reordered, got %v", got)
+	}
+	// Already ordered → nil (caller skips the reorder call).
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{
+		{id: "C", name: "cctl"}, {id: "A", name: "a/b/c"}, {id: "B", name: "b/c/d"},
+	}); got != nil {
+		t.Fatalf("already-ordered should return nil, got %v", got)
+	}
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{{id: "X", name: "solo"}}); got != nil {
+		t.Fatalf("single workspace should return nil, got %v", got)
+	}
+}
