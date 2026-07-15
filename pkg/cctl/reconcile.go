@@ -2,6 +2,7 @@ package cctl
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -170,6 +171,10 @@ func syncCmuxState(cfg *Config) syncResult {
 	// files the freshly-opened workspaces too.
 	for _, e := range entriesToSpawn(views, liveByServer, entries) {
 		if err := restoreSpawn(cfg, e, false); err != nil {
+			if errors.Is(err, errWorktreeGone) {
+				res.closed++ // dropped a session whose worktree was deleted
+				continue
+			}
 			log().Warn("sync-spawn-fail", "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "err", err.Error())
 			res.errs++
 			continue
@@ -1167,6 +1172,24 @@ func parseCmuxGroups(raw []byte) []cmuxGroup {
 // restoreSpawn (re)opens a manifest entry's tab via the normal spawn path,
 // which heals an existing same-titled tab or creates the workspace, binds
 // the durable wrapper, and refreshes the manifest record.
+// errWorktreeGone marks a restoreSpawn that DROPPED its session because the
+// worktree directory no longer exists — handled, not a failure.
+var errWorktreeGone = errors.New("worktree directory is gone — session dropped")
+
+// worktreeDirGone definitively checks whether a session's cwd is missing.
+// Only a successful probe that says "no such dir" returns gone=true.
+func worktreeDirGone(srv Server, dir string) (bool, error) {
+	// shellPath (not shellQuote): session cwds are recorded with a "~/"
+	// prefix on remotes, and single-quoting the tilde defeats expansion —
+	// `test -d '~/x'` is ALWAYS false, which made this guard drop live
+	// sessions wholesale on its first outing.
+	out, err := runRemote(srv, "test -d "+shellPath(dir)+" && echo yes || echo no")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) == "no", nil
+}
+
 func restoreSpawn(cfg *Config, e wsEntry, focus bool) error {
 	r, err := cfg.resolve(e.Server, e.Repo)
 	if err != nil {
@@ -1182,6 +1205,18 @@ func restoreSpawn(cfg *Config, e wsEntry, focus bool) error {
 	cwd := r.Repo.Path
 	if e.Worktree != "" && e.Worktree != "main" {
 		cwd = worktreePath(r.WorktreeBase, r.RepoName, e.Worktree)
+	}
+	// A session whose worktree directory was deleted can never come back —
+	// the wrapper would only print "worktree directory is gone" and loop
+	// (exit → next reconcile revives → same dead end). Verify the cwd exists
+	// before spawning: DEFINITIVELY missing → drop the session (manifest +
+	// workspace); a transport error stays a normal spawn error, so a probe
+	// blip can never delete anything.
+	if gone, err := worktreeDirGone(r.Server, cwd); err == nil && gone {
+		log().Warn("sync-drop-gone-worktree", "server", e.Server, "ws", cmuxWsTitle(e.Repo, e.Worktree, e.Session), "cwd", cwd)
+		manifestRemove(e.Server, e.Repo, e.Worktree, e.Session)
+		closeCmuxWorkspaceByIDOrTitle(e.WsID, cmuxWsTitle(e.Repo, e.Worktree, e.Session))
+		return errWorktreeGone
 	}
 	// Honor the session's recorded agent (fallback: config-resolved).
 	if e.Agent != "" {
