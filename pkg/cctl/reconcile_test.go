@@ -332,42 +332,58 @@ func TestSyncCloseUnmatchedDefault(t *testing.T) {
 func TestShouldCloseDeadWorkspace(t *testing.T) {
 	tracked := tmuxName("rxtx.dev", "main", "audit")
 	desired := map[string]bool{"rxtx.dev/main/audit": true}
+	desiredTmux := map[string]bool{tracked: true}
 	remoteMeta := wsMeta{server: "ws", remote: true, repoRoot: "olympus"}
 	localMeta := wsMeta{server: "local", repoRoot: "rxtx.dev"}
 
 	// alive tracked → keep
 	live := map[string]bool{tracked: true}
-	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, live, desired, false) {
+	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, live, desired, desiredTmux, false) {
 		t.Error("alive session must never be closed")
 	}
 	// dead + tracked → keep (the reconcile REVIVES tracked sessions; only dd,
 	// which removes the manifest entry, makes a session closeable)
-	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, map[string]bool{}, desired, false) {
+	if shouldCloseDeadWorkspace("rxtx.dev/main/audit", localMeta, map[string]bool{}, desired, desiredTmux, false) {
 		t.Error("dead tracked workspace must be kept (it gets revived, not closed)")
 	}
 	// dead + untracked + flag OFF → keep (protects manual tabs)
-	if shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, false) {
+	if shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, desiredTmux, false) {
 		t.Error("dead untracked workspace must be kept when close-unmatched is off")
 	}
 	// dead + untracked + flag ON → close (opt-in pruning), but only cctl-shaped
-	if !shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, true) {
+	if !shouldCloseDeadWorkspace("rxtx.dev/main/scratch", localMeta, map[string]bool{}, desired, desiredTmux, true) {
 		t.Error("dead untracked 3-part workspace should close when close-unmatched is on")
 	}
 	// non-cctl-shaped (single component) → never closed, even with flag on
-	if shouldCloseDeadWorkspace("my-notes", localMeta, map[string]bool{}, desired, true) {
+	if shouldCloseDeadWorkspace("my-notes", localMeta, map[string]bool{}, desired, desiredTmux, true) {
 		t.Error("non-cctl-shaped workspace must never be auto-closed")
 	}
 	// 2-part: closed only in a cctl remote group, never via close-unmatched
-	if shouldCloseDeadWorkspace("olympus/lethe", localMeta, map[string]bool{}, desired, true) {
+	if shouldCloseDeadWorkspace("olympus/lethe", localMeta, map[string]bool{}, desired, desiredTmux, true) {
 		t.Error("2-part local workspace must not be closed even with flag on")
 	}
-	if !shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, map[string]bool{}, desired, false) {
+	if !shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, map[string]bool{}, desired, desiredTmux, false) {
 		t.Error("dead 2-part workspace in a cctl remote group should close")
 	}
 	// 2-part in remote group but a session there is alive → keep
 	liveWt := map[string]bool{tmuxName("olympus", "lethe", "poc"): true}
-	if shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, liveWt, desired, false) {
+	if shouldCloseDeadWorkspace("olympus/lethe", remoteMeta, liveWt, desired, desiredTmux, false) {
 		t.Error("2-part workspace with a live session must be kept")
+	}
+
+	// Stale sanitized twin: "olympus/ecr_b1/1" and the tracked canonical
+	// "olympus/ecr.b1/1" share one tmux session (both sanitize to ecr_b1). The
+	// canonical tab is tracked; the sanitized dup must be closed even though the
+	// shared session is live — otherwise the legacy duplicate never collapses.
+	twinDesired := map[string]bool{"olympus/ecr.b1/1": true}
+	twinDesiredTmux := map[string]bool{tmuxName("olympus", "ecr.b1", "1"): true}
+	sharedLive := map[string]bool{tmuxName("olympus", "ecr_b1", "1"): true}
+	if !shouldCloseDeadWorkspace("olympus/ecr_b1/1", localMeta, sharedLive, twinDesired, twinDesiredTmux, false) {
+		t.Error("stale sanitized twin of a tracked canonical workspace should be closed")
+	}
+	// ...but the canonical real-name workspace itself must never be closed.
+	if shouldCloseDeadWorkspace("olympus/ecr.b1/1", localMeta, sharedLive, twinDesired, twinDesiredTmux, false) {
+		t.Error("canonical tracked workspace must never be closed")
 	}
 }
 
