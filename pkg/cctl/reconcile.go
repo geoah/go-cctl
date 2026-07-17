@@ -464,6 +464,18 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 // prunes the manifest (so the R key can still restore it).
 func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByServer map[string]map[string]bool, localName string, entries []wsEntry, closeUnmatched bool, res *syncResult) {
 	desired := manifestWsSet()
+	// Canonical tmux identity of every tracked workspace. A workspace whose name
+	// sanitizes to the same session as a tracked one — but that isn't itself
+	// tracked — is a legacy sanitized-vs-real twin (e.g. "olympus/ecr_b1/1" left
+	// over after the manifest healed to the real "olympus/ecr.b1/1"). Its shared
+	// tmux session is live, so the plain liveness check would keep it forever;
+	// this set lets closeDead collapse the duplicate onto the canonical tab.
+	desiredTmux := map[string]bool{}
+	for name := range desired {
+		if r, w, s, ok := parseWsTitle(name); ok {
+			desiredTmux[tmuxName(r, w, s)] = true
+		}
+	}
 	srvByWs := map[string]string{}
 	for _, e := range entries {
 		srvByWs[cmuxWsTitle(e.Repo, e.Worktree, e.Session)] = e.Server
@@ -481,7 +493,7 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 		if live == nil {
 			continue // server unreachable — can't tell; leave it
 		}
-		if !shouldCloseDeadWorkspace(w.name, meta, live, desired, closeUnmatched) {
+		if !shouldCloseDeadWorkspace(w.name, meta, live, desired, desiredTmux, closeUnmatched) {
 			continue
 		}
 		if out, err := exec.Command(cli, "close-workspace", "--workspace", w.id).CombinedOutput(); err != nil {
@@ -501,14 +513,16 @@ func closeDead(cli string, views []cmuxWsView, wsMeta map[string]wsMeta, liveByS
 //   - 3-part "repo/worktree/session": close when tracked in the manifest, in a
 //     verified cctl remote group, or — only with closeUnmatched — any dead
 //     cctl-shaped name (the opt-in that prunes tabs cctl can't otherwise prove
-//     it owns).
+//     it owns). Also closes a live one when its tmux identity matches a tracked
+//     canonical workspace under a different name (a stale sanitized twin whose
+//     real-name tab already covers the session — desiredTmux carries those).
 //   - 2-part legacy "repo/worktree": close only inside a verified cctl remote
 //     group (cmux would never name such a group itself). Never via
 //     closeUnmatched — a bare two-part name is exactly what a manual tab or
 //     cmux's own project grouping looks like.
 //   - anything else (the "cctl" control workspace, single-name or custom
 //     workspaces): never closed.
-func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired map[string]bool, closeUnmatched bool) bool {
+func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired, desiredTmux map[string]bool, closeUnmatched bool) bool {
 	inCctlRemoteGroup := meta.remote && meta.repoRoot != "" && strings.HasPrefix(name, meta.repoRoot+"/")
 	parts := strings.Split(name, "/")
 	switch len(parts) {
@@ -516,7 +530,12 @@ func shouldCloseDeadWorkspace(name string, meta wsMeta, live, desired map[string
 		if desired[name] {
 			return false // tracked — the reconcile revives/keeps it, never closes
 		}
-		if live[tmuxName(parts[0], parts[1], parts[2])] {
+		t := tmuxName(parts[0], parts[1], parts[2])
+		if desiredTmux[t] {
+			return true // stale sanitized twin of a tracked canonical workspace —
+			// its real-name tab already covers this (live) session, so drop the dup
+		}
+		if live[t] {
 			return false // live (and would've been adopted) — keep
 		}
 		// Orphan: a cctl-shaped tab not in the manifest (dd'd or junk). Close
