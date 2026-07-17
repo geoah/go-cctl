@@ -144,6 +144,12 @@ func syncCmuxState(cfg *Config) syncResult {
 		res.adopted += adoptFromTmux(name, s, sessionsByServer[name])
 	}
 
+	// Collapse any duplicate rows that describe one session under both its real
+	// and tmux-sanitized worktree name (a legacy adopt bug). Left in place they
+	// resurrect a duplicate workspace on every pass. Runs after adopt so a
+	// freshly-adopted real-name entry can absorb its sanitized twin.
+	manifestDedupByTmux()
+
 	// Re-read after adoption so open/group/close see the full tracked set.
 	entries := loadManifestEntries()
 
@@ -382,9 +388,14 @@ func snapshotCmuxViews(cli string) []cmuxWsView {
 }
 
 // adoptFromTmux records live tmux sessions on one server that are missing
-// from the manifest. Repo names are de-sanitized via the server's repo list
-// so "rxtx_dev" → "rxtx.dev". Remote entries are flagged so heal/close treat
-// them as cmux-ssh-managed.
+// from the manifest. Repo AND worktree names are de-sanitized back to their
+// real forms ("rxtx_dev" → "rxtx.dev", "ecr_b1" → "ecr.b1"): a tmux session
+// name is sanitized ('.'/':' → '_'), so parseTmuxName hands us the sanitized
+// components, but spawns record the manifest under the REAL names. Adopting
+// under the sanitized name creates a mismatched duplicate entry (and a
+// duplicate cmux workspace) that a later dd — which targets the real name —
+// can't remove, so the reconcile keeps reviving it. Remote entries are flagged
+// so heal/close treat them as cmux-ssh-managed.
 func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 	if len(sessions) == 0 {
 		return 0
@@ -403,6 +414,21 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 	for name := range repos {
 		bySafe[tmuxSafeName(name)] = name
 	}
+	// Per-repo map from sanitized worktree name → real name, from
+	// `git worktree list` (one round-trip). Mirrors the repo de-sanitization
+	// above and normalizeSessionNames in the TUI. Best-effort: on error we
+	// fall back to the sanitized name (harmless when the worktree has no
+	// reserved chars).
+	wtBySafe := map[string]map[string]string{}
+	if wts, _, err := listAllWorktrees(srv, repos); err == nil {
+		for repo, list := range wts {
+			m := map[string]string{}
+			for _, wt := range list {
+				m[tmuxSafeName(wt.Name)] = wt.Name
+			}
+			wtBySafe[repo] = m
+		}
+	}
 	have := manifestKeySet()
 	n := 0
 	for _, s := range sessions {
@@ -410,14 +436,18 @@ func adoptFromTmux(serverName string, srv Server, sessions []SessionInfo) int {
 		if real, ok := bySafe[s.Repo]; ok {
 			repo = real
 		}
-		key := manifestKey(serverName, repo, s.Worktree, s.Session)
+		worktree := s.Worktree
+		if real, ok := wtBySafe[repo][s.Worktree]; ok {
+			worktree = real
+		}
+		key := manifestKey(serverName, repo, worktree, s.Session)
 		if have[key] {
 			continue
 		}
 		manifestUpsertEntry(wsEntry{
-			Server: serverName, Repo: repo, Worktree: s.Worktree, Session: s.Session,
+			Server: serverName, Repo: repo, Worktree: worktree, Session: s.Session,
 			TmuxName: s.Name,
-			WsTitle:  cmuxWsTitle(repo, s.Worktree, s.Session), TabTitle: s.Session, Remote: !srv.Local,
+			WsTitle:  cmuxWsTitle(repo, worktree, s.Session), TabTitle: s.Session, Remote: !srv.Local,
 		})
 		have[key] = true
 		n++

@@ -181,6 +181,65 @@ func TestManifestRoundTrip(t *testing.T) {
 	}
 }
 
+// A dotted worktree ("ecr.b1") is stored real by a spawn but sanitized
+// ("ecr_b1") by the legacy adopt path, leaving two rows for one tmux session.
+// dd targets the real name; it must still purge the sanitized twin (matched by
+// canonical tmux name) so the next reconcile can't revive the session.
+func TestManifestRemove_PurgesSanitizedTwin(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	// real-name entry (spawn) + sanitized twin (adopt) — same tmux session.
+	manifestUpsert(SpawnSpec{Server: "dev", Repo: "olympus", Worktree: "ecr.b1", Session: "2"})
+	manifestUpsertEntry(wsEntry{
+		Server: "dev", Repo: "olympus", Worktree: "ecr_b1", Session: "2",
+		TmuxName: tmuxName("olympus", "ecr.b1", "2"),
+		WsTitle:  cmuxWsTitle("olympus", "ecr_b1", "2"), TabTitle: "2",
+	})
+	// A different session on the same worktree must survive.
+	manifestUpsert(SpawnSpec{Server: "dev", Repo: "olympus", Worktree: "ecr.b1", Session: "1"})
+
+	manifestRemove("dev", "olympus", "ecr.b1", "2")
+
+	es := loadManifestEntries()
+	if len(es) != 1 || es[0].Session != "1" {
+		t.Fatalf("after remove want only session 1, got %+v", es)
+	}
+}
+
+// The reconcile's dedup collapses the real+sanitized twin pair, keeping the
+// real-name row (its worktree changes under sanitization) so its WsTitle still
+// matches the actual cmux workspace.
+func TestManifestDedupByTmux_KeepsRealName(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	manifestUpsertEntry(wsEntry{
+		Server: "dev", Repo: "olympus", Worktree: "ecr_b1", Session: "1",
+		TmuxName: tmuxName("olympus", "ecr.b1", "1"),
+		WsTitle:  cmuxWsTitle("olympus", "ecr_b1", "1"),
+	})
+	manifestUpsertEntry(wsEntry{
+		Server: "dev", Repo: "olympus", Worktree: "ecr.b1", Session: "1",
+		TmuxName: tmuxName("olympus", "ecr.b1", "1"),
+		WsTitle:  cmuxWsTitle("olympus", "ecr.b1", "1"),
+	})
+	// An unrelated single session must be left untouched.
+	manifestUpsertEntry(wsEntry{
+		Server: "dev", Repo: "olympus", Worktree: "n2d-vs-c4d", Session: "1",
+		TmuxName: tmuxName("olympus", "n2d-vs-c4d", "1"),
+	})
+
+	if dropped := manifestDedupByTmux(); dropped != 1 {
+		t.Fatalf("want 1 dropped, got %d", dropped)
+	}
+	es := loadManifestEntries()
+	if len(es) != 2 {
+		t.Fatalf("want 2 entries after dedup, got %d: %+v", len(es), es)
+	}
+	for _, e := range es {
+		if e.Worktree == "ecr_b1" {
+			t.Errorf("sanitized twin should have been dropped, kept: %+v", e)
+		}
+	}
+}
+
 func TestManifestWsSet(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	manifestUpsert(SpawnSpec{
