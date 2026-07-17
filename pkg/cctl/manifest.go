@@ -216,6 +216,74 @@ func manifestUpsertEntry(e wsEntry) {
 	}
 }
 
+// manifestDedupByTmux collapses entries that describe the SAME session — same
+// (server, canonical tmux name) — into one, healing the historical skew where
+// a spawn recorded a dotted worktree by its real name ("ecr.b1") while adopt
+// recorded the same live session with the tmux-sanitized name ("ecr_b1"). Two
+// rows for one tmux session mean a duplicate cmux workspace the reconcile keeps
+// re-opening and a dd that can't fully remove the session. Keeps the entry
+// whose repo/worktree are the REAL names (they change under sanitization),
+// else the most recently updated. Wrapper scripts are left alone — the twins
+// share one session/script, so the survivor still needs it. Returns how many
+// entries it dropped.
+func manifestDedupByTmux() int {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+	entries := loadManifest()
+	// realness scores how "un-sanitized" an entry's identity is: a name that
+	// changes when re-sanitized is the original real one (the twin we keep).
+	realness := func(e wsEntry) int {
+		score := 0
+		if tmuxSafeName(e.Repo) != e.Repo {
+			score++
+		}
+		if tmuxSafeName(e.Worktree) != e.Worktree {
+			score++
+		}
+		return score
+	}
+	// wins reports whether a should be kept over b: prefer the realer name,
+	// then the more recently updated entry.
+	wins := func(a, b wsEntry) bool {
+		if ra, rb := realness(a), realness(b); ra != rb {
+			return ra > rb
+		}
+		return a.Updated > b.Updated
+	}
+	best := map[string]int{} // server\x00tmuxName -> index of the kept entry
+	drop := map[int]bool{}
+	for i, e := range entries {
+		if e.TmuxName == "" {
+			continue // no canonical identity to dedup on
+		}
+		k := e.Server + "\x00" + e.TmuxName
+		j, seen := best[k]
+		if !seen {
+			best[k] = i
+			continue
+		}
+		if wins(e, entries[j]) {
+			best[k] = i
+			drop[j] = true
+		} else {
+			drop[i] = true
+		}
+	}
+	if len(drop) == 0 {
+		return 0
+	}
+	kept := entries[:0]
+	for i, e := range entries {
+		if !drop[i] {
+			kept = append(kept, e)
+		}
+	}
+	if err := saveManifest(kept); err != nil {
+		log().Warn("manifest-save-fail", "err", err.Error())
+	}
+	return len(drop)
+}
+
 // manifestRemoveWorktree drops every session on a worktree (called when the
 // whole worktree is removed) and best-effort deletes their wrapper scripts.
 func manifestRemoveWorktree(server, repo, worktree string) {
@@ -247,31 +315,38 @@ func manifestRemoveWorktree(server, repo, worktree string) {
 }
 
 // manifestRemove drops a session (called when it's deleted) and best-effort
-// removes its durable wrapper script.
+// removes its durable wrapper script. It matches on the (server,repo,worktree,
+// session) key AND on the canonical tmux name: tmuxName sanitizes its inputs,
+// so it's the same for a real-worktree entry and a legacy sanitized-worktree
+// twin (e.g. "ecr.b1" and "ecr_b1" both → cctl/<repo>/ecr_b1/<session>).
+// Matching either purges every record of the session — otherwise a surviving
+// twin gets revived by the next reconcile and the session looks un-deletable.
 func manifestRemove(server, repo, worktree, session string) {
 	key := manifestKey(server, repo, worktree, session)
+	tname := tmuxName(repo, worktree, session)
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
 	entries := loadManifest()
 	kept := entries[:0]
-	var removed *wsEntry
+	var removed []wsEntry
 	for _, e := range entries {
-		if e.key() == key {
-			ec := e
-			removed = &ec
+		if e.key() == key || (e.Server == server && e.TmuxName == tname) {
+			removed = append(removed, e)
 			continue
 		}
 		kept = append(kept, e)
 	}
-	if removed == nil {
+	if len(removed) == 0 {
 		return
 	}
 	if err := saveManifest(kept); err != nil {
 		log().Warn("manifest-save-fail", "err", err.Error())
 	}
-	if removed.Script != "" {
-		if err := os.Remove(removed.Script); err != nil && !os.IsNotExist(err) {
-			log().Debug("manifest-script-remove-fail", "script", removed.Script, "err", err.Error())
+	for _, e := range removed {
+		if e.Script != "" {
+			if err := os.Remove(e.Script); err != nil && !os.IsNotExist(err) {
+				log().Debug("manifest-script-remove-fail", "script", e.Script, "err", err.Error())
+			}
 		}
 	}
 }
