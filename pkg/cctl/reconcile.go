@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // This file is the one reconcile pass that keeps cmux and cctl in lockstep.
@@ -107,27 +108,19 @@ func syncCmuxState(cfg *Config) syncResult {
 	// plus which sessions actually have claude running (vs. sitting at a shell
 	// — claude exited, or the session came back as a plain shell after a
 	// reboot). The tmux session existing isn't enough: we want claude up.
+	probes := probeServersLiveness(targets)
 	liveByServer := map[string]map[string]bool{}
 	sessionsByServer := map[string][]SessionInfo{}
 	claudeUpByServer := map[string]map[string]bool{}
 	attachedByServer := map[string]map[string]bool{}
-	for name, s := range targets {
-		sessions, err := listSessions(name, s)
-		if err != nil {
-			continue
+	for name, pr := range probes {
+		if pr.err != nil {
+			continue // unreachable — every later pass treats it as unknown
 		}
-		set := make(map[string]bool, len(sessions))
-		attached := make(map[string]bool, len(sessions))
-		for _, ss := range sessions {
-			set[ss.Name] = true
-			if ss.Attached {
-				attached[ss.Name] = true
-			}
-		}
-		liveByServer[name] = set
-		sessionsByServer[name] = sessions
-		attachedByServer[name] = attached
-		claudeUpByServer[name] = claudeRunningSessions(s)
+		liveByServer[name] = pr.live
+		sessionsByServer[name] = pr.sessions
+		attachedByServer[name] = pr.attached
+		claudeUpByServer[name] = pr.claudeUp
 	}
 
 	// Snapshot cmux.
@@ -653,6 +646,56 @@ func respawnClaude(cfg *Config, e wsEntry) error {
 	launch := agentLaunchScript(r, cwd, "", e.TmuxName)
 	_, err = runRemote(r.Server, fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(e.TmuxName), shellQuote(launch)))
 	return err
+}
+
+// serverProbe is one server's liveness snapshot, gathered by
+// probeServersLiveness. err != nil means the server was unreachable and every
+// map is nil (callers already treat a missing server as "unknown, touch
+// nothing").
+type serverProbe struct {
+	sessions []SessionInfo
+	live     map[string]bool
+	attached map[string]bool
+	claudeUp map[string]bool
+	err      error
+}
+
+// probeServersLiveness gathers tmux liveness + agent state for every target
+// server CONCURRENTLY — each probe is two ssh round-trips (~1s+ against a
+// healthy remote, a full ConnectTimeout against a dead one), and running them
+// serially made reconcile latency the SUM of all servers instead of the MAX
+// (one wedged remote stalled the whole pass).
+func probeServersLiveness(targets map[string]Server) map[string]*serverProbe {
+	out := make(map[string]*serverProbe, len(targets))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for name, srv := range targets {
+		wg.Add(1)
+		go func(name string, srv Server) {
+			defer wg.Done()
+			pr := &serverProbe{}
+			sessions, err := listSessions(name, srv)
+			if err != nil {
+				pr.err = err
+			} else {
+				pr.sessions = sessions
+				pr.live = make(map[string]bool, len(sessions))
+				pr.attached = make(map[string]bool, len(sessions))
+				for _, ss := range sessions {
+					pr.live[ss.Name] = true
+					if ss.Attached {
+						pr.attached[ss.Name] = true
+					}
+				}
+				pr.claudeUp = claudeRunningSessions(srv)
+			}
+			mu.Lock()
+			out[name] = pr
+			mu.Unlock()
+		}(name, srv)
+	}
+	wg.Wait()
+	return out
 }
 
 // snapshotCmuxViews lists every cmux workspace with its surfaces.

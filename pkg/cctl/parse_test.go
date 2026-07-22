@@ -1498,3 +1498,27 @@ func keys(m map[string]Repo) []string {
 	}
 	return out
 }
+
+func TestSeedRepoCacheReachesResolve(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &Config{Servers: map[string]Server{
+		"local": {
+			Local:       true,
+			RepoSources: []RepoSource{{Path: dir}}, // discovery finds nothing here
+			Repos:       map[string]Repo{},
+		},
+	}}
+	// First resolve: repo unknown (discovery over an empty dir).
+	if _, err := cfg.resolve("local", "airplan"); err == nil {
+		t.Fatal("expected resolve to fail before the repo exists")
+	}
+	// A TUI refresh discovered the new clone → seeds the cache.
+	cfg.seedRepoCache("local", map[string]Repo{"airplan": {Path: dir + "/airplan"}})
+	r, err := cfg.resolve("local", "airplan")
+	if err != nil {
+		t.Fatalf("resolve after seed: %v (stale cache — the reported bug)", err)
+	}
+	if r.RepoName != "airplan" {
+		t.Fatalf("resolved wrong repo: %q", r.RepoName)
+	}
+}
