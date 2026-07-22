@@ -23,6 +23,22 @@ func tmuxSafeName(s string) string {
 	return strings.NewReplacer(".", "_", ":", "_").Replace(s)
 }
 
+// normalizeWorktree makes a user-supplied worktree name safe for cctl's
+// "repo/worktree/session" identity scheme, whose components must be
+// slash-free (tmuxName/parseTmuxName and cmuxWsTitle/parseWsTitle split on
+// "/"). A branch-style name like "feat/core" becomes the identity "feat-core"
+// while the ORIGINAL is returned as the branch to create/check out — so
+// entering "feat/core" yields worktree feat-core on branch feat/core. Without
+// this, the 5-part tmux name is invisible to the TUI (parseTmuxName filters
+// it) and reconcile respawn-kills the session on every pass, since it can
+// never look "live".
+func normalizeWorktree(wt string) (name, branch string) {
+	if !strings.Contains(wt, "/") {
+		return wt, ""
+	}
+	return strings.ReplaceAll(wt, "/", "-"), wt
+}
+
 // tmuxName returns the canonical tmux session name. With the worktree level
 // added, every name has four "/"-separated parts:
 //

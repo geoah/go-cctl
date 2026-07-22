@@ -4,29 +4,44 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sort"
 	"strings"
-
-	"github.com/spf13/cobra"
 )
 
-// newInitToolsCmds returns the per-tool subcommands attached under `cctl init`
-// so the cmd_init.go entry point can register them in one call.
-func newInitToolsCmds() []*cobra.Command {
-	return []*cobra.Command{
-		newInitTmuxCmd(),
-		newInitGhostlyCmd(),
-		newInitMoshCmd(),
-		newInitClaudeCmd(),
-		newInitCmuxCmd(),
-		newInitAllCmd(),
+// This file holds the per-tool init logic that `cctl init` (see cmd_init.go)
+// drives. There are no cobra subcommands any more — `cctl init` is a single
+// interactive/flag-driven command that calls these helpers for the tools and
+// servers the user picked.
+
+// sortedRemoteNames returns the names of every configured non-local server, in
+// stable (sorted) order. Local is handled separately by each tool's local path.
+func sortedRemoteNames(cfg *Config) []string {
+	var out []string
+	for name, s := range cfg.Servers {
+		if s.Local {
+			continue
+		}
+		out = append(out, name)
 	}
+	sort.Strings(out)
+	return out
 }
 
 // ---- tmux ------------------------------------------------------------------
 
 const tmuxManagedBody = `# cctl best practices for scroll/select/copy across mosh + ghostty + tmux.
 
-# enable mouse for scroll-wheel + drag selection
+# Mouse ON — required for wheel-scroll: tmux occupies the terminal's
+# alternate screen, so if tmux doesn't capture the mouse the emulator
+# translates the wheel into arrow keys aimed at whatever app is focused
+# (claude eats them as input-history). The cost is that tmux also captures
+# drag-selection, so copying is split by where the tmux server runs:
+#   - LOCAL sessions: plain drag → copy-mode → the copy-pipe binding below
+#     pipes to pbcopy → system clipboard. Just drag.
+#   - REMOTE (mosh) sessions: pbcopy runs on the wrong machine and tmux's
+#     OSC 52 fallback is dropped by cmux — so hold SHIFT while dragging.
+#     Shift bypasses tmux's mouse capture (libghostty behavior, which cmux
+#     and ghostty share) and the terminal selects+copies natively.
 set -g mouse on
 
 # vim-style copy mode (Ctrl-b [ then v / y)
@@ -40,7 +55,7 @@ setw -g mode-keys vi
 #      (mosh's default $TERM) ships none -- so without this, set-clipboard is a
 #      silent no-op on remotes. It also forces the "c" (CLIPBOARD) selector,
 #      the only one mosh-server forwards. The terminal emulator must still allow
-#      OSC 52 writes (` + "`cctl init ghostty`" + ` sets clipboard-write = allow,
+#      OSC 52 writes (` + "`cctl init`" + ` (ghostty) sets clipboard-write = allow,
 #      which cmux's terminals also read).
 set -s set-clipboard on
 set -ag terminal-overrides ",*:Ms=\\E]52;c%p1%.0s;%p2%s\\007"
@@ -49,12 +64,28 @@ set -ag terminal-overrides ",*:Ms=\\E]52;c%p1%.0s;%p2%s\\007"
 # escape sequences (OSC 52, images, ...) out to the terminal
 set -g allow-passthrough on
 
-# y in copy mode copies the selection to the system clipboard
-bind -T copy-mode-vi y send-keys -X copy-pipe-and-cancel
+# Plain drag ALWAYS starts a tmux selection — even over apps that grabbed the
+# mouse (claude enables mouse reporting for scroll, and by default tmux would
+# forward the drag to it; claude then renders its own selection whose copy
+# path is OSC 52, dead inside cmux). Hijacking the drag costs nothing real —
+# claude keeps clicks and scroll — and makes drag behave the same over every
+# pane. Copy lands via the copy-pipe bindings below.
+bind -n MouseDrag1Pane copy-mode -M
+
+# Copy to the system clipboard. Two independent mechanisms, because OSC 52
+# alone isn't enough inside cmux: cmux's terminals don't reliably honor an
+# inbound OSC 52 clipboard-write, so a tmux-copy-mode selection would land in a
+# tmux buffer that never reaches the Mac clipboard. Piping to pbcopy fixes the
+# LOCAL case (the tmux server is on the Mac); the "|| cat" swallows stdin on
+# remotes where pbcopy is absent, and set-clipboard's OSC 52 (above) still
+# carries the copy back over mosh — visible in ghostty, dropped by cmux. So:
+# local copy = plain drag (pbcopy); remote copy INSIDE CMUX = hold SHIFT while
+# dragging (bypasses tmux; cmux selects natively and copyOnSelect copies).
+bind -T copy-mode-vi y send-keys -X copy-pipe-and-cancel "pbcopy 2>/dev/null || cat >/dev/null"
 
 # mouse drag-end copies without exiting copy-mode (so the view doesn't snap
 # back to the bottom mid-scroll)
-bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear
+bind -T copy-mode-vi MouseDragEnd1Pane send-keys -X copy-pipe-no-clear "pbcopy 2>/dev/null || cat >/dev/null"
 
 # big scrollback so claude output is still scrollable hours later
 set -g history-limit 100000
@@ -79,35 +110,6 @@ set -g default-terminal "tmux-256color"
 set -ga terminal-overrides ",*256col*:Tc,xterm-ghostty:Tc"
 `
 
-func newInitTmuxCmd() *cobra.Command {
-	var server string
-	cmd := &cobra.Command{
-		Use:   "tmux",
-		Short: "Ensure tmux is configured for mouse/scroll/copy across mosh + ghostty",
-		Long: `init tmux upserts a clearly-marked block in ~/.tmux.conf with cctl's
-best-practice defaults for the mosh + tmux + ghostty stack:
-
-  - mouse on, vim-style copy mode
-  - OSC 52 set-clipboard with the Ms-capability + "c" selector override that
-    makes copy actually reach the system clipboard over ssh/mosh (without it,
-    set-clipboard is a silent no-op on xterm-256color / mosh)
-  - allow-passthrough so agent TUIs can emit their own escape sequences
-  - drag-end copy that keeps your scroll position
-  - focus-events + aggressive-resize for nicer multi-client / roamed sessions
-  - tmux session name broadcast as the terminal window title
-  - 100k history, zero escape-time, true color
-
-Re-run any time to refresh the block; lines outside the markers are not
-touched. Use --server <name> to apply the same block on a remote you mosh to.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return applyManaged("tmux", "~/.tmux.conf", tmuxManagedBody, server)
-		},
-	}
-	cmd.Flags().StringVar(&server, "server", "", "apply on this configured cctl server (default: local machine)")
-	return cmd
-}
-
 // ---- ghostty ---------------------------------------------------------------
 
 const ghostlyManagedBody = `# cctl best practices for clipboard + tmux interop.
@@ -123,68 +125,25 @@ mouse-shift-capture = false
 mouse-scroll-multiplier = 3
 `
 
-func newInitGhostlyCmd() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "ghostty",
-		Short: "Configure ghostty's clipboard + mouse-capture for tmux interop",
-		Long: `init ghostty upserts a managed block in ~/.config/ghostty/config so OSC 52
-clipboard writes from tmux land in the system clipboard, and so shift+drag
-bypasses tmux's mouse handling for native selection.
-
-Local only — ghostty is the terminal emulator on your laptop.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return applyManaged("ghostty", "~/.config/ghostty/config", ghostlyManagedBody, "")
-		},
-	}
-	return cmd
-}
-
 // ---- mosh ------------------------------------------------------------------
+//
+// mosh has no file to edit — it's configured via flags and TERM — so init just
+// verifies the installs are recent enough (mosh >= 1.4) for tmux mouse mode,
+// OSC 52, and scrollback.
 
-func newInitMoshCmd() *cobra.Command {
-	var server string
-	cmd := &cobra.Command{
-		Use:   "mosh",
-		Short: "Check mosh version + report scrollback / setup hints",
-		Long: `init mosh has no file to edit — mosh is configured via flags and TERM —
-but it does verify that the local (and optionally remote) installs are
-recent enough to play nicely with tmux mouse mode, OSC 52, and scrollback
-(mosh >= 1.4).`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return reportMosh(server)
-		},
-	}
-	cmd.Flags().StringVar(&server, "server", "", "also check mosh-server on this configured cctl server")
-	return cmd
-}
-
-func reportMosh(serverName string) error {
+func reportMoshLocal() {
 	v, err := exec.Command("mosh", "--version").Output()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "mosh: not found on local PATH — install via your package manager (brew install mosh / apt install mosh).")
-	} else {
-		fmt.Fprintf(os.Stderr, "mosh (local): %s\n", firstLine(string(v)))
+		return
 	}
-	if serverName == "" {
-		return nil
-	}
-	cfg, _, err := loadConfig()
+	fmt.Fprintf(os.Stderr, "mosh (local): %s\n", firstLine(string(v)))
+}
+
+func reportMoshRemote(serverName string, srv Server) error {
+	out, err := runRemote(srv, `mosh-server -v 2>&1 | head -1 || mosh --version 2>&1 | head -1 || echo "mosh not found"`)
 	if err != nil {
 		return err
-	}
-	srv, ok := cfg.Servers[serverName]
-	if !ok {
-		return fmt.Errorf("unknown server %q", serverName)
-	}
-	if srv.Local {
-		return nil
-	}
-	out, rerr := runRemote(srv, `mosh-server -v 2>&1 | head -1 || mosh --version 2>&1 | head -1 || echo "mosh not found"`)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "mosh (%s): error — %v\n", serverName, rerr)
-		return nil
 	}
 	fmt.Fprintf(os.Stderr, "mosh (%s): %s\n", serverName, firstLine(out))
 	fmt.Fprintln(os.Stderr, "")
@@ -192,31 +151,17 @@ func reportMosh(serverName string) error {
 	fmt.Fprintln(os.Stderr, "tmux session and scroll inside tmux's copy-mode instead.")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "Hint: copy-to-clipboard over mosh needs the OSC 52 Ms override in tmux")
-	fmt.Fprintf(os.Stderr, "(mosh only forwards the \"c\" selector). Run `cctl init tmux --server %s`.\n", serverName)
+	fmt.Fprintf(os.Stderr, "(mosh only forwards the \"c\" selector). Run `cctl init --tools tmux --servers %s`.\n", serverName)
 	return nil
 }
 
 // ---- claude ----------------------------------------------------------------
+//
+// claude has no config to edit — its conversations live in
+// ~/.claude/projects/<encoded-cwd> and cctl's resume detection relies on that
+// path. init just verifies claude is on PATH and reports the projects dir.
 
-func newInitClaudeCmd() *cobra.Command {
-	var server string
-	cmd := &cobra.Command{
-		Use:   "claude",
-		Short: "Sanity-check claude code + report cctl-relevant config",
-		Long: `init claude does not edit claude's config — its conversations live in
-~/.claude/projects/<encoded-cwd> and cctl's "resume" detection relies on
-that path being present. This command just verifies claude is on PATH and
-reports the projects dir.`,
-		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return reportClaude(server)
-		},
-	}
-	cmd.Flags().StringVar(&server, "server", "", "also check claude on this configured cctl server")
-	return cmd
-}
-
-func reportClaude(serverName string) error {
+func reportClaudeLocal() {
 	if path, err := exec.LookPath("claude"); err != nil {
 		fmt.Fprintln(os.Stderr, "claude (local): not found on PATH — install Claude Code or add it to ~/.local/bin")
 	} else {
@@ -229,62 +174,23 @@ func reportClaude(serverName string) error {
 	} else {
 		fmt.Fprintf(os.Stderr, "claude projects (local): %s missing — first `cctl claude` will start fresh.\n", projects)
 	}
-	if serverName == "" {
-		return nil
-	}
-	cfg, _, err := loadConfig()
+}
+
+func reportClaudeRemote(serverName string, srv Server) error {
+	out, err := runRemote(srv, `command -v claude || echo "(missing)"; test -d "$HOME/.claude/projects" && echo "projects: yes" || echo "projects: no"`)
 	if err != nil {
 		return err
-	}
-	srv, ok := cfg.Servers[serverName]
-	if !ok {
-		return fmt.Errorf("unknown server %q", serverName)
-	}
-	if srv.Local {
-		return nil
-	}
-	out, rerr := runRemote(srv, `command -v claude || echo "(missing)"; test -d "$HOME/.claude/projects" && echo "projects: yes" || echo "projects: no"`)
-	if rerr != nil {
-		fmt.Fprintf(os.Stderr, "claude (%s): error — %v\n", serverName, rerr)
-		return nil
 	}
 	fmt.Fprintf(os.Stderr, "claude (%s):\n%s\n", serverName, strings.TrimSpace(out))
 	return nil
 }
 
-// ---- all -------------------------------------------------------------------
-
-func newInitAllCmd() *cobra.Command {
-	var server string
-	cmd := &cobra.Command{
-		Use:   "all",
-		Short: "Run init tmux + ghostty + mosh + claude (in that order)",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := applyManaged("tmux", "~/.tmux.conf", tmuxManagedBody, server); err != nil {
-				return err
-			}
-			if err := applyManaged("ghostty", "~/.config/ghostty/config", ghostlyManagedBody, ""); err != nil {
-				return err
-			}
-			if err := reportMosh(server); err != nil {
-				return err
-			}
-			if err := reportClaude(server); err != nil {
-				return err
-			}
-			return nil
-		},
-	}
-	cmd.Flags().StringVar(&server, "server", "", "apply tmux + check mosh/claude on this configured cctl server too")
-	return cmd
-}
-
 // ---- shared helpers --------------------------------------------------------
 
-// applyManaged is the common path for tools whose config we edit. It targets
-// local by default and the named server if --server is given. The body should
-// NOT include the cctl markers; they're added by upsertManagedBlock*.
+// applyManaged is the common path for tools whose config we edit (tmux,
+// ghostty). serverName == "" targets the local machine; a configured name
+// targets that server (a local alias falls back to the local path). The body
+// should NOT include the cctl markers; they're added by upsertManagedBlock*.
 func applyManaged(tool, path, body, serverName string) error {
 	if serverName == "" {
 		changed, err := upsertManagedBlockLocal(path, body)

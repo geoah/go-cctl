@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -16,9 +17,15 @@ type Config struct {
 	Defaults Defaults          `yaml:"defaults"`
 	Servers  map[string]Server `yaml:"servers"`
 
-	// repoCache memoises discoverRepos() per server for the lifetime of the
-	// process so the TUI / repeated resolve() calls don't re-shell each time.
-	repoCache map[string]map[string]Repo
+	// repoCache memoises discoverRepos() per server so the TUI / repeated
+	// resolve() calls don't re-shell each time. It is NOT for-the-life-of-
+	// the-process: every TUI refresh re-discovers and re-seeds it via
+	// seedRepoCache, so resolve() sees repos added after startup (a stale
+	// cache made "n" on a freshly-cloned repo fail with "server has no repo"
+	// until restart). Guarded by repoCacheMu — resolve() runs in bubbletea
+	// command goroutines concurrently with the seeding on the Update loop.
+	repoCache   map[string]map[string]Repo
+	repoCacheMu sync.Mutex
 }
 
 type Defaults struct {
@@ -49,6 +56,12 @@ type Defaults struct {
 	// closed. Set true to aggressively prune them. Tabs whose name isn't
 	// cctl-shaped (plain shells, custom names) are never auto-closed either way.
 	SyncCloseUnmatched *bool `yaml:"sync_close_unmatched"`
+	// OrderWorkspaces controls whether the reconcile sorts cctl's cmux
+	// workspaces by name (repo/worktree/session), so each repo's sessions
+	// cluster together in the sidebar without needing native groups (which
+	// require an empty anchor workspace). Default true; set false to leave the
+	// order alone (e.g. if you drag-reorder manually).
+	OrderWorkspaces *bool `yaml:"order_workspaces"`
 	// BetaRemoteClaudeStatus (beta) makes cmux show live Claude status for
 	// REMOTE sessions. cmux's native integration can't reach a remote claude
 	// (it runs on another host, behind mosh+tmux); with this on, cctl relays
@@ -84,6 +97,15 @@ type Defaults struct {
 func (c *Config) syncAllServers() bool {
 	if c.Defaults.SyncAllServers != nil {
 		return *c.Defaults.SyncAllServers
+	}
+	return true
+}
+
+// orderWorkspaces reports whether reconcile sorts cmux workspaces by name so a
+// repo's sessions cluster together. Default true.
+func (c *Config) orderWorkspaces() bool {
+	if c.Defaults.OrderWorkspaces != nil {
+		return *c.Defaults.OrderWorkspaces
 	}
 	return true
 }
@@ -274,6 +296,24 @@ func (c *Config) resolve(serverName, repoName string) (*Resolved, error) {
 		}
 	}
 	repo, ok := allRepos[repoName]
+	if !ok && repoName != "" {
+		// Heal tmux-sanitized aliases: adoption used to record parseTmuxName
+		// output verbatim, so "rxtx.dev" sessions were tracked under repo
+		// "rxtx_dev" — a name that can never match. When exactly one available
+		// repo sanitizes to the requested name, resolve to it (ambiguity stays
+		// an error: never guess between "a.b" and "a:b").
+		match, n := "", 0
+		for name := range allRepos {
+			if tmuxSafeName(name) == repoName {
+				match, n = name, n+1
+			}
+		}
+		if n == 1 {
+			log().Info("resolve-repo-alias", "server", serverName, "from", repoName, "to", match)
+			repoName = match
+			repo, ok = allRepos[match]
+		}
+	}
 	if !ok {
 		if repoName == "" {
 			return nil, fmt.Errorf("server %q has %d repos; specify one with %s/<repo> (available: %s)", serverName, len(allRepos), serverName, strings.Join(repoNames(allRepos), ", "))
@@ -348,16 +388,20 @@ func (c *Config) repos(serverName string) (map[string]Repo, error) {
 	}
 	out := map[string]Repo{}
 	if len(srv.RepoSources) > 0 {
-		if c.repoCache == nil {
-			c.repoCache = map[string]map[string]Repo{}
-		}
+		c.repoCacheMu.Lock()
 		cached, ok := c.repoCache[serverName]
+		c.repoCacheMu.Unlock()
 		if !ok {
 			d, err := discoverRepos(srv)
 			if err != nil {
 				return nil, fmt.Errorf("discover repos on %s: %w", serverName, err)
 			}
+			c.repoCacheMu.Lock()
+			if c.repoCache == nil {
+				c.repoCache = map[string]map[string]Repo{}
+			}
 			c.repoCache[serverName] = d
+			c.repoCacheMu.Unlock()
 			cached = d
 		}
 		for k, v := range cached {
@@ -370,14 +414,21 @@ func (c *Config) repos(serverName string) (map[string]Repo, error) {
 	return out, nil
 }
 
-// invalidateRepoCache forces the next repos() call to re-run discovery.
-//
-//nolint:unused // wired in by the next TUI refresh task
-func (c *Config) invalidateRepoCache(serverName string) {
-	if c.repoCache == nil {
-		return
+// seedRepoCache replaces a server's cached discovery with a fresh result the
+// caller already has (the TUI's refresh fetch). Seeding — instead of just
+// invalidating — means the next resolve() needs no extra discovery round-trip.
+// A nil/empty set still seeds: "no repos discovered" is a valid fresh answer.
+func (c *Config) seedRepoCache(serverName string, repos map[string]Repo) {
+	cp := make(map[string]Repo, len(repos))
+	for k, v := range repos {
+		cp[k] = v
 	}
-	delete(c.repoCache, serverName)
+	c.repoCacheMu.Lock()
+	if c.repoCache == nil {
+		c.repoCache = map[string]map[string]Repo{}
+	}
+	c.repoCache[serverName] = cp
+	c.repoCacheMu.Unlock()
 }
 
 func repoNames(m map[string]Repo) []string {

@@ -560,3 +560,192 @@ func TestFindLocalServer(t *testing.T) {
 		t.Error("findLocalServer should report false when no local server")
 	}
 }
+
+func TestSurfacesToPrune(t *testing.T) {
+	titles := sessionTabTitles(wsEntry{Session: "docs", TmuxName: "cctl/olympus/gb300-k8s/docs"})
+	// Junk cwd shells alongside the real "docs" tab → prune the shells only.
+	w := cmuxWsView{id: "w1", name: "olympus/gb300-k8s/docs", surfaces: []cmuxSurface{
+		{id: "s1", title: "…/github.com/geoah/rxtx.dev"},
+		{id: "s2", title: "…/workspace/olympus/gb300-k8s"},
+		{id: "s3", title: "docs"},
+	}}
+	got := surfacesToPrune(w, titles)
+	if len(got) != 2 || got[0] != "s1" || got[1] != "s2" {
+		t.Fatalf("want [s1 s2] pruned, got %v", got)
+	}
+	// The full tmux name also counts as the session tab (local flavor).
+	w2 := cmuxWsView{id: "w2", name: "go-cctl/main/default", surfaces: []cmuxSurface{
+		{id: "a", title: "cctl/go-cctl/main/default"},
+	}}
+	if got := surfacesToPrune(w2, sessionTabTitles(wsEntry{Session: "default", TmuxName: "cctl/go-cctl/main/default"})); got != nil {
+		t.Fatalf("single session tab (full-name titled) must not be pruned, got %v", got)
+	}
+	// No identifiable session tab → prune NOTHING (never nuke a settling tab).
+	w3 := cmuxWsView{id: "w3", name: "rxtx.dev/mneme/default", surfaces: []cmuxSurface{
+		{id: "x", title: "✳ Some other conversation"},
+		{id: "y", title: "…/worktrees/rxtx.dev/mneme"},
+	}}
+	if got := surfacesToPrune(w3, sessionTabTitles(wsEntry{Session: "default", TmuxName: "cctl/rxtx_dev/mneme/default"})); got != nil {
+		t.Fatalf("no session tab present → must prune nothing, got %v", got)
+	}
+}
+
+func TestMergeWsEntry_PreservesRichFieldsDropsPrompt(t *testing.T) {
+	old := wsEntry{
+		Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		TmuxName: "cctl/olympus/gb300-k8s/docs", WsTitle: "olympus/gb300-k8s/docs",
+		TabTitle: "docs", Group: "workspace/olympus", GroupCwd: "/x", Cwd: "/y",
+		Script: "/Users/me/.cctl/spawn/w.sh", Agent: "claude", Remote: true,
+		Prompt: "stale pending prompt",
+	}
+	// A sparse attach-style upsert: identity only.
+	in := wsEntry{Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		TmuxName: "cctl/olympus/gb300-k8s/docs", Updated: 42}
+	got := mergeWsEntry(old, in)
+	if got.Script != old.Script {
+		t.Errorf("Script clobbered: %q (dd would leak the wrapper)", got.Script)
+	}
+	if got.Agent != "claude" || !got.Remote || got.Group != old.Group || got.Cwd != "/y" {
+		t.Errorf("rich fields lost: %+v", got)
+	}
+	if got.Prompt != "" {
+		t.Errorf("stale Prompt inherited (%q) — a dead session would relaunch with it", got.Prompt)
+	}
+	// Incoming non-empty values win.
+	in2 := wsEntry{Server: "workspace", Repo: "olympus", Worktree: "gb300-k8s", Session: "docs",
+		Agent: "codex", Prompt: "fresh"}
+	got2 := mergeWsEntry(old, in2)
+	if got2.Agent != "codex" || got2.Prompt != "fresh" {
+		t.Errorf("incoming values should win: %+v", got2)
+	}
+}
+
+func TestCctlRepoGroupNames(t *testing.T) {
+	cfg := &Config{Servers: map[string]Server{
+		"local":     {Local: true},
+		"workspace": {},
+	}}
+	entries := []wsEntry{
+		{Server: "local", Repo: "rxtx.dev"},
+		{Server: "workspace", Repo: "olympus"},
+		{Server: "gone", Repo: "zombie"}, // server removed from config → skipped
+	}
+	got := cctlRepoGroupNames(cfg, entries)
+	if !got["rxtx.dev"] || !got["workspace/olympus"] {
+		t.Fatalf("missing expected group names: %v", got)
+	}
+	if got["zombie"] || got["gone/zombie"] {
+		t.Fatalf("entry for a removed server must not own a group name: %v", got)
+	}
+}
+
+func TestOrderedCmuxWorkspaceIDs(t *testing.T) {
+	// Out of order, control not first, with a USER workspace ("scratch", not
+	// cctl-shaped) between them → the cctl block sorts into the cctl-occupied
+	// slots; the user workspace keeps its exact position.
+	wss := []cmuxWorkspace{
+		{id: "B", name: "rxtx.dev/main/x"},
+		{id: "U", name: "scratch"},
+		{id: "C", name: "cctl"},
+		{id: "A", name: "go-cctl/main/default"},
+	}
+	got := orderedCmuxWorkspaceIDs(wss)
+	want := []string{"C", "U", "A", "B"} // slots 0,2,3 are cctl's; slot 1 stays U
+	if len(got) != 4 || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] || got[3] != want[3] {
+		t.Fatalf("order = %v, want %v", got, want)
+	}
+	// Only user workspaces "out of order" → nil (we never touch them).
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{
+		{id: "Z", name: "zeta"}, {id: "Y", name: "alpha"},
+	}); got != nil {
+		t.Fatalf("user-only workspaces must never be reordered, got %v", got)
+	}
+	// Already ordered → nil (caller skips the reorder call).
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{
+		{id: "C", name: "cctl"}, {id: "A", name: "a/b/c"}, {id: "B", name: "b/c/d"},
+	}); got != nil {
+		t.Fatalf("already-ordered should return nil, got %v", got)
+	}
+	if got := orderedCmuxWorkspaceIDs([]cmuxWorkspace{{id: "X", name: "solo"}}); got != nil {
+		t.Fatalf("single workspace should return nil, got %v", got)
+	}
+}
+
+func TestEntriesToSpawnMatchesByWsID(t *testing.T) {
+	live := map[string]map[string]bool{"local": {"cctl/r/main/a": true}}
+	// Workspace was RENAMED (title no longer matches) but the UUID is
+	// recorded — the entry must still count as present.
+	views := []cmuxWsView{{id: "UUID-1", name: "renamed-by-user"}}
+	entries := []wsEntry{{
+		Server: "local", Repo: "r", Worktree: "main", Session: "a",
+		TmuxName: "cctl/r/main/a", WsID: "UUID-1",
+	}}
+	if out := entriesToSpawn(views, live, entries); len(out) != 0 {
+		t.Fatalf("UUID-matched workspace treated as missing: %+v", out)
+	}
+	// Same entry without the UUID → title mismatch → spawn.
+	entries[0].WsID = ""
+	if out := entriesToSpawn(views, live, entries); len(out) != 1 {
+		t.Fatalf("title-mismatched workspace without UUID should spawn, got %d", len(out))
+	}
+}
+
+func TestBackfillWsIDs(t *testing.T) {
+	views := []cmuxWsView{
+		{id: "UUID-A", name: "r/main/a"},
+		{id: "UUID-B", name: "r/main/b"},
+	}
+	entries := []wsEntry{
+		{Server: "s", Repo: "r", Worktree: "main", Session: "a"},                 // no id → backfill A
+		{Server: "s", Repo: "r", Worktree: "main", Session: "b", WsID: "STALE"},  // dead id → re-backfill B
+		{Server: "s", Repo: "r", Worktree: "main", Session: "c", WsID: "UUID-A"}, // hmm: live id, title absent → keep
+	}
+	got := backfillWsIDs(views, entries)
+	if got[0].WsID != "UUID-A" {
+		t.Errorf("entry a: want UUID-A, got %q", got[0].WsID)
+	}
+	if got[1].WsID != "UUID-B" {
+		t.Errorf("entry b: stale id not re-backfilled, got %q", got[1].WsID)
+	}
+	if got[2].WsID != "UUID-A" {
+		t.Errorf("entry c: live recorded id must never be moved, got %q", got[2].WsID)
+	}
+}
+
+func TestParseCmuxWorkspaceClosed(t *testing.T) {
+	// Captured from cmux 0.64.18 `cmux events`.
+	frame := `{"boot_id":"B","category":"workspace","id":"B-42","name":"workspace.closed","payload":{"custom_title":"r/main/a","cwd":"/x","index":null,"selected":false,"tab_count":12,"title":"r/main/a","workspace_id":"323ADC8F-1311-4CD8-8FD0-2DF66C2E7087"}}`
+	id, title, ok := parseCmuxWorkspaceClosed([]byte(frame))
+	if !ok || id != "323ADC8F-1311-4CD8-8FD0-2DF66C2E7087" || title != "r/main/a" {
+		t.Fatalf("parse = (%q, %q, %v)", id, title, ok)
+	}
+	// Other event names and garbage are rejected.
+	if _, _, ok := parseCmuxWorkspaceClosed([]byte(`{"name":"workspace.created","payload":{"workspace_id":"X"}}`)); ok {
+		t.Fatal("workspace.created must not parse as a close")
+	}
+	if _, _, ok := parseCmuxWorkspaceClosed([]byte(`not json`)); ok {
+		t.Fatal("garbage must not parse")
+	}
+}
+
+func TestHealSanitizedRepoNames(t *testing.T) {
+	cfg := &Config{Servers: map[string]Server{
+		"kv-dev": {Repos: map[string]Repo{"rxtx.dev": {}}},
+		"ambig":  {Repos: map[string]Repo{"a.b": {}, "a:b": {}}}, // both sanitize to a_b
+	}}
+	entries := []wsEntry{
+		{Server: "kv-dev", Repo: "rxtx_dev", Worktree: "phoenix", Session: "poc"},
+		{Server: "kv-dev", Repo: "rxtx.dev", Worktree: "main", Session: "x"}, // already canonical
+		{Server: "ambig", Repo: "a_b", Worktree: "w", Session: "s"},          // ambiguous — untouched
+	}
+	got := healSanitizedRepoNames("", cfg, nil, entries)
+	if got[0].Repo != "rxtx.dev" || got[0].WsTitle != "rxtx.dev/phoenix/poc" {
+		t.Errorf("alias not healed: %+v", got[0])
+	}
+	if got[1].Repo != "rxtx.dev" {
+		t.Errorf("canonical entry disturbed: %+v", got[1])
+	}
+	if got[2].Repo != "a_b" {
+		t.Errorf("ambiguous alias must not be guessed: %+v", got[2])
+	}
+}

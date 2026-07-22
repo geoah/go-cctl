@@ -35,6 +35,28 @@ import (
 //      just keeps using the layout command, which the durable path already
 //      fixes.)
 
+// setCmuxSurfaceResume is intentionally a NO-OP.
+//
+// It once called `cmux surface resume set` to bind a session's durable wrapper
+// as its restore command (so a remote/mosh workspace would replay it instead of
+// coming back as a bare shell). But cmux prompts the user to approve every
+// CLI-set resume command ("A process wants cmux to keep this resume command…"),
+// so setting one per session per reconcile spams those popups — the exact
+// reason cctl never set resume commands in the first place. Remote-restore
+// therefore needs a prompt-free mechanism (e.g. native `cmux ssh` workspaces),
+// tracked separately; this stub keeps the call sites while emitting nothing.
+func setCmuxSurfaceResume(cli, wsID, surfaceID, name, cwd, wrapper string) {}
+
+// cmuxSurfaceResumeIs reports whether a surface's resume binding already
+// replays the given wrapper — so the reconcile heal only writes when needed.
+func cmuxSurfaceResumeIs(cli, wsID, surfaceID, wrapper string) bool {
+	out, err := cmuxCmd(cli, "surface", "resume", "get", "--workspace", wsID, "--surface", surfaceID).Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(out), wrapper)
+}
+
 // cctlHome returns ~/.cctl, creating it if needed. This is cctl's local
 // state root (alongside the existing remotes/ stand-in dirs).
 func cctlHome() (string, error) {
@@ -352,6 +374,15 @@ func ensureCctlControlWorkspace(cli string) error {
 		log().Info("cctl-control-workspace-exists")
 		return nil
 	}
+	// Running inside a cmux workspace (e.g. `cctl init` launched from one, which
+	// cmux titles "cctl init")? That workspace is where the control TUI lives —
+	// adopt it (rename to "cctl" + pin/red) instead of spawning a SECOND control
+	// workspace. Prevents the duplicate pinned-red workspace.
+	if wsID := os.Getenv("CMUX_WORKSPACE_ID"); wsID != "" {
+		markCctlWorkspace(cli, wsID)
+		log().Info("cctl-control-workspace-adopted-current", "ws", wsID)
+		return nil
+	}
 	script, err := writeControlScript()
 	if err != nil {
 		return fmt.Errorf("write control wrapper: %w", err)
@@ -378,7 +409,27 @@ func markCctlWorkspace(cli, wsID string) {
 	if cli == "" {
 		return
 	}
+	// Never hijack a SESSION workspace: markSelf runs on every TUI launch, and
+	// running `cctl` inside a tracked session's tab (e.g. a `t` terminal) would
+	// otherwise rename that workspace to "cctl" + pin + redden it — destroying
+	// its identity title so the next reconcile spawns a duplicate.
+	if wsID != "" {
+		for _, w := range listCmuxWorkspaces(cli) {
+			if w.id == wsID {
+				if _, _, _, ok := parseWsTitle(w.name); ok {
+					log().Debug("cmux-mark-skip-session-ws", "ws", wsID, "name", w.name)
+					return
+				}
+				break
+			}
+		}
+	}
 	cmds := [][]string{
+		// Force the title to "cctl" so however the control workspace got
+		// launched (e.g. via `cctl init`, which cmux would title "cctl init")
+		// it's always named "cctl" — and the findCmuxWorkspaceByName("cctl")
+		// exists-check matches, so no duplicate control workspace is created.
+		{"workspace-action", "--action", "rename", "--title", "cctl"},
 		{"workspace-group", "remove"},
 		{"workspace-action", "--action", "pin"},
 		{"workspace-action", "--action", "set-color", "--color", "Red"},

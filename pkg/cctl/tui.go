@@ -1,6 +1,7 @@
 package cctl
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -23,7 +24,13 @@ func runTUI() error {
 	}
 	log().Info("tui-start", "config", path, "servers", len(cfg.Servers))
 	p := tea.NewProgram(newTUIModel(cfg), tea.WithAltScreen())
+	// Mirror cmux-side workspace closes into cctl: the watcher tails
+	// `cmux events` and the Update loop verifies + treats a user-closed
+	// tracked workspace as a dd. Canceled when the TUI exits.
+	evCtx, evCancel := context.WithCancel(context.Background())
+	go watchCmuxWorkspaceCloses(evCtx, func(msg cmuxWorkspaceClosedMsg) { p.Send(msg) })
 	final, err := p.Run()
+	evCancel()
 	// Kill the notification-bridge ssh tails on every exit path so they
 	// can't outlive the TUI.
 	if fm, ok := final.(*tuiModel); ok {
@@ -442,6 +449,12 @@ type tuiModel struct {
 	// reconnect+load in a burst (e.g. a manual refresh), they coalesce into a
 	// single sync fired by runSyncMsg.
 	syncPending bool
+	// syncing is true while a reconcile is in flight; detached session rows
+	// render as amber "syncing" during it, settling to green/red after.
+	syncing bool
+	// recentWsCloses timestamps cmux workspace.closed events for the burst
+	// circuit-breaker (a flood means cmux is shutting down, not user intent).
+	recentWsCloses []time.Time
 
 	// scrollOffset is the index of the first tree row drawn in the main
 	// panel; the panel windows m.rows[scrollOffset:scrollOffset+visible] and
@@ -628,28 +641,14 @@ type retryProbeMsg struct {
 // run the cmux↔cctl sync once for the burst. See requestSync.
 type runSyncMsg struct{}
 
+// prepareDoneMsg reports the outcome of an interactive "open a session" prepare
+// cmd (new / terminal / attach). Those cmds now do the work themselves —
+// record the manifest + converge cmux via the single reconcile path
+// (openSessionViaReconcile) — so this only carries what the handler needs to
+// resolve the footer task and refresh the tree.
 type prepareDoneMsg struct {
-	server   Server
-	useMosh  bool
-	cmdStr   string
-	cwd      string // suggested workspace cwd (used by cmuxSpawner)
-	wsTitle  string // workspace label: "repo/worktree" (one workspace per worktree)
-	tabTitle string // tab label inside the workspace: the session name
-	// serverName/repo/worktree/session are the session's identity, carried
-	// through to SpawnSpec for the durable wrapper path + restore manifest.
-	serverName string
-	repo       string
-	worktree   string
-	session    string
-	agent      string // resolved agent for this session ("claude"/"codex"), persisted to the manifest
-	group      string // sidebar group: the repo ("rxtx.dev" local, "server/repo" remote)
-	groupCwd   string // anchor cwd when the group is first created (repo path)
-	label      string
-	refresh    string
-	// focusExisting allows the spawner to focus a same-titled workspace
-	// instead of creating one. Only safe when a live tmux client is known
-	// to sit in that tab (attach-to-attached-session); see Spawner.
-	focusExisting bool
+	label   string
+	refresh string
 	// taskID ties this result back to the bgTask started when the action
 	// was triggered, so the right footer entry resolves.
 	taskID int
@@ -662,72 +661,18 @@ type actionDoneMsg struct {
 	// refreshAll reloads every server after the action (used by restore,
 	// which can bring sessions back across all of them).
 	refreshAll bool
-	taskID     int
-	err        error
+	// refreshConnected re-fetches connected servers (no probe) after the
+	// action — used by reconcile so the tree shows revived/attached sessions
+	// without re-probing/looping.
+	refreshConnected bool
+	taskID           int
+	err              error
 }
 
 // refreshServerMsg triggers a one-server reload, used as a follow-up after
 // spawning a session in a new terminal window (so the tree picks it up).
 type refreshServerMsg struct {
 	server string
-}
-
-// spawnInNewWindow launches an interactive cmd in a new tab (or window,
-// depending on the terminal) using the configured/auto-detected Spawner.
-// Fire-and-forget — TUI stays alive. Returns the provider name + an error
-// if the spawn failed. The previous inline-fallback path was removed when
-// cctl committed to "Enter always opens in a new tab".
-//
-// We always write a tiny wrapper script first so each Spawner only ever
-// has to hand its terminal one filesystem path; this dodges all the
-// arg-quoting/splitting pitfalls.
-func spawnInNewWindow(cfg *Config, s Server, useMosh bool, cmdStr string, spec SpawnSpec) (string, error) {
-	inner, err := interactiveCmd(s, useMosh, cmdStr)
-	if err != nil {
-		return "", fmt.Errorf("build interactive cmd: %w", err)
-	}
-	script, err := writeSpawnScript(inner, spec)
-	if err != nil {
-		return "", err
-	}
-	spec.Script = script
-	// transport: cmux-ssh — request a remote-SSH workspace running the
-	// raw remote command; the wrapper script above stays as the fallback
-	// if the cmux ssh path fails.
-	if s.useCmuxSSH() {
-		spec.Remote = &RemoteSpawn{
-			Destination: sshTarget(s),
-			Port:        s.Port,
-			Identity:    expandPath(s.SSHKey),
-			SSHOptions:  sshOptionValues(s.SSHOpts),
-			Command:     cmdStr,
-		}
-	}
-	pref := ""
-	if cfg != nil {
-		pref = cfg.Defaults.Spawn
-	}
-	sp, reason := detectSpawner(pref)
-	log().Debug("tui-spawn", "provider", sp.Name(), "reason", reason, "script", script,
-		"cwd", spec.Cwd, "ws", spec.WsTitle, "tab", spec.TabTitle,
-		"group", spec.GroupTitle, "focusExisting", spec.FocusExisting)
-	if err := sp.Spawn(spec); err != nil {
-		// Only clean up disposable ($TMPDIR) wrappers. A durable
-		// ~/.cctl/spawn script may already back an existing cmux tab; a
-		// transient spawn failure here mustn't yank it out from under a
-		// later restore.
-		if !spec.hasIdentity() {
-			os.Remove(script)
-		}
-		return sp.Name(), err
-	}
-	// Record the session in the restore manifest so a reboot (which wipes
-	// tmux, cctl's only other memory) can bring it back. Disposable spawns
-	// without identity aren't tracked.
-	if spec.hasIdentity() {
-		manifestUpsert(spec)
-	}
-	return sp.Name(), nil
 }
 
 // writeSpawnScript materializes a small shell script that exec's the
@@ -902,6 +847,7 @@ func (m *tuiModel) maybeStartupSync() tea.Cmd {
 		return nil
 	}
 	m.startupSynced = true
+	m.syncing = true
 	sweepLegacySpawnScripts()
 	// The startup sync covers every server, so clear their pendingSync flags
 	// — otherwise the post-startup reconnect path would immediately re-sync.
@@ -1070,6 +1016,23 @@ func (m *tuiModel) refreshAllCmd() tea.Cmd {
 	return tea.Batch(cmds...)
 }
 
+// refreshConnectedCmd re-fetches sessions/worktrees for already-CONNECTED
+// servers only — no reachability probe. Used right after a reconcile so the
+// tree reflects revived/attached sessions immediately, without re-probing
+// (which would time out on unreachable hosts and re-trigger a sync loop).
+func (m *tuiModel) refreshConnectedCmd() tea.Cmd {
+	var cmds []tea.Cmd
+	for _, n := range m.serverNames {
+		if st := m.state[n]; st != nil && st.conn == connConnected {
+			cmds = append(cmds, m.fetchServerCmd(n)...)
+		}
+	}
+	if len(cmds) == 0 {
+		return nil
+	}
+	return tea.Batch(cmds...)
+}
+
 func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -1096,6 +1059,14 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		st.repos = msg.repos
 		st.repoErr = msg.err
+		// Seed resolve()'s discovery cache with this fresh result: without
+		// this, repos cloned after startup showed in the tree (which reads
+		// st.repos) but "n" failed in resolve() ("server has no repo X")
+		// until a full restart. Only on success — an error payload here
+		// would wipe a good cache with an empty set.
+		if msg.err == nil {
+			m.cfg.seedRepoCache(msg.server, msg.repos)
+		}
 		st.reposLoaded = true
 		st.normalizeSessionNames()
 		m.rebuildRows()
@@ -1174,25 +1145,11 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			return m, m.finishTask(msg.taskID, msg.label+": prepare failed", msg.err)
 		}
-		provider, err := spawnInNewWindow(m.cfg, msg.server, msg.useMosh, msg.cmdStr, SpawnSpec{
-			Server:        msg.serverName,
-			Repo:          msg.repo,
-			Worktree:      msg.worktree,
-			Session:       msg.session,
-			Agent:         msg.agent,
-			Cwd:           msg.cwd,
-			WsTitle:       msg.wsTitle,
-			TabTitle:      msg.tabTitle,
-			GroupTitle:    msg.group,
-			GroupCwd:      msg.groupCwd,
-			FocusExisting: msg.focusExisting,
-		})
-		if err != nil {
-			log().Warn("tui-spawn-fail", "provider", provider, "err", err.Error())
-			return m, m.finishTask(msg.taskID, provider+" spawn failed", err)
-		}
-		log().Info("tui-spawn-ok", "label", msg.label, "provider", provider)
-		finish := m.finishTask(msg.taskID, fmt.Sprintf("opened %s (%s tab)", msg.label, provider), nil)
+		// Every interactive open (new / terminal / attach) has already recorded
+		// the manifest and converged cmux through the single reconcile path
+		// (openSessionViaReconcile). Nothing to spawn here — just resolve the
+		// task and refresh the tree.
+		finish := m.finishTask(msg.taskID, "opened "+msg.label, nil)
 		refresh := msg.refresh
 		return m, tea.Batch(finish,
 			tea.Tick(1500*time.Millisecond, func(time.Time) tea.Msg {
@@ -1212,9 +1169,29 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(cmds...)
 
+	case cmuxWorkspaceClosedMsg:
+		// A workspace disappeared on the cmux side (sidebar X, Close menu,
+		// Cmd-W). Burst = cmux quitting/restarting, not user intent: ignore
+		// and let the next reconcile heal. Singles get verified (workspace
+		// really gone, cmux still answering) and then deleted like dd.
+		now := time.Now()
+		recent := m.recentWsCloses[:0]
+		for _, t := range m.recentWsCloses {
+			if now.Sub(t) < 5*time.Second {
+				recent = append(recent, t)
+			}
+		}
+		m.recentWsCloses = append(recent, now)
+		if len(m.recentWsCloses) > 2 {
+			log().Warn("cmux-close-burst-ignored", "n", len(m.recentWsCloses), "ws", msg.title)
+			return m, nil
+		}
+		return m, m.cmuxWorkspaceClosedCmd(msg)
+
 	case runSyncMsg:
 		// Debounced post-startup sync (a server reconnected/refreshed).
 		m.syncPending = false
+		m.syncing = true
 		id, tick := m.startTask("sync", "syncing cmux ↔ cctl…")
 		return m, tea.Batch(m.syncCmd(id, false), tick)
 
@@ -1230,6 +1207,10 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		statusCmd := m.finishTask(msg.taskID, label, msg.err)
 		if msg.refreshAll {
 			return m, tea.Batch(m.refreshAllCmd(), statusCmd)
+		}
+		if msg.refreshConnected {
+			m.syncing = false // reconcile finished; rows settle green/red
+			return m, tea.Batch(m.refreshConnectedCmd(), statusCmd)
 		}
 		if msg.refresh != "" {
 			cmds := m.loadServerCmd(msg.refresh)
@@ -1326,13 +1307,16 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = "" // hide any earlier error so the red prompt below stands alone
 		m.statusMsg = ""
 		return m, nil
-	case "S", "R":
-		// Reconcile: converge cmux+tmux to the manifest (the same pass the
-		// startup/reconnect sync runs). Revives tracked sessions that aren't
-		// up, opens missing tabs, groups, and closes orphaned tabs. S and R
-		// are the same action — kept as two keys for muscle memory.
+	case "r", "R", "S":
+		// One action: refresh every server's data, then reconcile. The refresh
+		// probes set pendingSync, and the debounced runSyncMsg fires ONE
+		// reconcile after the loads settle — kicking a second syncCmd here in
+		// parallel raced it (two concurrent reconciles can both see the same
+		// dead session as missing and spawn duplicates).
 		m.clearPending()
-		return m.syncCmux()
+		m.statusErr = ""
+		log().Info("tui-refresh-reconcile")
+		return m, m.refreshAllCmd()
 	case "U":
 		// UU, same arming flow as dd: upgrading claude restarts every
 		// claude session on the target server (killing whatever they
@@ -1348,11 +1332,6 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.statusErr = ""
 		m.statusMsg = ""
 		return m, nil
-	case "r":
-		m.clearPending()
-		m.statusErr = ""
-		log().Info("tui-refresh-all")
-		return m, m.refreshAllCmd()
 	case "/":
 		m.clearPending()
 		m.mode = modeFilter
@@ -1368,7 +1347,7 @@ func (m *tuiModel) handleBrowseKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.rebuildRows()
 		}
 	case "?":
-		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · S/R reconcile (match cmux to cctl) · UU upgrade · / filter · r refresh · q quit"
+		m.statusMsg = "↑↓ move · PgUp/Dn ⌃d/⌃u scroll · g/G top/bottom · ←→ fold · ⏎ attach · n new · t terminal · dd delete · R refresh+reconcile (match cmux to cctl) · UU upgrade · / filter · q quit"
 	default:
 		// any other key cancels a pending dd/UU so the next press starts fresh
 		m.clearPending()
@@ -1856,37 +1835,6 @@ func (m *tuiModel) freeTerminalName(server, repo, wt string) string {
 	}
 }
 
-func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name string, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		r, err := m.cfg.resolve(serverName, repoName)
-		if err != nil {
-			return prepareDoneMsg{err: err, taskID: taskID}
-		}
-		cwd := r.Repo.Path
-		if worktree != "" && worktree != "main" {
-			cwd = worktreePath(r.WorktreeBase, r.RepoName, worktree)
-		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     terminalCmd(tmuxName(r.RepoName, worktree, name), cwd),
-			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    cmuxWsTitle(repoName, worktree, name),
-			tabTitle:   name,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   worktree,
-			session:    name,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, name),
-			refresh:    serverName,
-			taskID:     taskID,
-		}
-	}
-}
-
 // syncCmux is the S/R keys and the automatic startup/reconnect pass: ONE
 // reconcile that converges cmux+tmux to the manifest (desired state) — adopt
 // live sessions, revive tracked ones that died (reboot/kill → claude
@@ -1894,33 +1842,9 @@ func (m *tuiModel) terminalPrepareCmd(serverName, repoName, worktree, name strin
 // dd is the only way to drop a session. See syncCmuxState for the algorithm
 // and safety rails.
 func (m *tuiModel) syncCmux() (tea.Model, tea.Cmd) {
+	m.syncing = true
 	id, tick := m.startTask("", "reconciling cmux ↔ cctl…")
 	return m, tea.Batch(tick, m.syncCmd(id, false))
-}
-
-// syncCmd runs the reconcile off the UI goroutine. `quiet` suppresses the
-// "already in sync" note (used by the automatic startup pass, which
-// shouldn't chatter when there's nothing to do).
-func (m *tuiModel) syncCmd(taskID int, quiet bool) tea.Cmd {
-	return func() tea.Msg {
-		res := syncCmuxState(m.cfg)
-		log().Info("tui-sync", "restored", res.restored, "closed", res.closed,
-			"renamed", res.migrated, "grouped", res.grouped, "adopted", res.adopted,
-			"errs", res.errs)
-		msg := res.summary()
-		if !res.touched() {
-			if quiet {
-				msg = ""
-			} else {
-				msg = "cmux already matches cctl"
-			}
-		}
-		// No tree refresh: reconcile only touches cmux workspaces + the
-		// manifest. A revive does create a tmux session, but the tree catches
-		// up on the next reconnect/`r`; refreshing here would re-probe every
-		// server and loop back into another reconcile.
-		return actionDoneMsg{msg: msg, taskID: taskID}
-	}
 }
 
 // upgradeTarget resolves what a `UU` press would act on: the selected
@@ -1966,183 +1890,15 @@ func (m *tuiModel) upgradeClaude() (tea.Model, tea.Cmd) {
 	return m, tea.Batch(tick, m.upgradeClaudeCmd(server, srv, names, id))
 }
 
-func (m *tuiModel) upgradeClaudeCmd(serverName string, srv Server, sessions []string, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		// Map sanitized tmux repo names back to real ones so resolve() finds
-		// the worktree (e.g. "rxtx_dev" → "rxtx.dev").
-		bySafe := map[string]string{}
-		if allRepos, rerr := m.cfg.repos(serverName); rerr == nil {
-			for n := range allRepos {
-				bySafe[tmuxSafeName(n)] = n
-			}
-		}
-		// Sessions on one server can resolve to different agents (different
-		// repos), so the self-update is keyed on the resolved agent and run at
-		// most once per agent. If an agent's update fails we skip respawning
-		// that agent's sessions — same conservative intent as the original
-		// "update failed → don't bounce sessions", scoped per agent.
-		updated := map[string]bool{}
-		updateErrs := map[string]string{}
-		ensureUpdate := func(agent string) bool {
-			if updated[agent] {
-				return updateErrs[agent] == ""
-			}
-			updated[agent] = true
-			cmd := m.cfg.agentUpdateCmd(agent)
-			if out, err := runRemote(srv, agentUpdateScript(cmd)); err != nil {
-				updateErrs[agent] = fmt.Sprintf("%s: %v — %s", cmd, err, abbrev(strings.TrimSpace(out), 200))
-				log().Warn("tui-agent-update-fail", "server", serverName, "agent", agent, "err", err.Error())
-				return false
-			}
-			return true
-		}
-
-		restarted, failed := 0, 0
-		for _, name := range sessions {
-			// Respawn with the CURRENT launch script (not the window's stale
-			// original), so the restart picks up the new agent binary AND the
-			// current flags/hooks. claude --continue / codex resume --last
-			// resumes the conversation, so the session survives. Falls back to
-			// re-running the original command when we can't resolve the
-			// session's worktree.
-			cmd := fmt.Sprintf("tmux respawn-window -k -t %s", shellQuote(name))
-			if repo, wt, _, ok := parseTmuxName(name); ok {
-				if real, found := bySafe[repo]; found {
-					repo = real
-				}
-				if r, rerr := m.cfg.resolve(serverName, repo); rerr == nil {
-					if !ensureUpdate(r.Agent) {
-						// Update for this agent failed; leave the session as-is.
-						failed++
-						continue
-					}
-					cwd := r.Repo.Path
-					if wt != "" && wt != "main" {
-						cwd = worktreePath(r.WorktreeBase, r.RepoName, wt)
-					}
-					launch := agentLaunchScript(r, cwd, "", name)
-					cmd = fmt.Sprintf("tmux respawn-window -k -t %s %s", shellQuote(name), shellQuote(launch))
-				}
-			}
-			if _, err := runRemote(srv, cmd); err != nil {
-				log().Warn("tui-respawn-fail", "server", serverName, "session", name, "err", err.Error())
-				failed++
-				continue
-			}
-			restarted++
-		}
-		msg := fmt.Sprintf("agents upgraded on %s; relaunched %d session(s)", serverName, restarted)
-		if len(updateErrs) > 0 {
-			parts := make([]string, 0, len(updateErrs))
-			for agent, e := range updateErrs {
-				parts = append(parts, fmt.Sprintf("%s (%s)", agent, e))
-			}
-			return actionDoneMsg{
-				msg:     msg,
-				err:     fmt.Errorf("agent update failed: %s", strings.Join(parts, "; ")),
-				refresh: serverName,
-				taskID:  taskID,
-			}
-		}
-		if failed > 0 {
-			return actionDoneMsg{
-				msg:     msg,
-				err:     fmt.Errorf("%d session(s) failed to restart — see ~/.cctl.log", failed),
-				refresh: serverName,
-				taskID:  taskID,
-			}
-		}
-		return actionDoneMsg{msg: msg, refresh: serverName, taskID: taskID}
+// focusCmuxWorkspace selects the workspace with the given cctl name, best-effort.
+func focusCmuxWorkspace(wsTitle string) {
+	cli := cmuxCLIPath()
+	if cli == "" || wsTitle == "" {
+		return
 	}
-}
-
-func (m *tuiModel) attachCmd(serverName, repoName string, sess SessionInfo, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		r, err := m.cfg.resolve(serverName, repoName)
-		if err != nil {
-			return prepareDoneMsg{err: err, taskID: taskID}
-		}
-		// attachOrRespawn (not bare `tmux attach`): cmux re-runs the wrapper
-		// script when restoring the workspace, possibly long after the
-		// session died — see the helper's doc comment.
-		cwd := r.Repo.Path
-		if sess.Worktree != "" && sess.Worktree != "main" {
-			cwd = worktreePath(r.WorktreeBase, r.RepoName, sess.Worktree)
-		}
-		// Preserve the session's recorded agent across attach (so re-recording
-		// the manifest doesn't overwrite a per-session override with the config
-		// default); fall back to the resolved agent for untracked sessions.
-		if a := manifestAgent(serverName, repoName, sess.Worktree, sess.Session); a != "" {
-			r.Agent = a
-		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     agentAttachOrRespawn(r, sess.Name, cwd),
-			agent:      r.Agent,
-			cwd:        workspaceCwd(r, sess.Worktree),
-			wsTitle:    cmuxWsTitle(repoName, sess.Worktree, sess.Session),
-			tabTitle:   sess.Session,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   sess.Worktree,
-			session:    sess.Session,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s", serverName, repoName, sess.Session),
-			refresh:    serverName,
-			// Reuse the existing cmux tab only when a tmux client is
-			// already attached — that's the tab holding it. A detached
-			// session's old tab (if any) is a dead shell; the wrapper
-			// must run, so force a fresh workspace.
-			focusExisting: sess.Attached,
-			taskID:        taskID,
-		}
-	}
-}
-
-func (m *tuiModel) newSessionPrepareCmd(serverName, repoName, worktree, sessionName, prompt, agent string, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		start := time.Now()
-		log().Info("tui-new-session-prepare-start",
-			"server", serverName, "repo", repoName, "wt", worktree, "session", sessionName, "agent", agent)
-		r, err := m.cfg.resolve(serverName, repoName)
-		if err != nil {
-			log().Error("tui-new-session-resolve-fail",
-				"server", serverName, "repo", repoName, "err", err.Error())
-			return prepareDoneMsg{err: err, taskID: taskID}
-		}
-		// The form's agent choice overrides the config-resolved default for
-		// this session; everything downstream (launch + manifest) uses it.
-		if agent != "" {
-			r.Agent = agent
-		}
-		cmdStr, err := prepareAgent(r, worktree, sessionName, "", prompt, false, false)
-		log().Info("tui-new-session-prepare-done",
-			"server", serverName, "session", sessionName,
-			"dur", time.Since(start).String(), "err", errString(err))
-		if err != nil {
-			return prepareDoneMsg{err: err, taskID: taskID}
-		}
-		group, groupCwd := repoGroup(r)
-		return prepareDoneMsg{
-			server:     r.Server,
-			useMosh:    r.UseMosh,
-			cmdStr:     cmdStr,
-			cwd:        workspaceCwd(r, worktree),
-			wsTitle:    cmuxWsTitle(repoName, worktree, sessionName),
-			tabTitle:   sessionName,
-			serverName: serverName,
-			repo:       repoName,
-			worktree:   worktree,
-			session:    sessionName,
-			agent:      r.Agent,
-			group:      group,
-			groupCwd:   groupCwd,
-			label:      fmt.Sprintf("%s/%s/%s/%s", serverName, repoName, worktree, sessionName),
-			refresh:    serverName,
-			taskID:     taskID,
+	if id, ok := findCmuxWorkspaceByNameRetry(cli, wsTitle); ok {
+		if out, err := exec.Command(cli, "select-workspace", "--workspace", id).CombinedOutput(); err != nil {
+			log().Debug("cmux-focus-fail", "ws", wsTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
 }
@@ -2218,118 +1974,6 @@ func workspaceCwd(r *Resolved, worktreeName string) string {
 	}
 	return expandPath(worktreePath(r.WorktreeBase, r.RepoName, worktreeName))
 }
-
-func (m *tuiModel) killCmd(serverName, repoName, tmuxFullName, worktreeName, session string, removeWorktree bool, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		r, err := m.cfg.resolve(serverName, repoName)
-		if err != nil {
-			return actionDoneMsg{err: err, taskID: taskID}
-		}
-		if _, err := runRemote(r.Server, fmt.Sprintf("tmux kill-session -t %s", shellQuote(tmuxFullName))); err != nil {
-			return actionDoneMsg{err: fmt.Errorf("kill %s: %w", tmuxFullName, err), taskID: taskID}
-		}
-		// dd removes the session everywhere: forget it in the restore
-		// manifest (so sync won't bring it back) and close its cmux workspace
-		// so the window matches cctl. Best-effort — a missing one is fine.
-		manifestRemove(serverName, repoName, worktreeName, session)
-		closeCmuxWorkspaceByTitle(cmuxWsTitle(repoName, worktreeName, session))
-		// "main" worktree is the original checkout — never delete it.
-		if removeWorktree && worktreeName != "main" {
-			wt := worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
-			if _, err := runRemote(r.Server, removeWorktreeScript(r.Repo.Path, wt, r.WorktreeBase)); err != nil {
-				return actionDoneMsg{
-					msg:     fmt.Sprintf("killed %s (worktree removal failed)", tmuxFullName),
-					err:     fmt.Errorf("remove worktree %s: %w", wt, err),
-					refresh: serverName,
-					taskID:  taskID,
-				}
-			}
-			return actionDoneMsg{
-				msg:     fmt.Sprintf("killed %s + removed worktree", tmuxFullName),
-				refresh: serverName,
-				taskID:  taskID,
-			}
-		}
-		return actionDoneMsg{
-			msg:     fmt.Sprintf("killed %s (worktree kept)", tmuxFullName),
-			refresh: serverName,
-			taskID:  taskID,
-		}
-	}
-}
-
-// killWorktreeCmd removes a whole worktree: kills every cctl-managed tmux
-// session running on it, then runs `git worktree remove` (with --force +
-// rm -rf fallbacks). The branch is intentionally kept (matching `cctl rm`
-// behavior) so unpushed work isn't lost. Refuses to touch "main".
-//
-// `wtPath` is the actual on-disk path from `git worktree list`, when
-// known (TUI flow). If empty we fall back to the cctl-convention path
-// `<worktree_base>/<repo>/<worktree_name>` — the legacy behavior, which
-// silently no-ops for worktrees that live outside that convention.
-//
-// `victims` is the list of tmux session names to kill first, snapshotted
-// by the caller on the UI goroutine — this closure runs concurrently with
-// the model and must not read m.state.
-func (m *tuiModel) killWorktreeCmd(serverName, repoName, worktreeName, wtPath string, victims []string, taskID int) tea.Cmd {
-	return func() tea.Msg {
-		if worktreeName == "main" {
-			return actionDoneMsg{err: fmt.Errorf("cannot remove the main worktree"), taskID: taskID}
-		}
-		r, err := m.cfg.resolve(serverName, repoName)
-		if err != nil {
-			return actionDoneMsg{err: err, taskID: taskID}
-		}
-		// Belt-and-braces: even if the row was misclassified by a
-		// samePath regression, refuse to act when the on-disk path
-		// equals the configured repo path. removeWorktreeScript also
-		// guards this — three layers because the impact of getting
-		// it wrong is "user loses their repo".
-		if wtPath != "" && samePath(wtPath, r.Repo.Path) {
-			log().Error("tui-kill-worktree-refused-main",
-				"server", serverName, "repo", repoName, "wt", worktreeName,
-				"path", wtPath, "repo_path", r.Repo.Path)
-			return actionDoneMsg{err: fmt.Errorf(
-				"refused: wtPath %s is the main checkout (repo.Path=%s) — the row was likely mis-classified",
-				wtPath, r.Repo.Path,
-			), taskID: taskID}
-		}
-		wt := wtPath
-		if wt == "" {
-			wt = worktreePath(r.WorktreeBase, r.RepoName, worktreeName)
-		}
-		log().Info("tui-kill-worktree-start",
-			"server", serverName, "repo", repoName, "wt", worktreeName,
-			"path", wt, "sessions", len(victims))
-		for _, name := range victims {
-			if _, err := runRemote(r.Server, fmt.Sprintf("tmux kill-session -t %s", shellQuote(name))); err != nil {
-				log().Warn("tui-kill-worktree-session-fail", "name", name, "err", err.Error())
-			}
-		}
-		// The worktree's sessions are dead now, so their per-session cmux
-		// workspaces are stale shells: forget the worktree in the manifest and
-		// close every "repo/worktree/*" workspace so cmux matches cctl (done
-		// before the git removal so it happens even if that fails).
-		manifestRemoveWorktree(serverName, repoName, worktreeName)
-		closeCmuxWorkspacesByPrefix(repoName + "/" + worktreeName + "/")
-		if _, err := runRemote(r.Server, removeWorktreeScript(r.Repo.Path, wt, r.WorktreeBase)); err != nil {
-			return actionDoneMsg{
-				msg:     fmt.Sprintf("killed %d session(s); worktree removal failed", len(victims)),
-				err:     fmt.Errorf("remove worktree %s: %w", wt, err),
-				refresh: serverName,
-				taskID:  taskID,
-			}
-		}
-		log().Info("tui-kill-worktree-ok", "wt", wt, "sessions_killed", len(victims))
-		return actionDoneMsg{
-			msg:     fmt.Sprintf("removed %s (path=%s, killed %d session(s); branch kept)", worktreeName, wt, len(victims)),
-			refresh: serverName,
-			taskID:  taskID,
-		}
-	}
-}
-
-// ---- tree building ---------------------------------------------------------
 
 func (m *tuiModel) rebuildRows() {
 	var rows []treeRow
@@ -2852,16 +2496,12 @@ func (m *tuiModel) bottomStatus() string {
 // keyHints is the compact one-liner legend along the bottom (renderKeyHints
 // joins + wraps it). The full reference is `?` (legendLines).
 var keyHints = []string{
-	"↑↓ move",
-	"←→ fold",
-	"⏎ open",
 	"n new",
 	"t term",
 	"dd delete",
-	"S/R reconcile",
+	"R refresh+reconcile",
 	"UU upgrade",
 	"/ filter",
-	"r refresh",
 	"? help",
 	"q quit",
 }
@@ -3089,22 +2729,21 @@ func (m *tuiModel) rowCells(r treeRow, selected bool) (name, info, age string) {
 
 	case rowSession:
 		sess := r.session
-		marker := "○"
-		mStyle := dimStyle
-		if sess.Attached {
-			marker = "●"
-			mStyle = okStyle
+		// Status: green ● attached, amber ◐ syncing (while a reconcile runs),
+		// red ○ detached otherwise.
+		marker, mStyle, label := "○", darkRedStyle, "detached"
+		switch {
+		case sess.Attached:
+			marker, mStyle, label = "●", okStyle, "attached"
+		case m.syncing:
+			marker, mStyle, label = "◐", warnStyle, "syncing"
 		}
 		nm := highlightMatch(sess.Session, m.filter)
 		if m.filter == "" && selected {
 			nm = cursorStyle.Render(sess.Session)
 		}
 		name = indent + mStyle.Render(marker) + " " + tagStyle.Render("(s)") + " " + m.preparingPrefix(r) + nm
-		if sess.Attached {
-			info = okStyle.Render("attached")
-		} else {
-			info = dimStyle.Render("detached")
-		}
+		info = mStyle.Render(label)
 		age = dimStyle.Render(humanAge(sess.Age))
 
 	case rowEmpty, rowLoading:

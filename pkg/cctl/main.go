@@ -97,6 +97,10 @@ func restartAllOnStartup(yes bool) error {
 	res := restartAllTrackedSessions(cfg)
 	fmt.Fprintf(os.Stderr, "restart-all: reloaded config on %d/%d server(s); restarting %d session(s) — reconciling on startup...\n",
 		res.reloaded, res.servers, res.killed)
+	if res.unreachable > 0 {
+		fmt.Fprintf(os.Stderr, "restart-all: %d server(s) unreachable, %d session(s) left tracked (will revive when reachable).\n",
+			res.unreachable, res.skipped)
+	}
 	return nil
 }
 
@@ -116,6 +120,7 @@ func init() {
 	rootCmd.AddCommand(newSSHCmd())
 	rootCmd.AddCommand(newConfigCmd())
 	rootCmd.AddCommand(newInitCmd())
+	rootCmd.AddCommand(newReconcileCmd())
 	rootCmd.AddCommand(newDoctorCmd())
 	rootCmd.AddCommand(newVersionCmd())
 }

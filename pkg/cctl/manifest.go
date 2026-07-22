@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -40,7 +41,19 @@ type wsEntry struct {
 	// "codex"). Empty for sessions created before per-session agent tracking
 	// (and for adopted sessions) — callers fall back to the config-resolved
 	// agent, so old manifests keep working.
-	Agent   string `json:"agent,omitempty"`
+	Agent string `json:"agent,omitempty"`
+	// Prompt is a pending FIRST-LAUNCH prompt. When set, the reconcile spawn
+	// launches the agent with this prompt (a brand-new session) and then clears
+	// it, so later reconciles just attach. This is how "new session with an
+	// initial prompt" flows through the single reconcile path instead of a
+	// separate interactive spawn. Empty for restores and adopted sessions.
+	Prompt string `json:"prompt,omitempty"`
+	// WsID is the cmux workspace UUID, recorded after a successful spawn and
+	// backfilled by reconcile. It's the PRIMARY identity for matching a
+	// tracked session to its cmux workspace — titles are the fallback (they
+	// can be renamed or collide; the UUID can't). Empty for entries that
+	// predate id tracking or whose workspace hasn't been seen yet.
+	WsID    string `json:"ws_id,omitempty"`
 	Updated int64  `json:"updated"`
 }
 
@@ -52,11 +65,38 @@ func manifestKey(server, repo, worktree, session string) string {
 	return strings.Join([]string{server, repo, worktree, session}, "\x00")
 }
 
-// manifestMu serializes the load-modify-save cycle. Spawns and deletes run
-// in bubbletea command goroutines, so concurrent writers are possible; the
-// on-disk file is the source of truth and the lock keeps writes atomic
-// relative to each other.
+// manifestMu serializes the load-modify-save cycle within THIS process.
+// Spawns and deletes run in bubbletea command goroutines, so concurrent
+// writers are possible; the on-disk file is the source of truth and the lock
+// keeps writes atomic relative to each other. Cross-PROCESS writers (a TUI
+// sync racing a headless `cctl reconcile`) are serialized by the flock in
+// lockManifestFile — both locks are held around every load-modify-save.
 var manifestMu sync.Mutex
+
+// lockManifestFile takes an advisory flock on <manifest>.lock and returns the
+// unlock func. Two cctl processes (the TUI and `cctl reconcile`, or two
+// reconciles) can otherwise interleave load-modify-save and silently drop the
+// loser's update. Callers hold manifestMu first (process-internal ordering),
+// then this (cross-process). Best-effort: if the lock file can't be opened,
+// proceed unlocked — a wedged lock must never brick the manifest.
+func lockManifestFile() func() {
+	p, err := manifestPath()
+	if err != nil {
+		return func() {}
+	}
+	f, err := os.OpenFile(p+".lock", os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return func() {}
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return func() {}
+	}
+	return func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}
+}
 
 func manifestPath() (string, error) {
 	h, err := cctlHome()
@@ -114,6 +154,21 @@ func saveManifest(entries []wsEntry) error {
 	if err != nil {
 		return err
 	}
+	// Dedupe by key (newest wins): past bugs could double-record an entry,
+	// and every save is a chance to heal the file.
+	byKey := map[string]int{}
+	dedup := entries[:0]
+	for _, e := range entries {
+		if j, ok := byKey[e.key()]; ok {
+			if e.Updated >= dedup[j].Updated {
+				dedup[j] = e
+			}
+			continue
+		}
+		byKey[e.key()] = len(dedup)
+		dedup = append(dedup, e)
+	}
+	entries = dedup
 	sort.Slice(entries, func(i, j int) bool { return entries[i].key() < entries[j].key() })
 	doc := struct {
 		Entries []wsEntry `json:"entries"`
@@ -132,6 +187,95 @@ func saveManifest(entries []wsEntry) error {
 		return err
 	}
 	return nil
+}
+
+// manifestSetWsID records the cmux workspace UUID for a tracked session —
+// called after a successful spawn and by reconcile's backfill pass. No-op
+// when the entry is missing or the id is unchanged.
+func manifestSetWsID(server, repo, worktree, session, wsID string) {
+	if wsID == "" {
+		return
+	}
+	want := manifestKey(server, repo, worktree, session)
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+	defer lockManifestFile()()
+	entries := loadManifest()
+	for i := range entries {
+		if entries[i].key() == want {
+			if entries[i].WsID == wsID {
+				return
+			}
+			entries[i].WsID = wsID
+			if err := saveManifest(entries); err != nil {
+				log().Warn("manifest-save-fail", "err", err.Error())
+			}
+			return
+		}
+	}
+}
+
+// manifestRewriteRepo renames a tracked entry's repo in place — used to heal
+// entries that adopt recorded under a tmux-sanitized alias ("rxtx_dev" for
+// "rxtx.dev"). Unlike remove+re-add, the wrapper script and every other field
+// survive; WsTitle is re-derived from the canonical name.
+func manifestRewriteRepo(server, oldRepo, worktree, session, newRepo string) {
+	want := manifestKey(server, oldRepo, worktree, session)
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+	defer lockManifestFile()()
+	entries := loadManifest()
+	target := manifestKey(server, newRepo, worktree, session)
+	targetExists := false
+	for i := range entries {
+		if entries[i].key() == target {
+			targetExists = true
+			break
+		}
+	}
+	for i := range entries {
+		if entries[i].key() != want {
+			continue
+		}
+		if targetExists {
+			// Canonical entry already tracked — the alias is a duplicate
+			// (re-adopted from the sanitized tmux name); drop it.
+			entries = append(entries[:i], entries[i+1:]...)
+		} else {
+			entries[i].Repo = newRepo
+			entries[i].WsTitle = cmuxWsTitle(newRepo, entries[i].Worktree, entries[i].Session)
+		}
+		if err := saveManifest(entries); err != nil {
+			log().Warn("manifest-save-fail", "err", err.Error())
+		}
+		return
+	}
+}
+
+// manifestCompact rewrites the manifest file when duplicate keys are present
+// (residue of past double-record bugs) — saveManifest's dedupe does the work.
+// Reconcile calls this once per pass; a healthy file is a no-op read.
+func manifestCompact() {
+	manifestMu.Lock()
+	defer manifestMu.Unlock()
+	defer lockManifestFile()()
+	entries := loadManifest()
+	seen := map[string]bool{}
+	dup := false
+	for _, e := range entries {
+		if seen[e.key()] {
+			dup = true
+			break
+		}
+		seen[e.key()] = true
+	}
+	if !dup {
+		return
+	}
+	log().Info("manifest-compact", "entries", len(entries), "unique", len(seen))
+	if err := saveManifest(entries); err != nil {
+		log().Warn("manifest-save-fail", "err", err.Error())
+	}
 }
 
 // manifestAgent returns the recorded agent for a session, or "" if the session
@@ -172,6 +316,7 @@ func manifestUpsert(spec SpawnSpec) {
 	}
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	defer lockManifestFile()()
 	entries := loadManifest()
 	replaced := false
 	for i := range entries {
@@ -189,8 +334,13 @@ func manifestUpsert(spec SpawnSpec) {
 	}
 }
 
-// manifestUpsertEntry records a fully-formed entry (used by the sync pass to
-// adopt sessions discovered in tmux/cmux that predate the manifest).
+// manifestUpsertEntry records an entry, MERGING over any existing one (used by
+// adoption and by the interactive open paths). Callers often carry a sparse
+// entry — an attach knows the identity but not the wrapper script or group —
+// and replacing wholesale would clobber fields the full spawn recorded earlier
+// (losing Script leaks the wrapper on a later dd, since manifestRemove deletes
+// by that path). mergeWsEntry keeps the old value wherever the incoming one is
+// empty; Prompt is the exception (one-shot, never inherited).
 func manifestUpsertEntry(e wsEntry) {
 	if e.Server == "" || e.Repo == "" || e.Worktree == "" || e.Session == "" {
 		return
@@ -200,10 +350,11 @@ func manifestUpsertEntry(e wsEntry) {
 	}
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	defer lockManifestFile()()
 	entries := loadManifest()
 	for i := range entries {
 		if entries[i].key() == e.key() {
-			entries[i] = e
+			entries[i] = mergeWsEntry(entries[i], e)
 			if err := saveManifest(entries); err != nil {
 				log().Warn("manifest-save-fail", "err", err.Error())
 			}
@@ -284,11 +435,51 @@ func manifestDedupByTmux() int {
 	return len(drop)
 }
 
+// mergeWsEntry overlays an incoming (possibly sparse) entry on the stored one:
+// identity/Updated come from the incoming entry, every other field keeps the
+// old value when the incoming one is empty. Prompt is NEVER inherited from the
+// old entry — a pending first-launch prompt is one-shot, and re-inheriting it
+// would relaunch a dead session with a stale prompt. Pure, so it's testable.
+func mergeWsEntry(old, in wsEntry) wsEntry {
+	if in.TmuxName == "" {
+		in.TmuxName = old.TmuxName
+	}
+	if in.WsTitle == "" {
+		in.WsTitle = old.WsTitle
+	}
+	if in.TabTitle == "" {
+		in.TabTitle = old.TabTitle
+	}
+	if in.Group == "" {
+		in.Group = old.Group
+	}
+	if in.GroupCwd == "" {
+		in.GroupCwd = old.GroupCwd
+	}
+	if in.Cwd == "" {
+		in.Cwd = old.Cwd
+	}
+	if in.Script == "" {
+		in.Script = old.Script
+	}
+	if in.WsID == "" {
+		in.WsID = old.WsID
+	}
+	if in.Agent == "" {
+		in.Agent = old.Agent
+	}
+	if !in.Remote {
+		in.Remote = old.Remote
+	}
+	return in
+}
+
 // manifestRemoveWorktree drops every session on a worktree (called when the
 // whole worktree is removed) and best-effort deletes their wrapper scripts.
 func manifestRemoveWorktree(server, repo, worktree string) {
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	defer lockManifestFile()()
 	entries := loadManifest()
 	kept := entries[:0]
 	var dropped []wsEntry
@@ -326,6 +517,7 @@ func manifestRemove(server, repo, worktree, session string) {
 	tname := tmuxName(repo, worktree, session)
 	manifestMu.Lock()
 	defer manifestMu.Unlock()
+	defer lockManifestFile()()
 	entries := loadManifest()
 	kept := entries[:0]
 	var removed []wsEntry

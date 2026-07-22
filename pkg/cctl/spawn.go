@@ -77,6 +77,10 @@ type SpawnSpec struct {
 	// mirror it. Everywhere else (new session, detached resurrect) the
 	// wrapper script MUST actually run.
 	FocusExisting bool
+	// Focus makes the spawned/healed surface take focus. Interactive opens
+	// set it (the user asked for THIS session right now); reconcile leaves
+	// it false so a background converge never yanks focus between tabs.
+	Focus bool
 	// Remote, when set, requests a cmux remote-SSH workspace instead of
 	// a local one running the wrapper Script: the workspace is created
 	// via `cmux ssh` and tabs run Remote.Command in remote shells. The
@@ -184,7 +188,7 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 			log().Warn("cmux-ssh-spawn-fail (falling back to local wrapper workspace)", "ws", spec.WsTitle, "err", err.Error())
 		}
 	}
-	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle)
+	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle, spec.Focus)
 	if err != nil {
 		return fmt.Errorf("cmux build args: %w", err)
 	}
@@ -254,6 +258,9 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 		tabRef := "tab:1"
 		if sid := firstCmuxSurfaceID(cli, id); sid != "" {
 			tabRef = sid
+			// Bind the durable wrapper so cmux replays it on restore (a remote
+			// mosh workspace otherwise comes back as a detached shell).
+			setCmuxSurfaceResume(cli, id, sid, spec.TabTitle, spec.Cwd, spec.Script)
 		}
 		out, err := exec.Command(cli, "rename-tab", "--workspace", id, "--tab", tabRef, spec.TabTitle).CombinedOutput()
 		if err != nil {
@@ -263,14 +270,22 @@ func finishCmuxWorkspace(cli string, spec SpawnSpec) {
 	ensureCmuxGroupMembership(cli, spec.GroupTitle, spec.GroupCwd, id)
 }
 
-// ensureCmuxGroupMembership files a workspace under the sidebar group
-// named `group`, creating the group when it doesn't exist yet (anchored
-// at groupCwd — the repo checkout). Adding a workspace that's already a
-// member is harmless. Purely cosmetic, so failures only log.
+// ensureCmuxGroupMembership is intentionally a NO-OP.
 //
-// Note: `workspace-group create` defaults --from to the user's current
-// sidebar selection, so we always pass the workspace id explicitly.
+// Native cmux workspace-groups require a per-group anchor workspace that runs
+// no session, which conflicts with cctl's invariant that every workspace is a
+// live agent session (and closing the anchor dissolves the group). cctl now
+// keeps a FLAT workspace list; per-repo grouping is done visually by the
+// custom sidebar (~/.config/cmux/sidebars/cctl.swift) instead. This stub keeps
+// the call sites (spawn/reconcile) but creates/joins nothing — otherwise a
+// respawn would re-create a stray group for its repo (the one-off rxtx.dev
+// group seen when reconcile revived the sole dead session).
 func ensureCmuxGroupMembership(cli, group, groupCwd, wsID string) error {
+	return nil
+}
+
+//nolint:unused // retained for reference / possible future re-enable.
+func ensureCmuxGroupMembershipImpl(cli, group, groupCwd, wsID string) error {
 	if group == "" || wsID == "" {
 		return nil
 	}
@@ -356,14 +371,18 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 			if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
 				return fmt.Errorf("respawn-pane (heal existing tab): %w: %s", err, strings.TrimSpace(string(out)))
 			}
-			if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
-				log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			// Focus only when the spawn is interactive (spec.Focus) —
+			// background reconcile heals many sessions and must not yank
+			// focus between tabs.
+			setCmuxSurfaceResume(cli, wsID, sid, spec.TabTitle, spec.Cwd, spec.Script)
+			if spec.Focus {
+				focusCmuxSurface(cli, wsID, sid)
 			}
 			log().Info("cmux-heal-tab", "ws", wsID, "surface", sid, "tab", spec.TabTitle)
 			return nil
 		}
 	}
-	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", "true").CombinedOutput()
+	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", fmt.Sprintf("%v", spec.Focus)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("new-surface: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -390,12 +409,26 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 			log().Debug("cmux-rename-tab-fail", "surface", sid, "tab", spec.TabTitle, "err", err.Error(), "out", strings.TrimSpace(string(out)))
 		}
 	}
-	// Land the user on the workspace; the new surface was created with
-	// --focus true so the right tab is already selected within it.
-	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
-		log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	setCmuxSurfaceResume(cli, wsID, sid, spec.TabTitle, spec.Cwd, spec.Script)
+	// Focus only for interactive spawns (spec.Focus); background reconcile
+	// must not yank focus between the many sessions it heals.
+	if spec.Focus {
+		focusCmuxSurface(cli, wsID, sid)
 	}
 	return nil
+}
+
+// focusCmuxSurface brings the user to a spawned/healed session's workspace —
+// the "drop me on what I just opened" step of an interactive open. cmux's CLI
+// has no surface/tab-select verb (only creation-time --focus, which the
+// new-surface path already uses), so an existing healed tab can only be
+// focused at workspace granularity. Best-effort: failures are logged, never
+// fatal.
+func focusCmuxSurface(cli, wsID, sid string) {
+	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+		log().Debug("cmux-select-workspace-fail", "ws", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	}
+	_ = sid // no CLI verb to select an existing surface (cmux 0.64.x)
 }
 
 // cmuxUUIDRe / cmuxSurfaceRefRe match the two id shapes the cmux CLI
@@ -506,11 +539,60 @@ type cmuxWorkspace struct {
 }
 
 func listCmuxWorkspaces(cli string) []cmuxWorkspace {
+	// Prefer the JSON form: it exposes custom_title — the durable name cctl
+	// sets with `--name` (or `workspace rename`), which cmux PRESERVES. The
+	// legacy line form (and the sidebar) show the volatile `title`, which cmux
+	// rewrites to the pane's cwd whenever the session's tab isn't foreground
+	// (e.g. mid-revive before a mosh tab paints). Matching on that volatile
+	// title is what made reconcile fail to find an existing workspace and
+	// spawn a DUPLICATE instead — the core cmux↔cctl drift bug. custom_title
+	// stays put, so identity survives the title drifting.
+	if out, err := cmuxCmd(cli, "--id-format", "uuids", "workspace", "list", "--json").Output(); err == nil {
+		if ws := parseCmuxWorkspaceListJSON(out); ws != nil {
+			return ws
+		}
+	}
+	// Fallback for older cmux without `workspace list --json`.
 	out, err := exec.Command(cli, "--id-format", "uuids", "list-workspaces").Output()
 	if err != nil {
 		return nil
 	}
 	return parseCmuxWorkspaceList(string(out))
+}
+
+// parseCmuxWorkspaceListJSON parses `workspace list --json`, keying each
+// workspace on its durable custom_title (falling back to the volatile title
+// only when no custom title is set — e.g. the bare control workspace). The id
+// prefers the UUID (present with `--id-format uuids`) and falls back to the
+// ref handle, both of which cmux commands accept for --workspace. Split out so
+// it's unit-testable against a captured payload.
+func parseCmuxWorkspaceListJSON(raw []byte) []cmuxWorkspace {
+	var payload struct {
+		Workspaces []struct {
+			ID             string `json:"id"`
+			UUID           string `json:"uuid"`
+			Ref            string `json:"ref"`
+			Title          string `json:"title"`
+			CustomTitle    string `json:"custom_title"`
+			HasCustomTitle bool   `json:"has_custom_title"`
+		} `json:"workspaces"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil
+	}
+	var out []cmuxWorkspace
+	for _, w := range payload.Workspaces {
+		id := firstNonEmpty(w.ID, w.UUID, w.Ref)
+		name := w.Title
+		if w.HasCustomTitle && strings.TrimSpace(w.CustomTitle) != "" {
+			name = w.CustomTitle
+		}
+		if id == "" || strings.TrimSpace(name) == "" {
+			continue
+		}
+		out = append(out, cmuxWorkspace{id: id, name: strings.TrimSpace(name)})
+	}
+	return out
 }
 
 // parseCmuxWorkspaceList parses `--id-format uuids list-workspaces`: one
@@ -552,7 +634,7 @@ func parseCmuxWorkspaceList(raw string) []cmuxWorkspace {
 // cmuxNewWorkspaceArgs builds the argv for `cmux new-workspace ...` with a
 // single-terminal layout (no Files panel). Split out so the args are testable
 // without spawning cmux.
-func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
+func cmuxNewWorkspaceArgs(script, cwd, title string, focus bool) ([]string, error) {
 	layout, err := buildCmuxLayout(script)
 	if err != nil {
 		return nil, err
@@ -564,7 +646,9 @@ func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
 	args = append(args,
 		"--cwd", cwd,
 		"--layout", layout,
-		"--focus", "true",
+		// focus=false for reconcile (creating many workspaces must not steal
+		// focus); true for interactive opens so the user lands on the new tab.
+		"--focus", fmt.Sprintf("%v", focus),
 	)
 	return args, nil
 }
