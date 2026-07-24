@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -77,6 +78,15 @@ type SpawnSpec struct {
 	// mirror it. Everywhere else (new session, detached resurrect) the
 	// wrapper script MUST actually run.
 	FocusExisting bool
+	// Background opens the workspace/tab without stealing focus: the
+	// new-workspace/new-surface calls use `--focus false` and the trailing
+	// select-workspace is skipped. Set by the sync/reconcile path
+	// (restoreSpawn), which discovers sessions the user didn't ask to jump
+	// to right now (e.g. a review-prs batch, or restore after a cmux
+	// restart) — spawning N of them shouldn't yank the viewport N times.
+	// The interactive n/Enter paths leave it false so they still land you
+	// on the session you just asked for.
+	Background bool
 	// Remote, when set, requests a cmux remote-SSH workspace instead of
 	// a local one running the wrapper Script: the workspace is created
 	// via `cmux ssh` and tabs run Remote.Command in remote shells. The
@@ -184,7 +194,7 @@ func (cmuxSpawner) Spawn(spec SpawnSpec) error {
 			log().Warn("cmux-ssh-spawn-fail (falling back to local wrapper workspace)", "ws", spec.WsTitle, "err", err.Error())
 		}
 	}
-	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle)
+	args, err := cmuxNewWorkspaceArgs(spec.Script, cwd, spec.WsTitle, !spec.Background)
 	if err != nil {
 		return fmt.Errorf("cmux build args: %w", err)
 	}
@@ -356,14 +366,16 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 			if out, err := exec.Command(cli, "respawn-pane", "--workspace", wsID, "--surface", sid, "--command", tabCommand).CombinedOutput(); err != nil {
 				return fmt.Errorf("respawn-pane (heal existing tab): %w: %s", err, strings.TrimSpace(string(out)))
 			}
-			if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
-				log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+			if !spec.Background {
+				if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+					log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+				}
 			}
 			log().Info("cmux-heal-tab", "ws", wsID, "surface", sid, "tab", spec.TabTitle)
 			return nil
 		}
 	}
-	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", "true").CombinedOutput()
+	out, err := exec.Command(cli, "new-surface", "--workspace", wsID, "--focus", strconv.FormatBool(!spec.Background)).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("new-surface: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -391,9 +403,12 @@ func addCmuxTab(cli, wsID string, spec SpawnSpec, tabCommand string) error {
 		}
 	}
 	// Land the user on the workspace; the new surface was created with
-	// --focus true so the right tab is already selected within it.
-	if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
-		log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+	// --focus true so the right tab is already selected within it. Skipped
+	// for background spawns (sync/reconcile) so they don't steal the viewport.
+	if !spec.Background {
+		if out, err := exec.Command(cli, "select-workspace", "--workspace", wsID).CombinedOutput(); err != nil {
+			log().Debug("cmux-select-workspace-fail", "id", wsID, "err", err.Error(), "out", strings.TrimSpace(string(out)))
+		}
 	}
 	return nil
 }
@@ -551,8 +566,9 @@ func parseCmuxWorkspaceList(raw string) []cmuxWorkspace {
 
 // cmuxNewWorkspaceArgs builds the argv for `cmux new-workspace ...` with a
 // single-terminal layout (no Files panel). Split out so the args are testable
-// without spawning cmux.
-func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
+// without spawning cmux. focus=false opens the workspace in the background
+// (sync/reconcile discoveries — see SpawnSpec.Background).
+func cmuxNewWorkspaceArgs(script, cwd, title string, focus bool) ([]string, error) {
 	layout, err := buildCmuxLayout(script)
 	if err != nil {
 		return nil, err
@@ -564,7 +580,7 @@ func cmuxNewWorkspaceArgs(script, cwd, title string) ([]string, error) {
 	args = append(args,
 		"--cwd", cwd,
 		"--layout", layout,
-		"--focus", "true",
+		"--focus", strconv.FormatBool(focus),
 	)
 	return args, nil
 }
