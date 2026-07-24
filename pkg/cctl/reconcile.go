@@ -809,6 +809,10 @@ func restoreSpawn(cfg *Config, e wsEntry) error {
 			TabTitle:   e.Session,
 			GroupTitle: group,
 			GroupCwd:   groupCwd,
+			// Sync/reconcile discovered this session; the user didn't ask to
+			// jump to it right now. Open it in the background so a batch
+			// (e.g. review-prs) doesn't yank the viewport once per session.
+			Background: true,
 		})
 	return err
 }

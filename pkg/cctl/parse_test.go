@@ -537,7 +537,7 @@ func TestBuildCmuxLayout_OneTerminalOnly(t *testing.T) {
 //   - the embedded layout is itself valid JSON (sanity on quoting)
 func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 	t.Run("with title", func(t *testing.T) {
-		args, err := cmuxNewWorkspaceArgs("/tmp/foo.sh", "/home/user/repo", "my-app/b300/test")
+		args, err := cmuxNewWorkspaceArgs("/tmp/foo.sh", "/home/user/repo", "my-app/b300/test", true)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
@@ -550,6 +550,15 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 				t.Errorf("argv missing %q: %v", want, args)
 			}
 		}
+	})
+	t.Run("background (focus false)", func(t *testing.T) {
+		args, err := cmuxNewWorkspaceArgs("/tmp/foo.sh", "/home/user/repo", "my-app/b300/test", false)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		if joined := strings.Join(args, " "); !strings.Contains(joined, "--focus false") {
+			t.Errorf("background argv should carry --focus false: %v", args)
+		}
 		// The --layout value should be JSON-decodable.
 		for i, a := range args {
 			if a == "--layout" && i+1 < len(args) {
@@ -561,7 +570,7 @@ func TestCmuxNewWorkspaceArgs_StructureAndFlags(t *testing.T) {
 		}
 	})
 	t.Run("without title", func(t *testing.T) {
-		args, err := cmuxNewWorkspaceArgs("/tmp/foo.sh", "/home/user/repo", "")
+		args, err := cmuxNewWorkspaceArgs("/tmp/foo.sh", "/home/user/repo", "", true)
 		if err != nil {
 			t.Fatalf("err: %v", err)
 		}
